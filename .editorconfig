@@ -1,0 +1,29 @@
+# EditorConfig — C/C++ (4 spaces, LF)
+# https://editorconfig.org
+root = true
+
+[*]
+indent_style = space
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{cpp,hpp,h,c,cc,cxx,hh,hxx,inl,ipp}]
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[CMakeLists.txt]
+indent_size = 4
+
+[*.cmake]
+indent_size = 4
+
+[Makefile]
+indent_style = tab

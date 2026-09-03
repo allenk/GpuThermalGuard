@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-x64-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "windows-x64-dev",
+      "displayName": "Windows x64 Debug (VS2022/Ninja)",
+      "inherits": "windows-x64-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "windows-x64-release",
+      "displayName": "Windows x64 Release (VS2022/Ninja, static CRT)",
+      "inherits": "windows-x64-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64-dev",
+      "configurePreset": "windows-x64-dev"
+    },
+    {
+      "name": "windows-x64-release",
+      "configurePreset": "windows-x64-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-x64-dev",
+      "configurePreset": "windows-x64-dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-x64-release",
+      "configurePreset": "windows-x64-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
