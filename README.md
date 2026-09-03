@@ -155,7 +155,15 @@ Snapshots can be created from the main window or tray menu and are also captured
 
 ## Release integrity
 
-Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, requires Authenticode signing, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
+Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation. When an Authenticode certificate is configured, the executables are signed and verified before packaging. Until a certificate is available, releases are published only as clearly labeled **unsigned prereleases**, including `unsigned` in the archive name and a warning in the release notes. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
+
+After downloading a release archive, verify that its exact bytes were produced by this repository's GitHub Actions workflow:
+
+```powershell
+gh attestation verify .\GpuThermalGuard-<version>-unsigned-windows-x64.zip -R allenk/GpuThermalGuard
+```
+
+This provenance check does not replace Authenticode publisher identity or malware scanning. Windows SmartScreen may warn about unsigned prerelease executables.
 
 ## Contributing and security
 

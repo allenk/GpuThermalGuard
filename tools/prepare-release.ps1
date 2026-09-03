@@ -5,6 +5,7 @@ param(
     [string] $Tag,
     [string] $BuildDirectory = 'out/build/release-ci/Release',
     [string] $OutputDirectory = 'dist',
+    [switch] $Unsigned,
     [switch] $ValidateOnly
 )
 
@@ -62,12 +63,16 @@ foreach ($file in @($mainExe, $probeExe)) {
 if (Test-Path -LiteralPath $OutputDirectory) {
     Remove-Item -LiteralPath $OutputDirectory -Recurse -Force
 }
-$packageRoot = Join-Path $OutputDirectory "GpuThermalGuard-$version-windows-x64"
+$packageStem = "GpuThermalGuard-$version-windows-x64"
+if ($Unsigned) {
+    $packageStem = "GpuThermalGuard-$version-unsigned-windows-x64"
+}
+$packageRoot = Join-Path $OutputDirectory $packageStem
 New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 Copy-Item -LiteralPath $mainExe, $probeExe, 'LICENSE', 'THIRD_PARTY_NOTICES.md',
     'README.md', 'README.zh-TW.md' -Destination $packageRoot
 
-$zipPath = Join-Path $OutputDirectory "GpuThermalGuard-$version-windows-x64.zip"
+$zipPath = Join-Path $OutputDirectory "$packageStem.zip"
 Compress-Archive -Path "$packageRoot\*" -DestinationPath $zipPath -CompressionLevel Optimal
 Remove-Item -LiteralPath $packageRoot -Recurse -Force
 
@@ -75,15 +80,22 @@ $hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
 "$($hash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($zipPath))" |
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Encoding utf8NoBOM
 
-$notes = @(
-    "# GpuThermalGuard $Tag",
-    '',
+$notes = [System.Collections.Generic.List[string]]::new()
+$notes.Add("# GpuThermalGuard $Tag")
+$notes.Add('')
+if ($Unsigned) {
+    $notes.Add('> [!WARNING]')
+    $notes.Add('> **UNSIGNED PRERELEASE:** The executables in this archive do not have an Authenticode publisher signature. Verify the ZIP with `SHA256SUMS.txt` and the GitHub Actions build-provenance attestation before running it.')
+    $notes.Add('')
+}
+$notes.AddRange([string[]]@(
     $section.Groups['body'].Value.Trim(),
     '',
     "[Full changelog](https://github.com/allenk/GpuThermalGuard/blob/$Tag/CHANGELOG.md)",
     '',
     '> Download the ZIP and verify it against `SHA256SUMS.txt`. The executable requests administrator privileges.'
-) -join "`n"
-$notes | Set-Content -LiteralPath (Join-Path $OutputDirectory 'release-notes.md') -Encoding utf8NoBOM
+))
+($notes -join "`n") |
+    Set-Content -LiteralPath (Join-Path $OutputDirectory 'release-notes.md') -Encoding utf8NoBOM
 
 Write-Host "Prepared release package for $Tag in $OutputDirectory."

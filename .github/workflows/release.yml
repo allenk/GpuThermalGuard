@@ -43,15 +43,22 @@ jobs:
         shell: pwsh
         run: ctest --test-dir out/build/release-ci -C Release --output-on-failure
 
-      - name: Authenticode sign and verify
+      - name: Authenticode sign and verify when configured
+        id: signing
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
-            throw 'Release signing secrets are not configured; unsigned releases are blocked.'
+          $hasCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)
+          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)
+          if ($hasCertificate -ne $hasPassword) {
+            throw 'Release signing is only partially configured. Set both signing secrets or remove both.'
+          }
+          if (-not $hasCertificate) {
+            'signed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Warning 'No Authenticode certificate is configured. Publishing an explicitly marked unsigned prerelease.'
+            exit 0
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'release-signing.pfx'
           try {
@@ -68,13 +75,19 @@ jobs:
               & $signTool.FullName verify /pa /v $file
               if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $file." }
             }
+            'signed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           } finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
 
       - name: Prepare package, checksums, and release notes
         shell: pwsh
-        run: ./tools/prepare-release.ps1 -Tag '${{ github.ref_name }}'
+        run: |
+          $parameters = @{ Tag = '${{ github.ref_name }}' }
+          if ('${{ steps.signing.outputs.signed }}' -ne 'true') {
+            $parameters.Unsigned = $true
+          }
+          ./tools/prepare-release.ps1 @parameters
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -89,14 +102,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ github.ref_name }}'
+          $signed = '${{ steps.signing.outputs.signed }}' -eq 'true'
+          $version = $tag.Substring(1)
+          $assetName = if ($signed) {
+            "GpuThermalGuard-$version-windows-x64.zip"
+          } else {
+            "GpuThermalGuard-$version-unsigned-windows-x64.zip"
+          }
+          $title = if ($signed) {
+            "GpuThermalGuard $tag"
+          } else {
+            "GpuThermalGuard $tag (UNSIGNED prerelease)"
+          }
           $arguments = @(
             'release', 'create', $tag,
             '--verify-tag',
-            '--title', "GpuThermalGuard $tag",
+            '--title', $title,
             '--notes-file', 'dist/release-notes.md',
-            ('dist/GpuThermalGuard-' + $tag.Substring(1) + '-windows-x64.zip'),
+            (Join-Path 'dist' $assetName),
             'dist/SHA256SUMS.txt'
           )
-          if ($tag.Contains('-')) { $arguments += '--prerelease' }
+          if (-not $signed -or $tag.Contains('-')) { $arguments += '--prerelease' }
           & gh @arguments
           if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed.' }

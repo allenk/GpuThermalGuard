@@ -21,7 +21,7 @@ All notable changes to this project will be documented in this file.
 
 - Automatic restore keeps the trip count, immediately rearms monitoring, and can re-trip on the first dangerous sample.
 - A power-limit write is never reported as successful until the value is read back.
-- Release automation requires Authenticode signing before a GitHub Release can be published.
+- Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
 [Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.8.0-beta.1...HEAD
 [0.8.0-beta.1]: https://github.com/allenk/GpuThermalGuard/releases/tag/v0.8.0-beta.1

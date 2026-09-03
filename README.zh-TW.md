@@ -149,7 +149,15 @@ Snapshot 可由主視窗與 Tray 選單建立，也會在溫度保護觸發後�
 
 ## 發佈完整性
 
-正式 Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、強制 Authenticode 簽章、產生 `SHA256SUMS.txt` 與 build-provenance attestation；Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
+Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt` 與 build-provenance attestation。有設定 Authenticode 憑證時，EXE 會先簽章並驗證再封裝；尚無憑證時，只會發布清楚標示的 **unsigned prerelease**，壓縮檔名稱包含 `unsigned`，Release Notes 也會顯示警告。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
+
+下載 Release 壓縮檔後，可驗證該檔案是否確實由本 Repository 的 GitHub Actions workflow 產生：
+
+```powershell
+gh attestation verify .\GpuThermalGuard-<version>-unsigned-windows-x64.zip -R allenk/GpuThermalGuard
+```
+
+Provenance 驗證不能取代 Authenticode 發行者身分或惡意程式掃描；Windows SmartScreen 仍可能警告尚未簽章的 prerelease EXE。
 
 ## 作者
 
