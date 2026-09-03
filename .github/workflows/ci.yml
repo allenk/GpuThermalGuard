@@ -16,7 +16,9 @@ concurrency:
 
 jobs:
   windows-x64:
-    runs-on: windows-2025
+    # windows-2025 moved to the VS 2026 image in June 2026. This project is
+    # deliberately pinned to the VS 2022/v143 toolchain.
+    runs-on: windows-2022
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

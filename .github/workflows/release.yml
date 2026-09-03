@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   release-windows-x64:
-    runs-on: windows-2025
+    # windows-2025 moved to the VS 2026 image in June 2026. Keep release
+    # binaries reproducible with the project's VS 2022/v143 baseline.
+    runs-on: windows-2022
     permissions:
       contents: write
       id-token: write
