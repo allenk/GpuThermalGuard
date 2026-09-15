@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.9.0-beta.1] - 2026-09-15
+
 ### Added
 
 - Dedicated high-priority protection scheduling, independent of the desktop message loop, with delay and telemetry-loss safety handling.
@@ -18,8 +20,6 @@ All notable changes to this project will be documented in this file.
 - Deferred bounded logging and OSD drawing/resource handling for long-running sessions.
 - Non-activating OSD visibility repair after session/display changes and sustained ordinary-window obstruction.
 - Updated English/Traditional Chinese documentation and screenshots, with a clearly separated preview of the unreleased private System Monitor integration.
-
-The synchronized source candidate uses version **0.9.0**. A release tag and date have not yet been assigned.
 
 ## [0.8.0-beta.1] - 2026-09-03
 
@@ -40,5 +40,6 @@ The synchronized source candidate uses version **0.9.0**. A release tag and date
 - A power-limit write is never reported as successful until the value is read back.
 - Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
-[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.8.0-beta.1...HEAD
+[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.1...HEAD
+[0.9.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.8.0-beta.1...v0.9.0-beta.1
 [0.8.0-beta.1]: https://github.com/allenk/GpuThermalGuard/releases/tag/v0.8.0-beta.1
