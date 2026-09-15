@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(GpuThermalGuard VERSION 0.8.0 LANGUAGES CXX)
+project(GpuThermalGuard VERSION 0.9.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "GpuThermalGuard currently supports Windows only")
@@ -46,6 +46,9 @@ add_library(gtg_core STATIC
     src/core/protection.cpp
     src/core/protection.hpp
     src/core/restore_policy.hpp
+    src/logging/deferred_queue.hpp
+    src/timing/protection_thread_policy.hpp
+    src/timing/protection_timing.hpp
 )
 target_include_directories(gtg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(gtg_core PUBLIC gtg_build_options)
@@ -60,6 +63,7 @@ target_link_libraries(gtg_nvml PUBLIC gtg_build_options nvml_headers)
 add_library(gtg_telemetry STATIC
     src/telemetry/telemetry_history.cpp
     src/telemetry/telemetry_history.hpp
+    src/telemetry/telemetry_freshness.hpp
 )
 target_include_directories(gtg_telemetry PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(gtg_telemetry PUBLIC gtg_build_options)
@@ -73,11 +77,13 @@ target_link_libraries(gtg_snapshot PUBLIC gtg_build_options gdiplus shell32)
 
 add_executable(GpuThermalGuardProbe
     src/probe_main.cpp
+    src/logging/logger.cpp
 )
 target_link_libraries(GpuThermalGuardProbe PRIVATE gtg_nvml gtg_build_options)
 
 add_executable(GpuThermalGuard WIN32
     src/app_main.cpp
+    src/supervision/supervisor.cpp
     src/service/service_main.cpp
     src/service/service_main.hpp
     src/settings/settings.cpp
@@ -87,6 +93,8 @@ add_executable(GpuThermalGuard WIN32
     src/ipc/protocol.hpp
     src/logging/logger.cpp
     src/logging/logger.hpp
+    src/protection/local_protection_worker.cpp
+    src/protection/local_protection_worker.hpp
     src/tray/history_chart.cpp
     src/tray/history_chart.hpp
     src/tray/main_dialog.cpp
@@ -109,6 +117,8 @@ target_link_libraries(GpuThermalGuard PRIVATE
     comctl32
     uxtheme
     gdiplus
+    wtsapi32
+    dwmapi
 )
 if(GTG_OSD_CLICK_THROUGH)
     target_compile_definitions(GpuThermalGuard PRIVATE GTG_OSD_CLICK_THROUGH=1)
@@ -121,11 +131,14 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(gtg_tests
         tests/test_main.cpp
+        src/supervision/supervisor.cpp
         tests/wtl_compile_probe.cpp
+        src/logging/logger.cpp
     )
     target_link_libraries(gtg_tests PRIVATE gtg_core gtg_telemetry gtg_snapshot
-        gtg_build_options wtl user32 gdi32)
+        gtg_build_options nvml_headers wtl user32 gdi32 advapi32)
     add_test(NAME gtg_tests COMMAND gtg_tests)
+    set_tests_properties(gtg_tests PROPERTIES TIMEOUT 45)
 endif()
 
 if(MSVC)

@@ -15,6 +15,8 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 | --- | --- |
 | ![GpuThermalGuard 主面板](docs/images/dashboard.png) | ![GpuThermalGuard OSD](docs/images/osd.png) |
 
+截圖中的設定屬於單一工作站，不是所有 GPU 的建議門檻。
+
 ## 為什麼打造這個工具
 
 這個專案源自一張長時間執行 AI 推理的 RTX PRO 6000 Blackwell Workstation Edition。持續負載下，Windows 偶爾會發生 TDR 或失去 GPU；反覆出現的事故特徵包括：
@@ -41,18 +43,18 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 ## 設計理念
 
 - **原生、小型**：C++20、Win32、WTL、GDI/GDI+；沒有瀏覽器 runtime 或 GPU UI backend。
-- **快速保護迴圈**：每 200 ms 讀取 NVML telemetry。
+- **獨立保護迴圈**：專用高優先權 worker 以 200 ms 為目標節拍；保護排程不依賴 UI repaint 或訊息迴圈。驅動呼叫仍可能阻塞，因此不是硬即時保證。
 - **Fail-safe 狀態機**：硬溫度門檻不會被 debounce 或平滑化掩蓋。
 - **寫入必須驗證**：功率限制寫入後必須讀回，否則不宣稱保護成功。
 - **安全鎖定**：觸發後維持安全功率；穩定冷卻後才允許人工或明確啟用的自動恢復。
 - **立即重新武裝**：自動恢復不會停止或放寬監控；重新過熱可立即再次觸發。
 - **保存事故證據**：歷史 telemetry、log、觸發次數、wall-time 與自動／手動 PNG snapshot。
 - **Standalone 部署**：MSVC runtime 靜態連結，單一 EXE，不需要旁置 runtime；仍需要 Windows 系統 DLL 與 NVIDIA driver 的 `nvml.dll`。
-- **UI 不依賴 GPU**：即使正在觀察 GPU 不穩定，監控介面仍由 CPU 上的原生 UI 繪製。
+- **CPU 繪製 UI**：程式不使用 GPU rendering backend；Windows 桌面合成仍可能受到繁忙或恢復中的顯示驅動影響。
 
 ## 監控內容
 
-- GPU 溫度與韌體溫度門檻
+- GPU 型號、VBIOS 版本、溫度與韌體溫度門檻
 - 板卡功率與目前／預設功率限制
 - VRAM 百分比與 GiB
 - GPU Loading
@@ -70,7 +72,13 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 6. 穩定冷卻完成後，只允許人工恢復，或在使用者明確勾選 **Auto Restore** 時自動恢復。
 7. 恢復正常功率後讀回驗證，並立即重新武裝保護迴圈。
 
-自動恢復不會清除觸發計數；成功人工恢復或按下 **保存並套用** 才會歸零，方便看出無人看管期間是否反覆觸發。
+累計觸發總數會跨越重啟、人工／自動恢復與 **保存並套用** 持續保留。使用 **本輪觸發** 旁的 **重設** 開始新一輪測試，不會中斷保護或清除累計總數。
+
+**工作功率上限 (W)** 是運作時的功耗牆。**保存並套用** 會透過保護 worker，在安全條件允許時要求套用；不會強行把已鎖定或高溫中的 GPU 恢復到工作功率。啟動程式本身不會提交 Apply。未套用的編輯會有醒目提示；請以目前功率限制與狀態欄確認驗證結果。
+
+恢復失敗會保留鎖定，並嘗試寫回安全功率與讀回驗證。每次鎖定的自動恢復最多嘗試三次、間隔至少五秒，每次仍須通過新鮮的冷卻檢查；永久性錯誤會提早停止重試。Log 保留寫入與讀回證據，人工恢復仍可使用。
+
+OSD 在安全功率鎖定期間顯示 **ALERT**，包含等待恢復的階段。延遲的顯示採樣會標記出來，不會默默冒充即時資料；保護核心的遙測中斷另由保護機制處理。
 
 ## 語言與設定
 
@@ -96,6 +104,8 @@ HKLM\SOFTWARE\GpuThermalGuard
 .\GpuThermalGuard.exe
 .\GpuThermalGuard.exe --tray
 ```
+
+預設／Tray 啟動會由不載入 NVML 的 supervisor 管理監控子程序，兩者使用同一支 EXE。子程序異常失敗後會採退避重試與保守的恢復檢查；使用者明確 Exit 則結束程式。這可縮短中斷，但無法保證驅動故障期間完全沒有保護空窗；不需要另外安裝 supervisor service。
 
 同一支 EXE 也包含 SCM service entry point：
 
@@ -137,6 +147,25 @@ Probe 完全唯讀，不會呼叫任何 NVML setter。
 ```
 
 Snapshot 可由主視窗與 Tray 選單建立，也會在溫度保護觸發後自動保存。即使視窗隱藏，仍會在不搶 focus 的情況下繪製並保存主面板 client area。
+
+## 桌面以外：私人 System Monitor 延伸實驗
+
+長時間 AI 推理不一定有人守在工作站旁。另一個獨立、私人的 **System Monitor** 正在探索遠端瀏覽器儀表板：集中顯示 GPU／CPU 活動、實體記憶體與 commit 使用量、磁碟容量，以及 GTG 保護事件。
+
+GTG 維持本機、standalone 設計。獨立 collector 把 GTG log 當作其中一個資訊來源，另外收集主機資源，再上傳到有存取控制的 Web 應用。網路連線不參與 GTG 的溫控決策；log 時間戳與過期標示用來區分歷史證據與即時狀態。
+
+<img src="docs/images/remote-system-monitor.png" alt="私人 System Monitor：GTG 保護事件與系統資源總覽" width="760">
+
+點選指標可查看 detail，調整時間範圍與圖表尺度。VRAM 範例也展示私人、固定動作的 WSL 推理工作流程，可停止或啟動模型；這些動作屬於獨立 companion，不是 GTG 保護控制器。截圖保留先前失敗與後續成功的歷史紀錄。
+
+<details>
+<summary>展開私人 VRAM detail 與推理工作流程範例</summary>
+
+<img src="docs/images/remote-vram-detail.png" alt="私人 VRAM detail：模型選擇、限定的 WSL 動作與操作歷史" width="760">
+
+</details>
+
+**僅供預覽：** System Monitor、collector、後端、權證與遠端控制尚未開源，也不包含在此 repository 或 GTG release。截圖展示的是可能的整合應用，不是已提供的 GTG 功能或對外開放的託管服務。GTG 本機保護不需要雲端帳號或網路連線。
 
 ## 目前限制
 

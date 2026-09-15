@@ -8,8 +8,10 @@
 #include <atlbase.h>
 #include <atlapp.h>
 #include <atlwin.h>
+#include <wtsapi32.h>
 
 #include "telemetry/telemetry_history.hpp"
+#include "telemetry/telemetry_freshness.hpp"
 
 namespace gtg::tray {
 
@@ -57,12 +59,12 @@ public:
         MESSAGE_HANDLER(WM_DPICHANGED, OnDpiChanged)
         MESSAGE_HANDLER(WM_DISPLAYCHANGE, OnDisplayChanged)
         MESSAGE_HANDLER(WM_SETTINGCHANGE, OnDisplayChanged)
+        MESSAGE_HANDLER(WM_WTSSESSION_CHANGE, OnSessionChanged)
+        MESSAGE_HANDLER(WM_POWERBROADCAST, OnPowerBroadcast)
         MESSAGE_HANDLER(WM_EXITSIZEMOVE, OnExitSizeMove)
         MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBackground)
         MESSAGE_HANDLER(WM_TIMER, OnRefreshTimer)
     END_MSG_MAP()
-
-    static constexpr UINT kPlacementChangedMessage = WM_APP + 45;
 
     [[nodiscard]] bool Initialize(HWND notification_window,
                                   const telemetry::History* history,
@@ -75,6 +77,7 @@ public:
     void RequestRefresh() noexcept;
     void SetThresholds(int trigger_temperature_c, int safe_power_w,
                        std::optional<double> maximum_power_w) noexcept;
+    void SetCurrentPowerLimit(std::optional<double> current_power_limit_w) noexcept;
     void SetStatus(std::wstring_view status, OsdVisual visual);
     [[nodiscard]] POINT Position() const noexcept;
 
@@ -91,6 +94,8 @@ private:
     LRESULT OnMouseActivate(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnDpiChanged(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnDisplayChanged(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnSessionChanged(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnPowerBroadcast(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnExitSizeMove(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnEraseBackground(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnRefreshTimer(UINT, WPARAM, LPARAM, BOOL&);
@@ -98,9 +103,13 @@ private:
     [[nodiscard]] Layout CurrentLayout() const noexcept;
     [[nodiscard]] bool FitToWorkArea(POINT& position, const Layout& layout) const noexcept;
     void ApplyPosition(POINT position, const Layout& layout) noexcept;
+    void SynchronizeDragHandleToOverlay() noexcept;
     void HandleDragMove(int x, int y) noexcept;
     void HandleDragEnd() noexcept;
+    void ScheduleTopmostRepair(std::wstring_view reason) noexcept;
+    void RepairTopmost() noexcept;
     void RenderLatest() noexcept;
+    void CheckZOrder() noexcept;
     [[nodiscard]] bool Render() noexcept;
 
     static constexpr int kWidthDip = 388;
@@ -109,17 +118,35 @@ private:
     static constexpr std::uint64_t kVisibleDurationMs = 30'000;
     static constexpr std::uint64_t kRenderIntervalMs = 500;
     static constexpr UINT_PTR kRefreshTimerId = 1;
+    static constexpr UINT_PTR kTopmostRepairTimerId = 2;
+    static constexpr UINT kInitialTopmostRepairDelayMs = 350;
+    static constexpr UINT kFollowupTopmostRepairDelayMs = 1'200;
 
     HWND notification_window_{nullptr};
     const telemetry::History* history_{nullptr};
     int trigger_temperature_c_{85};
     int safe_power_w_{300};
     std::optional<double> maximum_power_w_;
+    std::optional<double> current_power_limit_w_;
     std::wstring status_{L"保護狀態初始化中"};
     OsdVisual visual_{OsdVisual::Neutral};
     OsdDragHandle drag_handle_;
     bool synchronizing_position_{false};
     bool refresh_pending_{false};
+    bool session_notifications_registered_{false};
+    HPOWERNOTIFY display_status_notification_{nullptr};
+    std::optional<DWORD> display_status_;
+    std::wstring topmost_repair_reason_;
+    unsigned int topmost_repair_passes_remaining_{};
+    telemetry::FreshnessState freshness_state_{telemetry::FreshnessState::NoData};
+    std::uint64_t recovered_until_ms_{};
+    std::uint64_t next_zorder_check_ms_{};
+    std::uint64_t last_zorder_repair_ms_{};
+    HWND previous_obstruction_{};
+    bool session_locked_{};
+    std::uint64_t last_render_error_ms_{};
+    DWORD render_error_{};
+    bool render_failed_{};
 };
 
 }  // namespace gtg::tray

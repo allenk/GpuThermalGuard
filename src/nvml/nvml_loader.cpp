@@ -3,12 +3,18 @@
 #include <windows.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <sstream>
 #include <utility>
 
+#include "logging/logger.hpp"
+
 namespace gtg::nvml {
 namespace {
+
+std::atomic<std::uint64_t> g_power_operation_id{0};
 
 template <typename Function>
 Function GetExport(void* module, const char* name) noexcept {
@@ -75,6 +81,10 @@ void Library::Reset() noexcept {
         (void)shutdown_();
     }
     initialized_ = false;
+    bound_device_ = nullptr;
+    bound_device_index_ = 0;
+    bound_minimum_power_mw_.reset();
+    bound_maximum_power_mw_.reset();
     if (module_ != nullptr) {
         ::FreeLibrary(static_cast<HMODULE>(module_));
         module_ = nullptr;
@@ -164,15 +174,19 @@ std::optional<int> Library::ReadTemperature(const nvmlDevice_t device) const {
         nvmlTemperature_t temperature{};
         temperature.version = nvmlTemperature_v1;
         temperature.sensorType = NVML_TEMPERATURE_GPU;
-        if (device_get_temperature_v_(device, &temperature) == NVML_SUCCESS) {
+        last_temperature_result_ = device_get_temperature_v_(device, &temperature);
+        if (last_temperature_result_ == NVML_SUCCESS) {
             return temperature.temperature;
         }
+        if (last_temperature_result_ != NVML_ERROR_NOT_SUPPORTED &&
+            last_temperature_result_ != NVML_ERROR_FUNCTION_NOT_FOUND &&
+            last_temperature_result_ != NVML_ERROR_ARGUMENT_VERSION_MISMATCH) return std::nullopt;
     }
 
     if (device_get_temperature_legacy_ != nullptr) {
         unsigned int temperature = 0;
-        if (device_get_temperature_legacy_(device, NVML_TEMPERATURE_GPU, &temperature) ==
-            NVML_SUCCESS) {
+        last_temperature_result_ = device_get_temperature_legacy_(device, NVML_TEMPERATURE_GPU, &temperature);
+        if (last_temperature_result_ == NVML_SUCCESS) {
             return static_cast<int>(temperature);
         }
     }
@@ -308,6 +322,187 @@ std::vector<DeviceSnapshot> Library::ProbeDevices() {
     return snapshots;
 }
 
+bool Library::BindDevice(const unsigned int device_index) {
+    bound_device_ = nullptr;
+    bound_uuid_.clear();
+    if (!initialized_) {
+        last_error_ = "NVML is not initialized";
+        return false;
+    }
+    nvmlDevice_t device = nullptr;
+    const nvmlReturn_t handle_result =
+        device_get_handle_by_index_v2_(device_index, &device);
+    if (handle_result != NVML_SUCCESS) {
+        last_error_ = "nvmlDeviceGetHandleByIndex_v2 failed: " + ErrorText(handle_result);
+        return false;
+    }
+
+    std::array<char, NVML_DEVICE_UUID_BUFFER_SIZE> uuid{};
+    const auto uuid_result = device_get_uuid_(device, uuid.data(), static_cast<unsigned>(uuid.size()));
+    if (uuid_result != NVML_SUCCESS) {
+        last_error_ = "nvmlDeviceGetUUID failed: " + ErrorText(uuid_result);
+        return false;
+    }
+
+    unsigned int minimum = 0;
+    unsigned int maximum = 0;
+    const nvmlReturn_t constraint_result =
+        device_get_power_constraints_(device, &minimum, &maximum);
+    if (constraint_result != NVML_SUCCESS) {
+        last_error_ = "nvmlDeviceGetPowerManagementLimitConstraints failed: " +
+                      ErrorText(constraint_result);
+        return false;
+    }
+
+    bound_device_ = device;
+    bound_uuid_ = uuid.data();
+    bound_device_index_ = device_index;
+    bound_minimum_power_mw_ = minimum;
+    bound_maximum_power_mw_ = maximum;
+    last_error_.clear();
+    return true;
+}
+
+bool Library::BindDeviceByUuid(const std::string& uuid) {
+    if (uuid.empty()) return BindDevice(0);
+    bound_device_ = nullptr;
+    if (!initialized_) return false;
+    unsigned count{};
+    if (device_get_count_v2_(&count) != NVML_SUCCESS) return false;
+    for (unsigned index = 0; index < count; ++index) {
+        if (BindDevice(index) && bound_uuid_ == uuid) return true;
+    }
+    bound_device_ = nullptr;
+    bound_uuid_.clear();
+    last_error_ = "Original GPU UUID unavailable; refusing another GPU";
+    return false;
+}
+
+std::optional<int> Library::ReadBoundTemperature() {
+    if (bound_device_ == nullptr) {
+        last_error_ = "No NVML device is bound";
+        return std::nullopt;
+    }
+    const auto temperature = ReadTemperature(bound_device_);
+    if (!temperature.has_value()) {
+        last_error_ = "bound-device temperature query failed code=" +
+            std::to_string(static_cast<int>(last_temperature_result_)) + ": " + ErrorText(last_temperature_result_);
+    } else {
+        last_error_.clear();
+    }
+    return temperature;
+}
+
+std::optional<unsigned int> Library::ReadBoundPowerUsageMillwatts() {
+    if (bound_device_ == nullptr) {
+        last_error_ = "No NVML device is bound";
+        return std::nullopt;
+    }
+    auto value = ReadUnsigned(device_get_power_usage_, bound_device_);
+    if (!value.has_value()) {
+        last_error_ = "bound-device power-usage query failed";
+    } else {
+        last_error_.clear();
+    }
+    return value;
+}
+
+std::optional<unsigned int> Library::ReadBoundPowerLimitMillwatts() {
+    if (bound_device_ == nullptr) {
+        last_error_ = "No NVML device is bound";
+        return std::nullopt;
+    }
+    auto value = ReadUnsigned(device_get_power_limit_, bound_device_);
+    if (!value.has_value()) {
+        last_error_ = "bound-device power-limit query failed";
+    } else {
+        last_error_.clear();
+    }
+    return value;
+}
+
+bool Library::SetBoundPowerLimitWatts(const unsigned int watts, const wchar_t* context) {
+    last_power_result_ = {};
+    last_power_result_.operation_id =
+        g_power_operation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    last_power_result_.requested_mw = static_cast<std::uint64_t>(watts) * 1000ULL;
+    auto finish = [&]() {
+        // Never let formatting/allocation failure alter the hardware result.
+        // This bounded queue does not wait on disk or the journal mutex.
+        try {
+            const auto message = FormatPowerOperationResult(last_power_result_,
+                context != nullptr ? context : L"power");
+            if (last_power_result_.verified) {
+                (void)logging::TryInfo(message);
+            } else {
+                (void)logging::TryWarning(message);
+            }
+        } catch (...) {
+            (void)logging::TryWarning(L"POWER_OP diagnostic formatting failed");
+        }
+        return last_power_result_.verified;
+    };
+    auto precondition_failure = [&](const char* message) {
+        last_error_ = message;
+        last_power_result_.precondition_error = message;
+        return finish();
+    };
+    if (bound_device_ == nullptr || !bound_minimum_power_mw_ || !bound_maximum_power_mw_) {
+        return precondition_failure("No NVML device is bound");
+    }
+    if (device_set_power_limit_ == nullptr) {
+        return precondition_failure("nvml.dll does not expose nvmlDeviceSetPowerManagementLimit");
+    }
+    if (device_get_power_limit_ == nullptr) {
+        return precondition_failure("nvml.dll does not expose nvmlDeviceGetPowerManagementLimit");
+    }
+    if (watts > (std::numeric_limits<unsigned int>::max() / 1000U)) {
+        return precondition_failure("Requested power limit overflows NVML milliwatts");
+    }
+    const unsigned int milliwatts = watts * 1000U;
+    if (milliwatts < *bound_minimum_power_mw_ || milliwatts > *bound_maximum_power_mw_) {
+        return precondition_failure("Requested power limit is outside the device constraints");
+    }
+    const auto id = last_power_result_.operation_id;
+    try {
+        last_power_result_ = ExecutePowerOperation(milliwatts,
+            [&]() { return device_set_power_limit_(bound_device_, milliwatts); },
+            [&](unsigned int* value) { return device_get_power_limit_(bound_device_, value); },
+            [&](nvmlReturn_t result) { return ErrorText(result); },
+            []() {
+                return std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            });
+    } catch (...) {
+        // A diagnostic allocation may fail after hardware accepted the write.
+        // Return unverified so the caller retains its latch and performs safe
+        // fallback; do not let an exception bypass that safety transaction.
+        (void)logging::TryError(L"POWER_OP evidence capture failed; hardware state unverified");
+        try { last_error_ = "power operation evidence capture failed; hardware state unverified"; }
+        catch (...) { last_error_.clear(); }
+        return finish();
+    }
+    last_power_result_.operation_id = id;
+    try {
+        if (last_power_result_.verified) {
+            last_error_.clear();
+        } else if (last_power_result_.setter->code != NVML_SUCCESS) {
+            last_error_ = "nvmlDeviceSetPowerManagementLimit failed: " +
+                last_power_result_.setter->message;
+        } else {
+            const auto& read = last_power_result_.recheck ?
+                *last_power_result_.recheck : *last_power_result_.readback;
+            last_error_ = read.code != NVML_SUCCESS ?
+                "power limit write acknowledged but read-back failed: " + read.message :
+                "power limit mismatch: requested " + std::to_string(milliwatts) +
+                    " mW, observed " + std::to_string(*read.actual_mw) + " mW";
+        }
+    } catch (...) {
+        last_error_.clear();
+    }
+    return finish();
+}
+
 bool Library::SetPowerLimitWatts(const unsigned int device_index, const unsigned int watts) {
     if (!initialized_) {
         last_error_ = "NVML is not initialized";
@@ -322,43 +517,10 @@ bool Library::SetPowerLimitWatts(const unsigned int device_index, const unsigned
         return false;
     }
 
-    nvmlDevice_t device = nullptr;
-    nvmlReturn_t result = device_get_handle_by_index_v2_(device_index, &device);
-    if (result != NVML_SUCCESS) {
-        last_error_ = "nvmlDeviceGetHandleByIndex_v2 failed: " + ErrorText(result);
-        return false;
+    if (bound_device_ == nullptr || bound_device_index_ != device_index) {
+        if (!BindDevice(device_index)) return false;
     }
-
-    unsigned int minimum = 0;
-    unsigned int maximum = 0;
-    result = device_get_power_constraints_(device, &minimum, &maximum);
-    if (result != NVML_SUCCESS) {
-        last_error_ = "nvmlDeviceGetPowerManagementLimitConstraints failed: " + ErrorText(result);
-        return false;
-    }
-    const unsigned int milliwatts = watts * 1000U;
-    if (milliwatts < minimum || milliwatts > maximum) {
-        last_error_ = "Requested power limit is outside the device constraints";
-        return false;
-    }
-
-    result = device_set_power_limit_(device, milliwatts);
-    if (result != NVML_SUCCESS) {
-        last_error_ = "nvmlDeviceSetPowerManagementLimit failed: " + ErrorText(result);
-        return false;
-    }
-    unsigned int verified = 0;
-    result = device_get_power_limit_(device, &verified);
-    if (result != NVML_SUCCESS) {
-        last_error_ = "power limit was written but read-back failed: " + ErrorText(result);
-        return false;
-    }
-    if (verified != milliwatts) {
-        last_error_ = "power limit read-back did not match the requested value";
-        return false;
-    }
-    last_error_.clear();
-    return true;
+    return SetBoundPowerLimitWatts(watts);
 }
 
 }  // namespace gtg::nvml

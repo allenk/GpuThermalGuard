@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <nvml.h>
+#include "nvml/power_operation.hpp"
 
 namespace gtg::nvml {
 
@@ -42,11 +43,23 @@ public:
     [[nodiscard]] bool Initialize();
     [[nodiscard]] std::string driver_version() const;
     [[nodiscard]] std::vector<DeviceSnapshot> ProbeDevices();
+    [[nodiscard]] bool BindDevice(unsigned int device_index);
+    [[nodiscard]] bool BindDeviceByUuid(const std::string& uuid);
+    [[nodiscard]] const std::string& bound_uuid() const noexcept { return bound_uuid_; }
+    [[nodiscard]] std::optional<int> ReadBoundTemperature();
+    [[nodiscard]] std::optional<unsigned int> ReadBoundPowerUsageMillwatts();
+    [[nodiscard]] std::optional<unsigned int> ReadBoundPowerLimitMillwatts();
+    [[nodiscard]] bool SetBoundPowerLimitWatts(
+        unsigned int watts, const wchar_t* context = L"power");
     [[nodiscard]] bool SetPowerLimitWatts(unsigned int device_index, unsigned int watts);
     [[nodiscard]] bool can_set_power_limit() const noexcept {
         return device_set_power_limit_ != nullptr;
     }
     [[nodiscard]] const std::string& last_error() const noexcept { return last_error_; }
+    // Copy before another setter if retaining evidence across safe fallback.
+    [[nodiscard]] const PowerOperationResult& last_power_result() const noexcept {
+        return last_power_result_;
+    }
 
 private:
     template <typename Function>
@@ -63,6 +76,13 @@ private:
     void* module_{nullptr};
     bool initialized_{false};
     std::string last_error_;
+    std::string bound_uuid_;
+    mutable nvmlReturn_t last_temperature_result_{NVML_SUCCESS};
+    PowerOperationResult last_power_result_;
+    nvmlDevice_t bound_device_{nullptr};
+    unsigned int bound_device_index_{};
+    std::optional<unsigned int> bound_minimum_power_mw_;
+    std::optional<unsigned int> bound_maximum_power_mw_;
 
     decltype(&::nvmlInit_v2) init_v2_{nullptr};
     decltype(&::nvmlShutdown) shutdown_{nullptr};

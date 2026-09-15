@@ -1,4 +1,6 @@
 #include "tray/main_dialog.hpp"
+#include "tray/window_position.hpp"
+#include "supervision/supervisor.hpp"
 
 #include <algorithm>
 #include <format>
@@ -22,6 +24,31 @@ constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
 // prevents collisions with other applications that happen to use uID == 1.
 constexpr GUID kTrayIconGuid{
     0x7b0ec2a1, 0x73c9, 0x4cf4, {0xa5, 0x8f, 0x48, 0x52, 0x52, 0x7a, 0x6b, 0x91}};
+
+std::uint64_t CurrentFileTimeValue() noexcept {
+    FILETIME file_time{};
+    GetSystemTimePreciseAsFileTime(&file_time);
+    ULARGE_INTEGER value{};
+    value.LowPart = file_time.dwLowDateTime;
+    value.HighPart = file_time.dwHighDateTime;
+    return value.QuadPart;
+}
+
+std::wstring FormatCompactLocalTime(const std::uint64_t file_time_value) {
+    if (file_time_value == 0) return {};
+    ULARGE_INTEGER value{};
+    value.QuadPart = file_time_value;
+    FILETIME utc{value.LowPart, value.HighPart};
+    FILETIME local{};
+    SYSTEMTIME system_time{};
+    if (FileTimeToLocalFileTime(&utc, &local) == FALSE ||
+        FileTimeToSystemTime(&local, &system_time) == FALSE) {
+        return {};
+    }
+    return std::format(L"{:02}-{:02} {:02}:{:02}",
+                       system_time.wMonth, system_time.wDay,
+                       system_time.wHour, system_time.wMinute);
+}
 
 std::wstring Utf8ToWide(const std::string& text) {
     if (text.empty()) return {};
@@ -57,6 +84,49 @@ HICON LoadDpiIcon(HWND control, const UINT resource_id, const int size_dip) {
         MAKEINTRESOURCEW(resource_id), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
 }
 
+bool SaveOsdWindowPosition(const OsdOverlay& overlay,
+                           const std::wstring_view reason) noexcept {
+    const auto position = ReadWindowPosition(overlay.m_hWnd);
+    if (!position) return false;
+    std::wstring error;
+    if (!settings::SaveOsdPosition(position->x, position->y, error)) {
+        logging::Warning(error);
+        return false;
+    }
+    logging::Info(std::format(
+        L"OSD placement saved; position=({}, {}) reason={}",
+        position->x, position->y, reason));
+    return true;
+}
+
+bool RestoreOsdWindowPosition(HWND notification_window,
+                              const telemetry::History* history,
+                              OsdOverlay& overlay,
+                              settings::OsdPreference& preference) {
+    preference = settings::LoadOsdPreference();
+    bool placement_repaired = false;
+    const bool ready = overlay.Initialize(
+        notification_window, history, preference.has_position,
+        {preference.x, preference.y}, placement_repaired);
+    if (!ready) {
+        logging::Warning(L"OSD placement restore failed because overlay initialization failed");
+        return false;
+    }
+
+    const POINT applied = overlay.Position();
+    if (preference.has_position) {
+        logging::Info(std::format(
+            L"OSD placement restored; saved=({}, {}) applied=({}, {}) repaired={}",
+            preference.x, preference.y, applied.x, applied.y, placement_repaired));
+    } else {
+        logging::Info(std::format(
+            L"OSD placement initialized from default; applied=({}, {})",
+            applied.x, applied.y));
+    }
+
+    return true;
+}
+
 }  // namespace
 
 LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
@@ -70,44 +140,48 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     SetStatus(localization::Select(L"初始化中…", L"Initializing…"), StatusVisual::Neutral);
     UpdateWallTime();
     ReloadSnapshotIcon();
-    CenterWindow();
+    RestoreMainWindowPosition();
     const auto loaded_settings = settings::Load();
     config_ = loaded_settings.config;
     trigger_count_ = settings::LoadTriggerCount();
+    const settings::TriggerTestRun test_run = settings::LoadTriggerTestRun();
+    if (test_run.loaded) {
+        test_run_baseline_ = test_run.baseline;
+        test_run_started_file_time_ = test_run.started_file_time;
+    }
     SetDlgItemInt(IDC_NORMAL_POWER, static_cast<UINT>(config_.normal_power_w), FALSE);
     SetDlgItemInt(IDC_SAFE_POWER, static_cast<UINT>(config_.safe_power_w), FALSE);
     SetDlgItemInt(IDC_TRIGGER_TEMP, static_cast<UINT>(config_.trigger_temperature_c), FALSE);
     CheckDlgButton(IDC_AUTO_RESTORE, config_.auto_restore ? BST_CHECKED : BST_UNCHECKED);
+    SetSettingsDirty(false);
     ApplyLocalization();
     CheckDlgButton(IDC_CLOSE_TO_TRAY,
                    settings::LoadCloseToTrayPreference() ? BST_CHECKED : BST_UNCHECKED);
     history_chart_.SubclassWindow(GetDlgItem(IDC_HISTORY));
     history_chart_.SetHistory(&telemetry_history_);
-    const settings::OsdPreference osd_preference = settings::LoadOsdPreference();
-    bool placement_repaired = false;
-    osd_ready_ = osd_overlay_.Initialize(m_hWnd, &telemetry_history_,
-        osd_preference.has_position, {osd_preference.x, osd_preference.y}, placement_repaired);
+    settings::OsdPreference osd_preference;
+    osd_ready_ = RestoreOsdWindowPosition(
+        m_hWnd, &telemetry_history_, osd_overlay_, osd_preference);
     CheckDlgButton(IDC_OSD_ENABLED,
                    osd_ready_ && osd_preference.enabled ? BST_CHECKED : BST_UNCHECKED);
-    if (placement_repaired && osd_ready_) {
-        const POINT position = osd_overlay_.Position();
-        std::wstring position_error;
-        if (settings::SaveOsdPosition(position.x, position.y, position_error)) {
-            logging::Info(L"OSD placement repaired to a visible monitor work area");
-        } else {
-            logging::Warning(position_error);
-        }
-    }
     taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
     activate_message_ = RegisterWindowMessageW(L"GpuThermalGuard.Activate.v1");
     nvml_ready_ = nvml_.Initialize();
+    if (!nvml_ready_) supervision::RequestRecovery();
     logging::Info(nvml_ready_
         ? std::format(L"NVML initialized; driver={}", Utf8ToWide(nvml_.driver_version()))
         : std::format(L"NVML initialization failed: {}", Utf8ToWide(nvml_.last_error())));
-    controller_ = std::make_unique<ProtectionController>(config_);
-    if (settings::LoadSafeLatch()) {
-        (void)controller_->RestorePersistedSafeLatch();
-        logging::Warning(L"persisted safe-power latch restored at startup");
+    ipc::Response startup_service{};
+    service_connected_ = ipc::Send(ipc::Command::Query, startup_service);
+    if (service_connected_) {
+        HandleServiceResponse(startup_service);
+    } else {
+        last_worker_start_attempt_ms_ = GetTickCount64();
+        if (local_protection_.Start(config_, settings::LoadSafeLatch())) {
+            logging::Info(L"dedicated local protection worker started; cadence=200 ms");
+        } else {
+            logging::Error(L"unable to start dedicated local protection worker");
+        }
     }
     history_chart_.SetThresholds(config_.trigger_temperature_c, config_.safe_power_w,
                                  std::nullopt);
@@ -127,6 +201,7 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
 }
 
 LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
+    PollApplyCompletion();
     if (id == kRefreshTimer) {
         const auto now = static_cast<std::uint64_t>(GetTickCount64());
         if (!tray_added_ && now - last_tray_add_attempt_ms_ >= 2'000) {
@@ -148,6 +223,7 @@ LRESULT MainDialog::OnClose(UINT, WPARAM, LPARAM, BOOL&) {
                                               L"The tray icon is unavailable. The Tray UI will exit to avoid becoming inaccessible.").data(),
                         L"GPU Thermal Guard", MB_OK | MB_ICONWARNING);
         }
+        supervision::MarkCleanExit();
         DestroyWindow();
     }
     return 0;
@@ -155,6 +231,11 @@ LRESULT MainDialog::OnClose(UINT, WPARAM, LPARAM, BOOL&) {
 
 LRESULT MainDialog::OnDestroy(UINT, WPARAM, LPARAM, BOOL&) {
     KillTimer(kRefreshTimer);
+    SaveMainWindowPosition();
+    // Hidden OSDs retain their HWND/position. Save before any potentially
+    // blocking worker shutdown and before destroying the painted overlay.
+    if (osd_ready_) (void)SaveOsdWindowPosition(osd_overlay_, L"normal exit");
+    local_protection_.Stop();
     osd_overlay_.Shutdown();
     osd_ready_ = false;
     RemoveTrayIcon();
@@ -179,7 +260,19 @@ LRESULT MainDialog::OnDpiChanged(UINT, WPARAM, LPARAM, BOOL& handled) {
     // Let the dialog manager finish Per-Monitor V2 layout first, then reload an
     // exact-size ICO frame for the new device-pixel scale.
     PostMessageW(kReloadSnapshotIconMessage);
+    PostMessageW(kRepairMainPlacementMessage);
     handled = FALSE;
+    return 0;
+}
+
+LRESULT MainDialog::OnDisplayConfigurationChanged(UINT, WPARAM, LPARAM, BOOL&) {
+    PostMessageW(kRepairMainPlacementMessage);
+    return 0;
+}
+
+LRESULT MainDialog::OnExitSizeMove(UINT, WPARAM, LPARAM, BOOL&) {
+    (void)FitMainWindowToWorkArea();
+    SaveMainWindowPosition();
     return 0;
 }
 
@@ -218,6 +311,50 @@ LRESULT MainDialog::OnCtlColorStatic(UINT, WPARAM wparam, LPARAM lparam, BOOL& h
     SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
     SetBkMode(dc, OPAQUE);
     return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+}
+
+LRESULT MainDialog::OnDrawItem(UINT, WPARAM, const LPARAM lparam, BOOL& handled) {
+    const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
+    if (item == nullptr || item->CtlType != ODT_BUTTON ||
+        item->CtlID != IDC_SAVE_SETTINGS) {
+        handled = FALSE;
+        return 0;
+    }
+
+    const bool selected = (item->itemState & ODS_SELECTED) != 0;
+    const bool disabled = (item->itemState & ODS_DISABLED) != 0;
+    const COLORREF fill = settings_dirty_
+        ? (selected ? RGB(205, 132, 18) : RGB(244, 172, 54))
+        : (selected ? GetSysColor(COLOR_3DSHADOW) : GetSysColor(COLOR_BTNFACE));
+    const COLORREF border = settings_dirty_ ? RGB(176, 104, 0)
+                                            : GetSysColor(COLOR_BTNSHADOW);
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    const HGDIOBJ previous_brush = SelectObject(item->hDC, brush);
+    const HGDIOBJ previous_pen = SelectObject(item->hDC, pen);
+    RoundRect(item->hDC, item->rcItem.left, item->rcItem.top,
+              item->rcItem.right, item->rcItem.bottom, 6, 6);
+    SelectObject(item->hDC, previous_pen);
+    SelectObject(item->hDC, previous_brush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+
+    wchar_t label[128]{};
+    ::GetWindowTextW(item->hwndItem, label, static_cast<int>(_countof(label)));
+    SetBkMode(item->hDC, TRANSPARENT);
+    SetTextColor(item->hDC, disabled ? GetSysColor(COLOR_GRAYTEXT)
+                                    : (settings_dirty_ ? RGB(45, 31, 8)
+                                                       : GetSysColor(COLOR_BTNTEXT)));
+    RECT text_rect = item->rcItem;
+    if (selected) OffsetRect(&text_rect, 1, 1);
+    DrawTextW(item->hDC, label, -1, &text_rect,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if ((item->itemState & ODS_FOCUS) != 0) {
+        RECT focus = item->rcItem;
+        InflateRect(&focus, -3, -3);
+        DrawFocusRect(item->hDC, &focus);
+    }
+    return TRUE;
 }
 
 LRESULT MainDialog::OnTrayMessage(UINT, WPARAM, LPARAM event, BOOL&) {
@@ -295,14 +432,10 @@ LRESULT MainDialog::OnReloadSnapshotIcon(UINT, WPARAM, LPARAM, BOOL&) {
     return 0;
 }
 
-LRESULT MainDialog::OnOsdPlacementChanged(UINT, const WPARAM repaired, LPARAM, BOOL&) {
-    if (!osd_ready_) return 0;
-    const POINT position = osd_overlay_.Position();
-    std::wstring error;
-    if (!settings::SaveOsdPosition(position.x, position.y, error)) {
-        logging::Warning(error);
-    } else if (repaired != FALSE) {
-        logging::Info(L"OSD placement repaired after display configuration change");
+LRESULT MainDialog::OnRepairMainPlacement(UINT, WPARAM, LPARAM, BOOL&) {
+    if (FitMainWindowToWorkArea()) {
+        SaveMainWindowPosition();
+        logging::Info(L"main window placement repaired to a visible monitor work area");
     }
     return 0;
 }
@@ -327,13 +460,14 @@ LRESULT MainDialog::OnRegisteredMessage(UINT message, WPARAM, LPARAM, BOOL& hand
 }
 
 LRESULT MainDialog::OnValidateSettings(WORD, WORD, HWND, BOOL&) {
+    if (apply_pending_) return 0;
     if (service_connected_) {
         MessageBoxW(localization::Select(L"Service 正在執行。請先停止 Service 再修改設定，避免兩邊使用不同參數。",
                                          L"The Service is running. Stop it before changing settings so both components use the same parameters.").data(),
                     L"GPU Thermal Guard", MB_OK | MB_ICONWARNING);
         return 0;
     }
-    if (controller_ && controller_->safe_latched()) {
+    if (local_protection_.Snapshot().safe_latched) {
         MessageBoxW(localization::Select(L"安全功率仍在鎖定中，現在不能更改設定。",
                                          L"Safe power is locked; settings cannot be changed now.").data(), L"GPU Thermal Guard",
                     MB_OK | MB_ICONWARNING);
@@ -374,33 +508,61 @@ LRESULT MainDialog::OnValidateSettings(WORD, WORD, HWND, BOOL&) {
                     MB_OK | MB_ICONWARNING);
         return 0;
     }
-    std::wstring save_error;
-    if (!settings::Save(candidate, save_error)) {
-        MessageBoxW(save_error.c_str(), localization::Select(L"保存設定失敗", L"Save Failed").data(), MB_OK | MB_ICONERROR);
+    if (!local_protection_.RequestApply(candidate)) {
+        MessageBoxW(localization::Select(L"監控核心尚未就緒或有待處理的套用要求。",
+            L"Protection worker is unavailable or an Apply request is pending.").data(),
+            L"GPU Thermal Guard", MB_OK | MB_ICONWARNING);
         return 0;
     }
-    config_ = candidate;
-    controller_ = std::make_unique<ProtectionController>(config_);
-    history_chart_.SetThresholds(config_.trigger_temperature_c, config_.safe_power_w,
-                                 maximum_power_limit_mw_
-                                     ? std::optional<double>(*maximum_power_limit_mw_ / 1000.0)
-                                     : std::nullopt);
-    osd_overlay_.SetThresholds(config_.trigger_temperature_c, config_.safe_power_w,
-                               maximum_power_limit_mw_
-                                   ? std::optional<double>(*maximum_power_limit_mw_ / 1000.0)
-                                   : std::nullopt);
-    logging::Info(std::format(L"settings changed; normal={} W safe={} W trigger={} C auto_restore={}",
-        config_.normal_power_w, config_.safe_power_w, config_.trigger_temperature_c,
-        config_.auto_restore ? L"true" : L"false"));
-    restore_prompt_gate_.Reset();
-    trigger_count_ = 0;
-    std::wstring counter_error;
-    if (!settings::SaveTriggerCount(trigger_count_, counter_error)) logging::Warning(counter_error);
-    ApplyLocalization();
-    MessageBoxW(localization::Select(L"設定已保存到 HKLM，Tray 與 Service 下次啟動時都會使用它。只有觸發保護時才會降低 GPU 功率。",
-                                     L"Settings were saved to HKLM. Tray and Service will use them on next start; GPU power is reduced only on a protection trigger.").data(),
-                L"GPU Thermal Guard", MB_OK | MB_ICONINFORMATION);
+    apply_pending_ = true;
+    for (const int id : {IDC_NORMAL_POWER, IDC_SAFE_POWER, IDC_TRIGGER_TEMP, IDC_AUTO_RESTORE, IDC_SAVE_SETTINGS})
+        ::EnableWindow(GetDlgItem(id), FALSE);
+    SetControlText(IDC_SAVE_SETTINGS, localization::Select(L"套用中…", L"Applying…"));
     return 0;
+}
+
+void MainDialog::PollApplyCompletion() {
+    if (!apply_pending_) return;
+    auto completion = local_protection_.TakeApplyCompletion();
+    if (!completion && local_protection_.IsRunning()) return;
+    // The owner may publish completion between the first read and running=false.
+    // Re-read after observing its exit before reporting failure/restarting it.
+    if (!completion) completion = local_protection_.TakeApplyCompletion();
+    apply_pending_ = false; // clear before any modal dialog pumps messages
+    for (const int id : {IDC_NORMAL_POWER, IDC_SAFE_POWER, IDC_TRIGGER_TEMP, IDC_AUTO_RESTORE, IDC_SAVE_SETTINGS})
+        ::EnableWindow(GetDlgItem(id), TRUE);
+    const bool applied = completion && (completion->result.status == ApplyStatus::Applied ||
+                                        completion->result.status == ApplyStatus::AppliedNotSaved);
+    if (applied) {
+        config_ = completion->config;
+        settings_unsaved_ = completion->result.status == ApplyStatus::AppliedNotSaved;
+        const auto max_power = maximum_power_limit_mw_
+            ? std::optional<double>(*maximum_power_limit_mw_ / 1000.0) : std::nullopt;
+        history_chart_.SetThresholds(config_.trigger_temperature_c, config_.safe_power_w, max_power);
+        osd_overlay_.SetThresholds(config_.trigger_temperature_c, config_.safe_power_w, max_power);
+    }
+    SetSettingsDirty(!applied || settings_unsaved_);
+    ApplyLocalization();
+    std::wstring message;
+    if (applied && !settings_unsaved_) {
+        message = localization::Format(L"工作功率上限 {} W 已寫入並讀回驗證，設定已保存。",
+            L"Working power limit {} W was written, verified and saved.", config_.normal_power_w);
+    } else if (applied) {
+        message = localization::Select(L"工作功率已套用，但設定保存失敗。重啟可能使用舊設定；請重試並查看 LOG。",
+            L"Working power is active, but saving failed. Restart may use old settings; retry and check the log.");
+    } else if (completion && completion->result.status == ApplyStatus::WriteFailed) {
+        message = completion->result.safe_verified
+            ? localization::Select(L"工作功率驗證失敗；已回到安全功率並鎖定。請查看 LOG。",
+                L"Working power verification failed; safe power verified and latched. See log.")
+            : localization::Select(L"工作功率及安全回退均未驗證！保護核心持續重試，請查看 LOG。",
+                L"Working power and safe fallback are UNVERIFIED! Protection keeps retrying; see log.");
+    } else {
+        message = localization::Select(L"未套用：GPU 已鎖定、接近新舊溫度門檻，或監控資料不新鮮。請稍後重試。",
+            L"Not applied: GPU is latched, near the old/new temperature threshold, or monitoring data is unavailable/stale. Retry later.");
+    }
+    if (completion && !completion->detail.empty()) message += L"\n\n" + completion->detail;
+    MessageBoxW(message.c_str(), L"GPU Thermal Guard",
+        MB_OK | (applied && !settings_unsaved_ ? MB_ICONINFORMATION : MB_ICONWARNING));
 }
 
 LRESULT MainDialog::OnHideToTray(WORD, WORD, HWND, BOOL&) {
@@ -452,10 +614,67 @@ LRESULT MainDialog::OnLanguageChanged(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 
+LRESULT MainDialog::OnProtectionSettingChanged(WORD, WORD, HWND, BOOL&) {
+    RefreshSettingsDirtyState();
+    return 0;
+}
+
 LRESULT MainDialog::OnManualSnapshot(WORD, WORD, HWND, BOOL&) {
     RequestUiSnapshot(snapshot::Reason::Manual, true);
     return 0;
 }
+
+LRESULT MainDialog::OnResetTriggerCount(WORD, WORD, HWND, BOOL&) {
+    const std::uint32_t current_run_count =
+        TestRunTriggerCount(trigger_count_, test_run_baseline_);
+    const int answer = MessageBoxW(
+        localization::Format(
+            L"確定開始新一輪測試並將本輪觸發次數歸零嗎？\n\n"
+            L"目前本輪觸發：{} 次。現有 Log 不會刪除。",
+            L"Start a new test run and reset its trip count to zero?\n\n"
+            L"Current run trips: {}. Existing logs will not be deleted.",
+            current_run_count).c_str(),
+        localization::Select(L"GPU Thermal Guard — 重設測試輪次",
+                             L"GPU Thermal Guard — Reset Test Run").data(),
+        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+    if (answer != IDYES) return 0;
+
+    std::uint32_t observed_total = trigger_count_;
+    if (service_connected_) {
+        ipc::Response response{};
+        if (ipc::Send(ipc::Command::Query, response)) {
+            observed_total = response.trigger_count;
+        }
+    } else if (local_protection_.IsRunning()) {
+        observed_total = local_protection_.Snapshot().trigger_count;
+    } else {
+        observed_total = settings::LoadTriggerCount();
+    }
+
+    const std::uint64_t started = CurrentFileTimeValue();
+    std::wstring error;
+    if (!settings::SaveTriggerTestRun(observed_total, started, error)) {
+        MessageBoxW(error.c_str(), L"GPU Thermal Guard", MB_OK | MB_ICONERROR);
+        logging::Warning(error);
+        return 0;
+    }
+
+    const std::uint32_t previous_run_count =
+        TestRunTriggerCount(observed_total, test_run_baseline_);
+    trigger_count_ = observed_total;
+    test_run_baseline_ = observed_total;
+    test_run_started_file_time_ = started;
+    ApplyLocalization();
+    logging::Info(std::format(
+        L"test run manually reset; previous_run_trips={} lifetime_total={} "
+        L"started={} normal={} W safe={} W trigger={} C auto_restore={}",
+        previous_run_count, observed_total, FormatCompactLocalTime(started),
+        config_.normal_power_w, config_.safe_power_w,
+        config_.trigger_temperature_c,
+        config_.auto_restore ? L"true" : L"false"));
+    return 0;
+}
+
 LRESULT MainDialog::OnTrayOpen(WORD, WORD, HWND, BOOL&) { ShowMainWindow(); return 0; }
 LRESULT MainDialog::OnTrayRefresh(WORD, WORD, HWND, BOOL&) {
     RefreshSnapshot();
@@ -477,7 +696,11 @@ LRESULT MainDialog::OnTrayToggleOsd(WORD, WORD, HWND, BOOL&) {
     SetOsdVisible(!osd_overlay_.Visible(), true);
     return 0;
 }
-LRESULT MainDialog::OnTrayExit(WORD, WORD, HWND, BOOL&) { DestroyWindow(); return 0; }
+LRESULT MainDialog::OnTrayExit(WORD, WORD, HWND, BOOL&) {
+    supervision::MarkCleanExit();
+    DestroyWindow();
+    return 0;
+}
 
 bool MainDialog::AddTrayIcon() {
     if (tray_added_) return true;
@@ -577,6 +800,7 @@ void MainDialog::SetOsdVisible(const bool should_show, const bool persist) {
 }
 
 void MainDialog::ShowMainWindow() {
+    if (FitMainWindowToWorkArea()) SaveMainWindowPosition();
     ShowWindow(SW_RESTORE);
     BringWindowToTop();
     if (SetForegroundWindow(m_hWnd) == FALSE) {
@@ -586,6 +810,7 @@ void MainDialog::ShowMainWindow() {
 }
 
 void MainDialog::RevealProtectionWithoutActivation() {
+    if (FitMainWindowToWorkArea()) SaveMainWindowPosition();
     if (!IsWindowVisible() || IsIconic()) {
         ShowWindow(SW_SHOWNOACTIVATE);
     }
@@ -596,6 +821,7 @@ void MainDialog::RevealProtectionWithoutActivation() {
 
 void MainDialog::RefreshSnapshot() {
     if (!nvml_ready_) {
+        if (!service_connected_) HandleLocalProtection();
         if (!gpu_unavailable_logged_) {
             logging::Error(std::format(L"GPU unavailable: {}", Utf8ToWide(nvml_.last_error())));
             gpu_unavailable_logged_ = true;
@@ -605,6 +831,7 @@ void MainDialog::RefreshSnapshot() {
     }
     const auto devices = nvml_.ProbeDevices();
     if (devices.empty()) {
+        if (!service_connected_) HandleLocalProtection();
         if (!gpu_unavailable_logged_) {
             logging::Error(std::format(L"GPU probe failed: {}", Utf8ToWide(nvml_.last_error())));
             gpu_unavailable_logged_ = true;
@@ -617,26 +844,56 @@ void MainDialog::RefreshSnapshot() {
     }
     if (gpu_unavailable_logged_) logging::Info(L"GPU snapshot stream recovered");
     gpu_unavailable_logged_ = false;
-    RenderSnapshot(devices.front());
+    const auto target_uuid = supervision::TargetUuid();
+    const auto selected = target_uuid.empty() ? devices.begin() :
+        std::find_if(devices.begin(), devices.end(), [&](const auto& device) {
+            return device.uuid == target_uuid;
+        });
+    if (selected == devices.end()) {
+        HandleLocalProtection();
+        RenderUnavailable(localization::Select(L"原 GPU 暫時無法使用，等待恢復",
+                                              L"Original GPU unavailable; waiting for recovery").data());
+        return;
+    }
+    RenderSnapshot(*selected);
     ipc::Response service_response{};
     if (ipc::Send(ipc::Command::Query, service_response)) {
+        // In Service mode the supervisor observes transport availability only;
+        // service recovery itself remains owned by SCM.
+        supervision::ReportHealth(true, false);
+        if (local_protection_.IsRunning()) {
+            local_protection_.Stop();
+            logging::Info(L"local protection worker stopped; Service owns GPU protection");
+        }
         if (!service_connected_) logging::Info(L"connected to protection service; tray is read-only");
         service_connected_ = true;
-        JournalSnapshot(devices.front(), nullptr);
+        JournalSnapshot(*selected, nullptr);
         HandleServiceResponse(service_response);
     } else {
         if (service_connected_) {
             logging::Warning(L"protection service disconnected; tray resumed local protection");
-            controller_ = std::make_unique<ProtectionController>(config_);
             restore_prompt_gate_.Reset();
             previous_service_latched_.reset();
         }
         service_connected_ = false;
-        EvaluateProtection(devices.front());
+        const auto now = static_cast<std::uint64_t>(GetTickCount64());
+        if (!apply_pending_ && !local_protection_.IsRunning() &&
+            now - last_worker_start_attempt_ms_ >= 2'000) {
+            last_worker_start_attempt_ms_ = now;
+            last_local_trip_sequence_ = 0;
+            if (local_protection_.Start(config_, settings::LoadSafeLatch())) {
+                logging::Info(L"dedicated local protection worker started; cadence=200 ms");
+            } else {
+                logging::Error(L"unable to start dedicated local protection worker");
+            }
+        }
+        HandleLocalProtection();
+        JournalSnapshot(*selected, nullptr);
     }
 }
 
 void MainDialog::RenderUnavailable(const std::wstring& status) {
+    osd_overlay_.SetCurrentPowerLimit(std::nullopt);
     latest_cpu_utilization_percent_ = SampleCpuUtilization();
     telemetry_history_.AddSample({GetTickCount64(), std::nullopt, std::nullopt,
                                   std::nullopt, std::nullopt, std::nullopt,
@@ -644,6 +901,7 @@ void MainDialog::RenderUnavailable(const std::wstring& status) {
     history_chart_.NotifyDataChanged();
     osd_overlay_.RequestRefresh();
     SetControlText(IDC_GPU_NAME, localization::Select(L"無法取得", L"Unavailable"));
+    SetControlText(IDC_GPU_VBIOS, L"—");
     SetControlText(IDC_GPU_TEMP, L"—");
     SetControlText(IDC_GPU_POWER, L"—");
     SetControlText(IDC_GPU_VRAM, L"—");
@@ -676,6 +934,8 @@ void MainDialog::RenderSnapshot(const nvml::DeviceSnapshot& s) {
     osd_overlay_.SetThresholds(config_.trigger_temperature_c, config_.safe_power_w,
         s.maximum_power_limit_mw
             ? std::optional<double>(*s.maximum_power_limit_mw / 1000.0) : std::nullopt);
+    osd_overlay_.SetCurrentPowerLimit(s.configured_power_limit_mw
+        ? std::optional<double>(*s.configured_power_limit_mw / 1000.0) : std::nullopt);
     latest_cpu_utilization_percent_ = SampleCpuUtilization();
     telemetry_history_.AddSample({GetTickCount64(),
         s.temperature_c ? std::optional<double>(*s.temperature_c) : std::nullopt,
@@ -688,6 +948,8 @@ void MainDialog::RenderSnapshot(const nvml::DeviceSnapshot& s) {
     history_chart_.NotifyDataChanged();
     osd_overlay_.RequestRefresh();
     SetControlText(IDC_GPU_NAME, Utf8ToWide(s.name));
+    SetControlText(IDC_GPU_VBIOS,
+                   s.vbios_version.empty() ? L"—" : Utf8ToWide(s.vbios_version));
     SetControlText(IDC_GPU_TEMP, s.temperature_c ? std::format(L"{} °C", *s.temperature_c) : L"—");
     SetControlText(IDC_GPU_POWER, s.power_usage_mw ? std::format(L"{:.1f} W", *s.power_usage_mw / 1000.0) : L"—");
     SetControlText(IDC_GPU_VRAM,
@@ -707,189 +969,131 @@ void MainDialog::RenderSnapshot(const nvml::DeviceSnapshot& s) {
         s.shutdown_tlimit_c.value_or(0)));
 }
 
-void MainDialog::EvaluateProtection(const nvml::DeviceSnapshot& s) {
-    if (!controller_ || !s.temperature_c.has_value()) return;
-    const auto now = static_cast<std::int64_t>(GetTickCount64());
-    ProtectionDecision decision = controller_->ObserveTemperature(now, *s.temperature_c);
+void MainDialog::HandleLocalProtection() {
+    const auto snapshot = local_protection_.Snapshot();
+    if (trigger_count_ != snapshot.trigger_count) {
+        trigger_count_ = snapshot.trigger_count;
+        ApplyLocalization();
+    }
 
-    if (decision.action == ProtectionAction::ApplySafePower) {
-        const bool applied = nvml_.SetPowerLimitWatts(
-            s.index, static_cast<unsigned int>(config_.safe_power_w));
-        std::wstring latch_error;
-        (void)settings::SaveSafeLatch(true, latch_error);
-        logging::Warning(std::format(
-            L"TRIGGER reason={} temp={} C rise={:.2f} C/s predicted={:.1f} C; requested={} W result={}",
-            Utf8ToWide(ToString(decision.trip_reason)), *s.temperature_c,
-            decision.rise_c_per_s, decision.predicted_temperature_c, config_.safe_power_w,
-            applied ? L"verified" : L"failed"));
-        if (applied) {
-            ++trigger_count_;
-            std::wstring counter_error;
-            if (!settings::SaveTriggerCount(trigger_count_, counter_error)) {
-                logging::Warning(counter_error);
-            }
-            ApplyLocalization();
-            logging::Warning(std::format(L"safe power applied and verified: {} W",
-                                         config_.safe_power_w));
-            SetStatus(localization::Format(L"已觸發保護：安全功率 {} W 已鎖定",
-                                           L"Protection triggered: safe power locked at {} W",
-                                           config_.safe_power_w), StatusVisual::Protected);
-            SetTrayVisual(IDI_TRAY_PROTECTED,
-                          localization::Select(L"GPU Thermal Guard — 安全功率已鎖定",
-                                               L"GPU Thermal Guard — Safe power locked").data());
-            if (decision.trip_reason != TripReason::None) {
-                RequestUiSnapshot(snapshot::Reason::ThermalTrigger);
-            }
-            RevealProtectionWithoutActivation();
-            ShowProtectionAlert(localization::Select(L"GPU Thermal Guard 已介入",
-                                                      L"GPU Thermal Guard intervened").data(),
-                config_.auto_restore
-                    ? localization::Select(L"GPU 溫度已達到保護條件，功率已降至安全設定；穩定冷卻後將自動恢復。",
-                                           L"GPU temperature reached the protection condition. Safe power is active and will restore automatically after stable cooling.").data()
-                    : localization::Select(L"GPU 溫度已達到保護條件，功率已降至安全設定；穩定冷卻後可手動恢復。",
-                                           L"GPU temperature reached the protection condition. Safe power is active; restore is manual after stable cooling.").data(),
-                NIIF_WARNING);
-        } else {
-            logging::Error(std::format(L"safe power write failed: {}",
-                                       Utf8ToWide(nvml_.last_error())));
-            SetStatus(Utf8ToWide(nvml_.last_error()), StatusVisual::Fault);
+    if (snapshot.trip_sequence > last_local_trip_sequence_) {
+        last_local_trip_sequence_ = snapshot.trip_sequence;
+        restore_prompt_gate_.Reset();
+        RequestUiSnapshot(snapshot::Reason::ThermalTrigger);
+        RevealProtectionWithoutActivation();
+        ShowProtectionAlert(
+            localization::Select(L"GPU Thermal Guard 已介入",
+                                 L"GPU Thermal Guard intervened").data(),
+            config_.auto_restore
+                ? localization::Select(
+                    L"GPU 溫度已達到保護條件，功率已降至安全設定；穩定冷卻後將自動恢復。",
+                    L"GPU temperature reached the protection condition. Safe power is active and will restore automatically after stable cooling.").data()
+                : localization::Select(
+                    L"GPU 溫度已達到保護條件，功率已降至安全設定；穩定冷卻後可手動恢復。",
+                    L"GPU temperature reached the protection condition. Safe power is active; restore is manual after stable cooling.").data(),
+            NIIF_WARNING);
+    }
+
+    if (!snapshot.running || !snapshot.nvml_ready) {
+        if (!snapshot.error.empty()) {
+            SetStatus(Utf8ToWide(snapshot.error), StatusVisual::Fault);
             SetTrayVisual(IDI_TRAY_FAULT,
-                          localization::Select(L"GPU Thermal Guard — 降低功率失敗",
-                                               L"GPU Thermal Guard — Power reduction failed").data());
-            ShowProtectionAlert(localization::Select(L"GPU Thermal Guard 寫入失敗",
-                                                      L"GPU Thermal Guard write failed").data(),
-                localization::Select(L"已偵測到高溫，但 NVML 無法套用安全功率。請立即降低負載。",
-                                     L"High temperature was detected, but NVML could not apply safe power. Reduce load immediately.").data(), NIIF_ERROR);
+                localization::Select(L"GPU Thermal Guard — 保護核心無法使用",
+                                     L"GPU Thermal Guard — Protection worker unavailable").data());
         }
-        last_safe_retry_ms_ = now;
+        return;
     }
 
-    // Journaling follows the safety-critical setter so file I/O can never
-    // delay the first power-limit intervention.
-    JournalSnapshot(s, &decision);
-    if (!last_logged_state_.has_value() || *last_logged_state_ != decision.state) {
-        logging::Info(std::format(L"protection state -> {}; temp={} C rise={:.2f} C/s predicted={:.1f} C",
-            Utf8ToWide(ToString(decision.state)), *s.temperature_c, decision.rise_c_per_s,
-            decision.predicted_temperature_c));
-        last_logged_state_ = decision.state;
-    }
-
-    if (ShouldAutomaticallyRestore(config_.auto_restore, decision.state) &&
-        (last_auto_restore_attempt_ms_ == 0 || now - last_auto_restore_attempt_ms_ >= 5'000)) {
-        last_auto_restore_attempt_ms_ = now;
-        logging::Info(std::format(L"automatic restore eligible; temp={} C target={} W trips={}",
-                                  *s.temperature_c, config_.normal_power_w, trigger_count_));
-        if (nvml_.SetPowerLimitWatts(s.index,
-                                     static_cast<unsigned int>(config_.normal_power_w))) {
-            decision = controller_->RequestRestore(now, *s.temperature_c);
-            std::wstring latch_error;
-            (void)settings::SaveSafeLatch(false, latch_error);
-            restore_prompt_gate_.Reset();
-            logging::Info(std::format(
-                L"automatic normal-power restore verified: {} W; trips retained={}; protection rearmed",
-                config_.normal_power_w, trigger_count_));
-        } else {
-            logging::Error(std::format(
-                L"automatic normal-power restore failed; safe latch retained; retry in 5 s: {}",
-                Utf8ToWide(nvml_.last_error())));
-        }
-    }
-
-    if (decision.safe_latched) {
-        const bool limit_is_safe = s.configured_power_limit_mw.has_value() &&
-            *s.configured_power_limit_mw <= static_cast<unsigned int>(config_.safe_power_w * 1000);
-        if (!limit_is_safe && now - last_safe_retry_ms_ >= 2'000) {
-            if (nvml_.SetPowerLimitWatts(s.index, static_cast<unsigned int>(config_.safe_power_w))) {
-                logging::Warning(std::format(L"safe power re-applied after limit drift: {} W",
-                                             config_.safe_power_w));
-            } else {
-                logging::Error(std::format(L"safe power retry failed: {}",
-                                           Utf8ToWide(nvml_.last_error())));
-            }
-            last_safe_retry_ms_ = now;
-        }
-        SetTrayVisual(decision.state == ProtectionState::ReadyToRestore ? IDI_TRAY_WARNING :
-                      IDI_TRAY_PROTECTED,
-                      decision.state == ProtectionState::ReadyToRestore
-                          ? (config_.auto_restore
-                              ? localization::Select(L"GPU Thermal Guard — 已冷卻，準備自動恢復",
-                                                     L"GPU Thermal Guard — Cooled; automatic restore pending").data()
-                              : localization::Select(L"GPU Thermal Guard — 已冷卻，等待手動恢復",
-                                                     L"GPU Thermal Guard — Cooled; awaiting manual restore").data())
-                          : localization::Select(L"GPU Thermal Guard — 安全功率已鎖定",
-                                                 L"GPU Thermal Guard — Safe power locked").data());
+    if (snapshot.state == ProtectionState::GpuUnavailable) {
         SetStatus(
-            decision.state == ProtectionState::ReadyToRestore
+            snapshot.safe_latched
+                ? localization::Select(
+                    L"保護遙測無法使用；已驗證的安全功率仍保持鎖定",
+                    L"Protection telemetry unavailable; verified safe power remains locked")
+                : localization::Select(
+                    L"保護遙測無法使用；尚未能驗證安全功率",
+                    L"Protection telemetry unavailable; safe power is not yet verified"),
+            snapshot.safe_latched ? StatusVisual::Warning : StatusVisual::Fault);
+        SetTrayVisual(snapshot.safe_latched ? IDI_TRAY_WARNING : IDI_TRAY_FAULT,
+            snapshot.safe_latched
+                ? localization::Select(L"GPU Thermal Guard — 遙測中斷，安全功率已鎖定",
+                                       L"GPU Thermal Guard — Telemetry lost; safe power locked").data()
+                : localization::Select(L"GPU Thermal Guard — 保護遙測無法使用",
+                                       L"GPU Thermal Guard — Protection telemetry unavailable").data());
+    } else if (snapshot.state == ProtectionState::Fault) {
+        SetStatus(localization::Select(
+                      L"安全功率尚未驗證；保護核心將持續重試",
+                      L"Safe power is not verified; protection worker will keep retrying"),
+                  StatusVisual::Fault);
+        SetTrayVisual(IDI_TRAY_FAULT,
+            localization::Select(L"GPU Thermal Guard — 安全功率尚未驗證",
+                                 L"GPU Thermal Guard — Safe power not verified").data());
+    } else if (snapshot.safe_latched) {
+        const bool ready = snapshot.state == ProtectionState::ReadyToRestore;
+        SetStatus(
+            snapshot.auto_restore_exhausted
+                ? localization::Select(L"自動恢復重試已停止；安全功率鎖定，請手動恢復並查看 LOG",
+                                       L"Auto restore retries stopped; safe power locked. Restore manually; see log.")
+                : ready
                 ? (config_.auto_restore
                     ? localization::Select(L"GPU 已穩定冷卻，正在準備自動恢復",
                                            L"GPU has cooled; preparing automatic restore")
                     : localization::Select(L"GPU 已穩定冷卻，等待手動恢復；目前仍保持安全功率",
                                            L"GPU has cooled; awaiting manual restore while safe power remains locked"))
-                : localization::Select(L"安全功率已鎖定；持續監控中",
-                                       L"Safe power is locked; monitoring continues"),
-            decision.state == ProtectionState::ReadyToRestore
-                ? StatusVisual::Warning : StatusVisual::Protected);
-    } else if (decision.state == ProtectionState::PreTrip) {
+                : localization::Select(L"安全功率已鎖定；獨立保護核心持續監控中",
+                                       L"Safe power is locked; dedicated protection worker continues monitoring"),
+            ready ? StatusVisual::Warning : StatusVisual::Protected);
+        SetTrayVisual(ready ? IDI_TRAY_WARNING : IDI_TRAY_PROTECTED,
+            ready
+                ? localization::Select(L"GPU Thermal Guard — 已冷卻，等待恢復",
+                                       L"GPU Thermal Guard — Cooled; awaiting restore").data()
+                : localization::Select(L"GPU Thermal Guard — 安全功率已鎖定",
+                                       L"GPU Thermal Guard — Safe power locked").data());
+    } else if (snapshot.state == ProtectionState::PreTrip) {
         SetStatus(localization::Select(L"接近觸發溫度且正在升溫；等待第二次趨勢確認",
                                        L"Near trigger temperature and rising; awaiting trend confirmation"),
                   StatusVisual::Warning);
         SetTrayVisual(IDI_TRAY_WARNING,
-                      localization::Select(L"GPU Thermal Guard — 接近觸發溫度",
-                                           L"GPU Thermal Guard — Near trigger temperature").data());
-    } else if (decision.state == ProtectionState::Armed) {
-        SetStatus(nvml_.can_set_power_limit()
-            ? localization::Select(L"保護已待命；觸發時將鎖定安全功率",
-                                   L"Protection armed; safe power will lock on trigger")
-            : localization::Select(L"唯讀監控：此 NVML 不支援設定功率限制",
-                                   L"Read-only monitoring: NVML power-limit control unavailable"),
-            nvml_.can_set_power_limit() ? StatusVisual::Armed : StatusVisual::Warning);
-        SetTrayVisual(IDI_TRAY_ARMED,
-            localization::Format(L"GPU Thermal Guard — {} °C · 保護待命",
-                                 L"GPU Thermal Guard — {} °C · Armed",
-                                 *s.temperature_c).c_str());
+            localization::Select(L"GPU Thermal Guard — 接近觸發溫度",
+                                 L"GPU Thermal Guard — Near trigger temperature").data());
+    } else if (snapshot.state == ProtectionState::Armed) {
+        SetStatus(localization::Select(L"保護已待命；獨立核心以 200 ms 節拍監控",
+                                       L"Protection armed; dedicated worker monitors at 200 ms"),
+                  StatusVisual::Armed);
+        if (snapshot.temperature_c.has_value()) {
+            SetTrayVisual(IDI_TRAY_ARMED,
+                localization::Format(L"GPU Thermal Guard — {} °C · 保護待命",
+                                     L"GPU Thermal Guard — {} °C · Armed",
+                                     *snapshot.temperature_c).c_str());
+        }
     }
 
-    if (!config_.auto_restore && restore_prompt_gate_.ShouldPrompt(
-            decision.safe_latched, decision.state == ProtectionState::ReadyToRestore)) {
+    // Presentation only: cooling does not release a verified safety latch.
+    if (snapshot.safe_latched && status_visual_ != StatusVisual::Fault) {
+        osd_overlay_.SetStatus(
+            snapshot.state == ProtectionState::ReadyToRestore
+                ? localization::Select(L"ALERT · 等待恢復", L"ALERT · Awaiting restore")
+                : localization::Select(L"ALERT · 安全功率已鎖定", L"ALERT · Safe power locked"),
+            OsdVisual::Protected);
+    }
+
+    if ((!config_.auto_restore || snapshot.auto_restore_exhausted) && restore_prompt_gate_.ShouldPrompt(
+            snapshot.safe_latched,
+            snapshot.state == ProtectionState::ReadyToRestore)) {
         ShowMainWindow();
         const int answer = MessageBoxW(
-            localization::Format(L"GPU 已持續冷卻到 {} °C 以下。\n\n要將功率恢復為 {} W 嗎？",
-                                 L"GPU has remained below {} °C.\n\nRestore power to {} W?",
-                                 controller_->recovery_temperature_c(),
-                                 config_.normal_power_w).c_str(),
+            localization::Format(
+                L"GPU 已持續冷卻到 {} °C 以下。\n\n要將功率恢復為 {} W 嗎？",
+                L"GPU has remained below {} °C.\n\nRestore power to {} W?",
+                config_.trigger_temperature_c - config_.recovery_delta_c,
+                config_.normal_power_w).c_str(),
             localization::Select(L"GPU Thermal Guard — 可安全恢復",
                                  L"GPU Thermal Guard — Safe to Restore").data(),
             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-        logging::Info(answer == IDYES ? L"user accepted normal-power restore"
-                                      : L"user declined normal-power restore; safe latch retained");
-        if (answer == IDYES) {
-            if (nvml_.SetPowerLimitWatts(s.index, static_cast<unsigned int>(config_.normal_power_w))) {
-                (void)controller_->RequestRestore(now, *s.temperature_c);
-                std::wstring latch_error;
-                (void)settings::SaveSafeLatch(false, latch_error);
-                if (ShouldResetTriggerCount(RestoreInitiator::Manual)) trigger_count_ = 0;
-                std::wstring counter_error;
-                if (!settings::SaveTriggerCount(trigger_count_, counter_error)) {
-                    logging::Warning(counter_error);
-                }
-                ApplyLocalization();
-                SetStatus(localization::Format(L"已手動恢復至 {} W",
-                                               L"Manually restored to {} W",
-                                               config_.normal_power_w),
-                          StatusVisual::Armed);
-                SetTrayVisual(IDI_TRAY_ARMED,
-                              localization::Select(L"GPU Thermal Guard — 保護已待命",
-                                                   L"GPU Thermal Guard — Armed").data());
-                logging::Info(std::format(L"normal power restored and verified: {} W",
-                                          config_.normal_power_w));
-            } else {
-                logging::Error(std::format(L"normal power restore failed: {}",
-                                           Utf8ToWide(nvml_.last_error())));
-                MessageBoxW(Utf8ToWide(nvml_.last_error()).c_str(),
-                            localization::Select(L"恢復功率失敗", L"Power Restore Failed").data(),
-                            MB_OK | MB_ICONERROR);
-            }
-        }
+        logging::Info(answer == IDYES
+            ? L"user requested dedicated-worker normal-power restore"
+            : L"user declined restore; safe latch retained");
+        if (answer == IDYES) local_protection_.RequestManualRestore();
     }
 }
 
@@ -920,7 +1124,10 @@ void MainDialog::JournalSnapshot(const nvml::DeviceSnapshot& s,
                                      static_cast<double>(*s.memory_total_bytes))
         : L"null";
     const std::wstring state = decision
-        ? Utf8ToWide(ToString(decision->state)) : L"ServiceOwned";
+        ? Utf8ToWide(ToString(decision->state))
+        : (service_connected_
+            ? L"ServiceOwned"
+            : Utf8ToWide(ToString(local_protection_.Snapshot().state)));
     logging::Info(std::format(
         L"snapshot temp_c={} power_w={} vram_used_gib={} vram_total_gib={} vram_pct={} "
         L"gpu_load_pct={} cpu_load_pct={} limit_w={} state={}",
@@ -931,9 +1138,13 @@ void MainDialog::JournalSnapshot(const nvml::DeviceSnapshot& s,
 void MainDialog::HandleServiceResponse(const ipc::Response& response) {
     const bool latched = (response.flags & ipc::SafeLatched) != 0;
     const bool ready = (response.flags & ipc::ReadyToRestore) != 0;
+    const auto service_state = static_cast<ProtectionState>(response.protection_state);
     const bool newly_latched = previous_service_latched_.has_value() &&
                                !*previous_service_latched_ && latched;
     const bool newly_counted_trip = HasNewTriggerCount(trigger_count_, response.trigger_count);
+    if (newly_counted_trip || service_state == ProtectionState::Armed) {
+        restore_prompt_gate_.Reset();
+    }
     previous_service_latched_ = latched;
     if (trigger_count_ != response.trigger_count) {
         trigger_count_ = response.trigger_count;
@@ -943,8 +1154,35 @@ void MainDialog::HandleServiceResponse(const ipc::Response& response) {
         RequestUiSnapshot(snapshot::Reason::ServiceTrigger);
         RevealProtectionWithoutActivation();
     }
-    if (latched) {
-        SetStatus(ready
+    if (service_state == ProtectionState::GpuUnavailable) {
+        SetStatus(
+            latched
+                ? localization::Select(
+                    L"Service：保護遙測無法使用；安全功率仍保持鎖定",
+                    L"Service: protection telemetry unavailable; safe power remains locked")
+                : localization::Select(
+                    L"Service：保護遙測無法使用；尚未能驗證安全功率",
+                    L"Service: protection telemetry unavailable; safe power is not verified"),
+            latched ? StatusVisual::Warning : StatusVisual::Fault);
+        SetTrayVisual(latched ? IDI_TRAY_WARNING : IDI_TRAY_FAULT,
+            latched
+                ? localization::Select(L"GPU Thermal Guard Service — 遙測中斷，安全功率已鎖定",
+                                       L"GPU Thermal Guard Service — Telemetry lost; safe power locked").data()
+                : localization::Select(L"GPU Thermal Guard Service — 保護遙測無法使用",
+                                       L"GPU Thermal Guard Service — Protection telemetry unavailable").data());
+    } else if (service_state == ProtectionState::Fault) {
+        SetStatus(localization::Select(
+                      L"Service：安全功率尚未驗證，將持續重試",
+                      L"Service: safe power is not verified; retrying"),
+                  StatusVisual::Fault);
+        SetTrayVisual(IDI_TRAY_FAULT,
+            localization::Select(L"GPU Thermal Guard Service — 安全功率尚未驗證",
+                                 L"GPU Thermal Guard Service — Safe power not verified").data());
+    } else if (latched) {
+        SetStatus(response.win32_error == ERROR_RETRY
+            ? localization::Select(L"Service：自動恢復重試已停止；安全功率鎖定，請查看 LOG 並手動恢復",
+                                   L"Service: auto retries stopped; safe power locked. See log; restore manually.")
+            : ready
             ? (config_.auto_restore
                 ? localization::Select(L"Service：GPU 已冷卻，自動恢復失敗或等待重試",
                                        L"Service: GPU cooled; automatic restore failed or is awaiting retry")
@@ -969,7 +1207,15 @@ void MainDialog::HandleServiceResponse(const ipc::Response& response) {
                                            L"GPU Thermal Guard Service — Armed").data());
     }
 
-    if (!config_.auto_restore && restore_prompt_gate_.ShouldPrompt(latched, ready)) {
+    if (latched && status_visual_ != StatusVisual::Fault) {
+        osd_overlay_.SetStatus(
+            ready
+                ? localization::Select(L"ALERT · 等待恢復", L"ALERT · Awaiting restore")
+                : localization::Select(L"ALERT · 安全功率已鎖定", L"ALERT · Safe power locked"),
+            OsdVisual::Protected);
+    }
+
+    if ((!config_.auto_restore || response.win32_error == ERROR_RETRY) && restore_prompt_gate_.ShouldPrompt(latched, ready)) {
         ShowMainWindow();
         const int answer = MessageBoxW(
             localization::Format(L"Service 回報 GPU 已穩定冷卻。\n\n要恢復為 {} W 嗎？",
@@ -991,7 +1237,6 @@ void MainDialog::HandleServiceResponse(const ipc::Response& response) {
                 logging::Error(std::format(L"service restore request failed; win32={}",
                                            restore_response.win32_error));
             } else {
-                if (ShouldResetTriggerCount(RestoreInitiator::Manual)) trigger_count_ = 0;
                 ApplyLocalization();
                 SetStatus(localization::Select(L"Service 已依使用者要求恢復正常功率",
                                                L"Service restored normal power as requested"), StatusVisual::Armed);
@@ -1087,6 +1332,7 @@ void MainDialog::ApplyLocalization() {
     SetControlText(IDC_STATUS_GROUP,
                    text(L"GPU 即時狀態（唯讀）", L"GPU Status (Read Only)"));
     SetControlText(IDC_GPU_LABEL, L"GPU");
+    SetControlText(IDC_VBIOS_LABEL, L"VBIOS");
     SetControlText(IDC_TEMP_LABEL, text(L"溫度", L"Temp"));
     SetControlText(IDC_POWER_LABEL, text(L"功率", L"Power"));
     SetControlText(IDC_VRAM_LABEL, L"VRAM");
@@ -1096,9 +1342,9 @@ void MainDialog::ApplyLocalization() {
                    text(L"歷史趨勢（5 分鐘視野／1 小時）",
                         L"History (5-minute view / 1 hour)"));
     SetControlText(IDC_SETTINGS_GROUP,
-                   text(L"保護設定（觸發時才會寫入 GPU）",
-                        L"Protection Settings (written only when triggered)"));
-    SetControlText(IDC_NORMAL_POWER_LABEL, text(L"正常功率 (W)", L"Normal Power (W)"));
+                   text(L"保護設定（APPLY 會套用工作功率上限）",
+                        L"Protection Settings (Apply sets working power limit)"));
+    SetControlText(IDC_NORMAL_POWER_LABEL, text(L"工作功率上限 (W)", L"Working Limit (W)"));
     SetControlText(IDC_SAFE_POWER_LABEL, text(L"安全功率 (W)", L"Safe Power (W)"));
     SetControlText(IDC_TRIGGER_TEMP_LABEL, text(L"觸發溫度 (°C)", L"Trigger Temp (°C)"));
     SetControlText(IDC_SETTINGS_NOTE,
@@ -1107,10 +1353,21 @@ void MainDialog::ApplyLocalization() {
     SetControlText(IDC_AUTO_RESTORE, text(L"自動 Restore", L"Auto Restore"));
     SetControlText(IDC_CLOSE_TO_TRAY, text(L"[X] 隱藏到系統匣", L"[X] Hide to tray"));
     SetControlText(IDC_OSD_ENABLED, text(L"顯示 OSD", L"Show OSD"));
-    SetControlText(IDC_SAVE_SETTINGS, text(L"保存並套用", L"Save & Apply"));
+    SetControlText(IDC_SAVE_SETTINGS,
+                   apply_pending_ ? text(L"套用中…", L"Applying…")
+                   : settings_dirty_ ? text(L"保存並套用 ●", L"Save & Apply ●")
+                                   : text(L"保存並套用", L"Save & Apply"));
     SetControlText(IDC_HIDE_TO_TRAY, text(L"隱藏到系統匣", L"Hide to Tray"));
+    SetControlText(IDC_RESET_TRIGGER_COUNT, text(L"重設", L"Reset"));
+    const std::uint32_t run_count =
+        TestRunTriggerCount(trigger_count_, test_run_baseline_);
+    const std::wstring started = FormatCompactLocalTime(test_run_started_file_time_);
     SetControlText(IDC_TRIGGER_COUNT,
-                   localization::Format(L"觸發次數：{}", L"Trips: {}", trigger_count_));
+        started.empty()
+            ? localization::Format(L"本輪觸發：{} · 尚未重設",
+                                   L"Run trips: {} · not reset", run_count)
+            : localization::Format(L"本輪觸發：{} · 自 {}",
+                                   L"Run trips: {} · since {}", run_count, started));
 
     HWND combo = GetDlgItem(IDC_LANGUAGE);
     const int selected = localization::Current() == localization::UiLanguage::English ? 1 : 0;
@@ -1121,6 +1378,32 @@ void MainDialog::ApplyLocalization() {
     SendMessageW(combo, CB_SETCURSEL, selected, 0);
     SendMessageW(combo, WM_SETREDRAW, TRUE, 0);
     ::InvalidateRect(combo, nullptr, TRUE);
+}
+
+void MainDialog::RefreshSettingsDirtyState() {
+    if (apply_pending_) return;
+    bool normal_ok{}, safe_ok{}, temp_ok{};
+    const UINT normal = ReadUnsignedControl(IDC_NORMAL_POWER, normal_ok);
+    const UINT safe = ReadUnsignedControl(IDC_SAFE_POWER, safe_ok);
+    const UINT trigger = ReadUnsignedControl(IDC_TRIGGER_TEMP, temp_ok);
+    const bool auto_restore = IsDlgButtonChecked(IDC_AUTO_RESTORE) == BST_CHECKED;
+    const bool dirty = settings_unsaved_ || !normal_ok || !safe_ok || !temp_ok ||
+        normal != static_cast<UINT>(config_.normal_power_w) ||
+        safe != static_cast<UINT>(config_.safe_power_w) ||
+        trigger != static_cast<UINT>(config_.trigger_temperature_c) ||
+        auto_restore != config_.auto_restore;
+    SetSettingsDirty(dirty);
+}
+
+void MainDialog::SetSettingsDirty(const bool dirty) {
+    if (settings_dirty_ == dirty) return;
+    settings_dirty_ = dirty;
+    SetControlText(IDC_SAVE_SETTINGS,
+        settings_dirty_
+            ? localization::Select(L"保存並套用 ●", L"Save & Apply ●")
+            : localization::Select(L"保存並套用", L"Save & Apply"));
+    HWND button = GetDlgItem(IDC_SAVE_SETTINGS);
+    if (button != nullptr) ::InvalidateRect(button, nullptr, TRUE);
 }
 
 void MainDialog::UpdateWallTime() {
@@ -1148,6 +1431,51 @@ void MainDialog::ReloadSnapshotIcon() {
                         reinterpret_cast<LPARAM>(replacement));
     if (snapshot_icon_ != nullptr) DestroyIcon(snapshot_icon_);
     snapshot_icon_ = replacement;
+}
+
+void MainDialog::RestoreMainWindowPosition() {
+    const auto saved = settings::LoadMainWindowPosition();
+    if (saved.has_position) {
+        SetWindowPos(nullptr, saved.x, saved.y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if (FitMainWindowToWorkArea()) {
+            logging::Info(L"saved main window placement repaired for current displays");
+            SaveMainWindowPosition();
+        }
+        return;
+    }
+    CenterWindow();
+}
+
+bool MainDialog::FitMainWindowToWorkArea() {
+    RECT bounds{};
+    if (GetWindowRect(&bounds) == FALSE) return false;
+    const int width = bounds.right - bounds.left;
+    const int height = bounds.bottom - bounds.top;
+    HMONITOR monitor = MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (monitor == nullptr || GetMonitorInfoW(monitor, &info) == FALSE) return false;
+
+    const int fitted_x = std::clamp(
+        bounds.left, info.rcWork.left,
+        std::max(info.rcWork.left, info.rcWork.right - width));
+    const int fitted_y = std::clamp(
+        bounds.top, info.rcWork.top,
+        std::max(info.rcWork.top, info.rcWork.bottom - height));
+    if (fitted_x == bounds.left && fitted_y == bounds.top) return false;
+    SetWindowPos(nullptr, fitted_x, fitted_y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return true;
+}
+
+void MainDialog::SaveMainWindowPosition() noexcept {
+    if (m_hWnd == nullptr || IsIconic()) return;
+    RECT bounds{};
+    if (GetWindowRect(&bounds) == FALSE) return;
+    std::wstring error;
+    if (!settings::SaveMainWindowPosition(bounds.left, bounds.top, error)) {
+        logging::Warning(error);
+    }
 }
 
 std::optional<double> MainDialog::SampleCpuUtilization() {

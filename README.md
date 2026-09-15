@@ -15,6 +15,8 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 | --- | --- |
 | ![GpuThermalGuard dashboard](docs/images/dashboard.png) | ![GpuThermalGuard OSD](docs/images/osd.png) |
 
+Screenshots show one workstation's settings, not recommended limits for every GPU.
+
 ## Why I built it
 
 This project started with an RTX PRO 6000 Blackwell Workstation Edition used for sustained AI inference. Under long-running workloads, Windows would occasionally report a TDR or lose the GPU. The recurring incident pattern was difficult to ignore:
@@ -41,18 +43,18 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 ## Design principles
 
 - **Native and small** — C++20, Win32, WTL, GDI/GDI+; no browser runtime or GPU rendering backend.
-- **Fast protection loop** — NVML telemetry sampled every 200 ms.
+- **Independent protection loop** — a dedicated high-priority worker targets a 200 ms cadence; UI repaint and message-loop delays do not schedule protection. Driver calls can still stall, so this is not a hard real-time guarantee.
 - **Fail-safe state model** — a hard temperature crossing is never hidden by debounce or smoothing.
 - **Verified writes** — a power-limit change is not reported as successful until it is read back.
 - **Safe latch** — after a trip, safe power remains active until stable cooling permits manual or explicitly enabled automatic restore.
 - **Immediately rearmed** — automatic restore never relaxes monitoring; a renewed over-temperature condition can trip again immediately.
 - **Incident evidence** — rolling telemetry, logs, trip count, wall time, and automatic/manual PNG snapshots.
 - **Standalone deployment** — static MSVC runtime and a single EXE; no sidecar runtime files. Windows system DLLs and the NVIDIA driver's `nvml.dll` are still required.
-- **No GPU dependency for UI** — monitoring remains a CPU-rendered native UI even while probing GPU instability.
+- **CPU-rendered UI** — no application GPU rendering backend; Windows desktop composition can still be delayed by a busy or recovering graphics driver.
 
 ## What it monitors
 
-- GPU temperature and firmware thermal thresholds
+- GPU model, VBIOS version, temperature, and firmware thermal thresholds
 - board power draw and current/default power limits
 - VRAM usage percentage and GiB
 - GPU utilization
@@ -70,7 +72,13 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 6. After the stable-cooling window, offer manual restore or perform it only when **Auto Restore** was explicitly enabled.
 7. Verify normal power after restore and immediately rearm the protection loop.
 
-Automatic restore does not clear the trip counter. A manual restore or **Save & Apply** resets it so repeated unattended cycles remain visible.
+The lifetime trip total persists across restarts, manual/automatic restore, and **Save & Apply**. Use **Reset** beside **Run trips** to begin a new test session without interrupting protection or changing the lifetime total.
+
+**Working Limit (W)** is the operating power ceiling. **Save & Apply** requests that limit through the protection worker only when its safety checks permit it; a latched or hot GPU is not forced back to working power. Starting the application does not submit an Apply request. Unapplied edits are highlighted; inspect the displayed current limit and status for the verified result.
+
+Restore failures retain the latch and attempt a verified safe-power fallback. Automatic recovery is bounded to three attempts per latch, at least five seconds apart and still subject to fresh cooling checks; permanent errors stop retries early. The log records write/readback evidence. Manual restore remains available.
+
+The OSD displays an **ALERT** while safe power is latched, including while waiting for restore. Delayed presentation samples are visually marked rather than silently presented as fresh measurements. Missing protection telemetry is handled separately by the protection core.
 
 ## Language and settings
 
@@ -96,6 +104,8 @@ The default mode is the tray application:
 .\GpuThermalGuard.exe
 .\GpuThermalGuard.exe --tray
 ```
+
+Default/Tray launch uses an NVML-free supervisor and a monitored child, both from the same EXE. Unexpected child failure triggers bounded-backoff restart and conservative recovery checks; intentional Exit stops the application. This reduces outages but cannot guarantee uninterrupted protection during driver failure. No separate supervisor service or installer is required.
 
 The same executable also contains an SCM service entry point:
 
@@ -143,6 +153,25 @@ When the executable directory is not writable, files are stored in standard per-
 ```
 
 Snapshots can be created from the main window or tray menu and are also captured after a thermal trigger. Hidden-window capture renders the dashboard client area without forcing the window to the foreground.
+
+## Beyond the desktop: a private System Monitor experiment
+
+Long-running inference jobs are not always watched from the workstation itself. A separate, private **System Monitor** explores a remote browser dashboard: GPU/CPU activity, physical memory and commit usage, disk capacity, and GTG protection events in one view.
+
+GTG stays local and standalone. The companion collector reads GTG logs as one information source, collects additional host metrics, and sends updates to an access-controlled web application. Remote connectivity is not part of GTG's thermal decision loop. Log timestamps and stale-data indicators distinguish historical evidence from live state.
+
+<img src="docs/images/remote-system-monitor.png" alt="Private System Monitor overview with GTG protection events and resource charts" width="760">
+
+Metric cards open a detail view with selectable time ranges and chart scaling. The VRAM example also shows a private, fixed-action WSL workflow for stopping or launching an inference model; those actions belong to the companion, not to GTG's protection controller. The screenshot includes historical failures as well as a later successful action.
+
+<details>
+<summary>View the private VRAM detail and inference-workflow example</summary>
+
+<img src="docs/images/remote-vram-detail.png" alt="Private VRAM detail with model selection, bounded WSL actions, and action history" width="760">
+
+</details>
+
+**Preview only:** System Monitor, its collector, backend, credentials, and remote controls are not open source or included in this repository or GTG releases. These screenshots illustrate a possible integration, not an available GTG feature or a hosted service offered to users. GTG requires no cloud account or network connection for local protection.
 
 ## Current limitations
 

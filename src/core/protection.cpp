@@ -6,6 +6,12 @@
 
 namespace gtg {
 
+bool ProtectionController::UpdateWorkingConfig(const ProtectionConfig& config) {
+    if (safe_latched_ || state_ != ProtectionState::Armed || ValidateConfig(config)) return false;
+    config_ = config;
+    return true;
+}
+
 std::optional<std::string> ValidateConfig(const ProtectionConfig& config) {
     if (config.normal_power_w <= 0) {
         return "normal power must be positive";
@@ -27,6 +33,12 @@ std::optional<std::string> ValidateConfig(const ProtectionConfig& config) {
     }
     if (config.minimum_rise_c_per_s <= 0.0) {
         return "minimum rise rate must be positive";
+    }
+    if (config.scheduler_delay_fail_safe_ms < 1) {
+        return "scheduler delay fail-safe must be positive";
+    }
+    if (config.sensor_unavailable_fail_safe_ms < 1) {
+        return "sensor unavailable fail-safe must be positive";
     }
     if (config.recovery_stable_ms < 1'000) {
         return "recovery stable duration must be at least one second";
@@ -127,10 +139,26 @@ void ProtectionController::ResetPredictor() noexcept {
 
 ProtectionDecision ProtectionController::ObserveTemperature(
     const std::int64_t monotonic_ms,
-    const int temperature_c) {
+    const int temperature_c,
+    const std::int64_t scheduler_delay_ms) {
     if (state_ == ProtectionState::Fault) {
         return CurrentDecision();
     }
+
+    // Unknown time is not evidence of cooling or a continuous rising trend.
+    // Use the existing telemetry-loss budget rather than accepting arbitrary
+    // gaps just because the next read happens to succeed.
+    bool discontinuity = sensor_unavailable_since_ms_.has_value();
+    if (sample_count_ > 0) {
+        const auto& last = samples_[(sample_start_ + sample_count_ - 1) % kSampleCapacity];
+        discontinuity = discontinuity || monotonic_ms <= last.monotonic_ms ||
+            monotonic_ms - last.monotonic_ms >= config_.sensor_unavailable_fail_safe_ms;
+    }
+    if (discontinuity) {
+        recovery_since_ms_.reset();
+        ResetPredictor();
+    }
+    sensor_unavailable_since_ms_.reset();
 
     PushSample({monotonic_ms, temperature_c});
 
@@ -147,6 +175,9 @@ ProtectionDecision ProtectionController::ObserveTemperature(
                                  std::max(0.0, slope) * config_.prediction_horizon_s;
         const bool near_limit =
             temperature_c >= config_.trigger_temperature_c - config_.predictive_band_c;
+        if (scheduler_delay_ms >= config_.scheduler_delay_fail_safe_ms && near_limit) {
+            return Trip(TripReason::SchedulerDelaySafety, slope, predicted);
+        }
         const bool predictive_condition =
             near_limit && slope >= config_.minimum_rise_c_per_s &&
             predicted >= static_cast<double>(config_.trigger_temperature_c);
@@ -185,12 +216,36 @@ ProtectionDecision ProtectionController::ObserveTemperature(
     return CurrentDecision();
 }
 
-ProtectionDecision ProtectionController::SensorUnavailable() {
+ProtectionDecision ProtectionController::SensorUnavailable(
+    const std::int64_t monotonic_ms) {
+    if (state_ == ProtectionState::Fault) {
+        return CurrentDecision();
+    }
+
+    recovery_since_ms_.reset();
+    predictive_hits_ = 0;
+
+    if (!sensor_unavailable_since_ms_) {
+        if (sample_count_ > 0) {
+            const auto latest = (sample_start_ + sample_count_ - 1) % kSampleCapacity;
+            sensor_unavailable_since_ms_ = samples_[latest].monotonic_ms;
+        } else {
+            sensor_unavailable_since_ms_ = monotonic_ms;
+        }
+    }
+
+    if (!safe_latched_ &&
+        monotonic_ms - *sensor_unavailable_since_ms_ >=
+            config_.sensor_unavailable_fail_safe_ms) {
+        return Trip(TripReason::TelemetryLossSafety, 0.0, 0.0);
+    }
+
     state_ = ProtectionState::GpuUnavailable;
     return CurrentDecision();
 }
 
 ProtectionDecision ProtectionController::SensorRecovered() {
+    sensor_unavailable_since_ms_.reset();
     ResetPredictor();
     recovery_since_ms_.reset();
 
@@ -220,9 +275,17 @@ ProtectionDecision ProtectionController::RestorePersistedSafeLatch() {
 ProtectionDecision ProtectionController::RequestRestore(
     const std::int64_t monotonic_ms,
     const int current_temperature_c) {
-    (void)monotonic_ms;
     if (state_ != ProtectionState::ReadyToRestore ||
         current_temperature_c > recovery_temperature_c()) {
+        return CurrentDecision();
+    }
+
+    if (sample_count_ == 0) return CurrentDecision();
+    const auto last_ms = samples_[(sample_start_ + sample_count_ - 1) % kSampleCapacity].monotonic_ms;
+    if (monotonic_ms < last_ms ||
+        monotonic_ms - last_ms >= config_.sensor_unavailable_fail_safe_ms) {
+        recovery_since_ms_.reset();
+        state_ = ProtectionState::SafeLatched;
         return CurrentDecision();
     }
 
@@ -262,6 +325,8 @@ const char* ToString(const TripReason reason) noexcept {
         case TripReason::None: return "None";
         case TripReason::HardLimit: return "HardLimit";
         case TripReason::PredictedCrossing: return "PredictedCrossing";
+        case TripReason::SchedulerDelaySafety: return "SchedulerDelaySafety";
+        case TripReason::TelemetryLossSafety: return "TelemetryLossSafety";
     }
     return "Unknown";
 }

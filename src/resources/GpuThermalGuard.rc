@@ -14,29 +14,32 @@ EXSTYLE WS_EX_APPWINDOW
 CAPTION "GPU Thermal Guard"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    GROUPBOX "GPU Status (Read Only)", IDC_STATUS_GROUP, 8, 7, 198, 159
-    LTEXT "GPU", IDC_GPU_LABEL, 18, 22, 35, 10
-    LTEXT "Reading...", IDC_GPU_NAME, 57, 22, 139, 18, SS_ENDELLIPSIS
-    LTEXT "Temp", IDC_TEMP_LABEL, 18, 43, 35, 10
-    LTEXT "—", IDC_GPU_TEMP, 57, 43, 48, 10
-    LTEXT "Power", IDC_POWER_LABEL, 111, 43, 31, 10
-    LTEXT "—", IDC_GPU_POWER, 146, 43, 50, 10
-    LTEXT "VRAM", IDC_VRAM_LABEL, 18, 62, 35, 10
-    LTEXT "—", IDC_GPU_VRAM, 57, 62, 139, 10
-    CONTROL "", -1, "Static", SS_ETCHEDHORZ, 18, 77, 178, 1
-    LTEXT "Power Limit", IDC_LIMIT_LABEL, 18, 84, 38, 10
-    LTEXT "—", IDC_GPU_LIMIT, 68, 84, 128, 10
-    LTEXT "T.Limits", IDC_THERMAL_LABEL, 18, 100, 38, 10
-    LTEXT "—", IDC_GPU_THERMAL, 68, 100, 128, 19
-    CONTROL "", -1, "Static", SS_ETCHEDHORZ, 18, 123, 178, 1
-    CONTROL "", IDC_STATUS_ICON, "Static", SS_ICON | SS_CENTERIMAGE, 18, 129, 30, 24
-    LTEXT "Initializing...", IDC_STATUS, 60, 132, 136, 16
-    LTEXT "Trips: 0", IDC_TRIGGER_COUNT, 18, 154, 68, 10
-    LTEXT "0000-00-00  00:00:00", IDC_WALL_TIME, 88, 146, 108, 10, SS_RIGHT
-    GROUPBOX "History (5-minute view / 1 hour)", IDC_HISTORY_GROUP, 212, 7, 210, 159
+    GROUPBOX "GPU Status (Read Only)", IDC_STATUS_GROUP, 8, 7, 198, 163
+    LTEXT "GPU", IDC_GPU_LABEL, 18, 22, 28, 10
+    LTEXT "Reading...", IDC_GPU_NAME, 57, 20, 139, 19
+    LTEXT "VBIOS", IDC_VBIOS_LABEL, 18, 39, 35, 10
+    LTEXT "—", IDC_GPU_VBIOS, 57, 39, 139, 10
+    LTEXT "Temp", IDC_TEMP_LABEL, 18, 55, 35, 10
+    LTEXT "—", IDC_GPU_TEMP, 57, 55, 48, 10
+    LTEXT "Power", IDC_POWER_LABEL, 111, 55, 31, 10
+    LTEXT "—", IDC_GPU_POWER, 146, 55, 50, 10
+    LTEXT "VRAM", IDC_VRAM_LABEL, 18, 70, 35, 10
+    LTEXT "—", IDC_GPU_VRAM, 57, 70, 139, 10
+    CONTROL "", -1, "Static", SS_ETCHEDHORZ, 18, 84, 178, 1
+    LTEXT "Power Limit", IDC_LIMIT_LABEL, 18, 90, 38, 10
+    LTEXT "—", IDC_GPU_LIMIT, 57, 90, 139, 10
+    LTEXT "T.Limits", IDC_THERMAL_LABEL, 18, 105, 38, 10
+    LTEXT "—", IDC_GPU_THERMAL, 57, 105, 139, 18
+    CONTROL "", -1, "Static", SS_ETCHEDHORZ, 18, 126, 178, 1
+    CONTROL "", IDC_STATUS_ICON, "Static", SS_ICON | SS_CENTERIMAGE, 18, 130, 30, 24
+    LTEXT "Initializing...", IDC_STATUS, 60, 132, 136, 15
+    LTEXT "0000-00-00  00:00:00", IDC_WALL_TIME, 88, 147, 108, 8, SS_RIGHT
+    LTEXT "Run trips: 0 · since 00-00 00:00", IDC_TRIGGER_COUNT, 18, 158, 143, 8
+    PUSHBUTTON "Reset", IDC_RESET_TRIGGER_COUNT, 164, 157, 32, 11, WS_TABSTOP
+    GROUPBOX "History (5-minute view / 1 hour)", IDC_HISTORY_GROUP, 212, 7, 210, 163
     CONTROL "", IDC_HISTORY, "Static", SS_NOTIFY, 216, 22, 202, 135
-    GROUPBOX "Protection Settings (written only when triggered)", IDC_SETTINGS_GROUP, 8, 172, 414, 45
-    LTEXT "Normal Power (W)", IDC_NORMAL_POWER_LABEL, 18, 188, 57, 10
+    GROUPBOX "Protection Settings (Apply sets working power limit)", IDC_SETTINGS_GROUP, 8, 172, 414, 45
+    LTEXT "Working Limit (W)", IDC_NORMAL_POWER_LABEL, 18, 188, 59, 10
     EDITTEXT IDC_NORMAL_POWER, 78, 185, 42, 14, ES_NUMBER | ES_AUTOHSCROLL
     LTEXT "Safe Power (W)", IDC_SAFE_POWER_LABEL, 132, 188, 57, 10
     EDITTEXT IDC_SAFE_POWER, 192, 185, 42, 14, ES_NUMBER | ES_AUTOHSCROLL
@@ -46,19 +49,20 @@ BEGIN
             "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 359, 186, 59, 12
     LTEXT "Safe power locks after a trip; choose manual or automatic restore after cooling.", IDC_SETTINGS_NOTE, 18, 204, 395, 10
     CONTROL "[X] Hide to tray", IDC_CLOSE_TO_TRAY,
-            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 18, 228, 101, 12
+            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 18, 228, 75, 12
     CONTROL "Show OSD", IDC_OSD_ENABLED,
-            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 121, 228, 55, 12
-    COMBOBOX IDC_LANGUAGE, 179, 224, 58, 80,
+            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 98, 228, 55, 12
+    COMBOBOX IDC_LANGUAGE, 158, 228, 62, 80,
              CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
     PUSHBUTTON "Capture Snapshot", IDC_CAPTURE_SNAPSHOT, 242, 222, 24, 20, BS_ICON | WS_TABSTOP
-    PUSHBUTTON "Save & Apply", IDC_SAVE_SETTINGS, 271, 222, 65, 20
+    CONTROL "Save & Apply", IDC_SAVE_SETTINGS, "Button",
+            BS_OWNERDRAW | WS_TABSTOP, 271, 222, 65, 20
     DEFPUSHBUTTON "Hide to Tray", IDC_HIDE_TO_TRAY, 341, 222, 81, 20
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,8,0,0
- PRODUCTVERSION 0,8,0,0
+ FILEVERSION 0,9,0,0
+ PRODUCTVERSION 0,9,0,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -74,12 +78,12 @@ BEGIN
   VALUE "Author", "AllenK (kwyshell)\0"
   VALUE "Comments", "GitHub: https://github.com/allenk | Medium: https://medium.com/@allenkuo\0"
   VALUE "FileDescription", "GPU Thermal Guard\0"
-  VALUE "FileVersion", "0.8.0.0\0"
+  VALUE "FileVersion", "0.9.0.0\0"
   VALUE "InternalName", "GpuThermalGuard.exe\0"
   VALUE "LegalCopyright", "Copyright (c) 2026 AllenK (kwyshell)\0"
   VALUE "OriginalFilename", "GpuThermalGuard.exe\0"
   VALUE "ProductName", "GPU Thermal Guard\0"
-  VALUE "ProductVersion", "0.8.0.0\0"
+  VALUE "ProductVersion", "0.9.0.0\0"
  END END
  BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x0409, 1200 END
 END

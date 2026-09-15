@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string_view>
 
@@ -8,6 +9,7 @@ namespace gtg::logging {
 enum class Role {
     Tray,
     Service,
+    Supervisor,
 };
 
 // Initializes a process-wide UTF-8 text journal. The logger first tries the
@@ -19,6 +21,14 @@ void Shutdown() noexcept;
 void Info(std::wstring_view message) noexcept;
 void Warning(std::wstring_view message) noexcept;
 void Error(std::wstring_view message) noexcept;
+
+// These functions copy into a bounded fixed-storage queue and return without
+// waiting for the journal mutex or filesystem. They are intended for the
+// protection path after any required setter/readback has completed.
+[[nodiscard]] bool TryInfo(std::wstring_view message) noexcept;
+[[nodiscard]] bool TryWarning(std::wstring_view message) noexcept;
+[[nodiscard]] bool TryError(std::wstring_view message) noexcept;
+[[nodiscard]] std::uint64_t DeferredDroppedCount() noexcept;
 
 [[nodiscard]] std::filesystem::path Path() noexcept;
 

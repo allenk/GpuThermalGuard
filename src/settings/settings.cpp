@@ -187,6 +187,61 @@ bool SaveTriggerCount(const unsigned int count, std::wstring& error) {
     return false;
 }
 
+TriggerTestRun LoadTriggerTestRun() noexcept {
+    TriggerTestRun result;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return result;
+    }
+
+    DWORD baseline_type = 0;
+    DWORD baseline = 0;
+    DWORD baseline_size = sizeof(baseline);
+    DWORD started_type = 0;
+    ULONGLONG started = 0;
+    DWORD started_size = sizeof(started);
+    const bool baseline_loaded = RegQueryValueExW(
+        key, L"TestRunBaseline", nullptr, &baseline_type,
+        reinterpret_cast<BYTE*>(&baseline), &baseline_size) == ERROR_SUCCESS &&
+        baseline_type == REG_DWORD;
+    const bool started_loaded = RegQueryValueExW(
+        key, L"TestRunStartedFileTime", nullptr, &started_type,
+        reinterpret_cast<BYTE*>(&started), &started_size) == ERROR_SUCCESS &&
+        started_type == REG_QWORD;
+    RegCloseKey(key);
+
+    if (baseline_loaded && started_loaded) {
+        result.loaded = true;
+        result.baseline = static_cast<std::uint32_t>(baseline);
+        result.started_file_time = static_cast<std::uint64_t>(started);
+    }
+    return result;
+}
+
+bool SaveTriggerTestRun(const std::uint32_t baseline,
+                        const std::uint64_t started_file_time,
+                        std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+
+    const DWORD baseline_data = static_cast<DWORD>(baseline);
+    const ULONGLONG started_data = static_cast<ULONGLONG>(started_file_time);
+    const LSTATUS baseline_write = RegSetValueExW(
+        key, L"TestRunBaseline", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&baseline_data), sizeof(baseline_data));
+    const LSTATUS started_write = baseline_write == ERROR_SUCCESS
+        ? RegSetValueExW(key, L"TestRunStartedFileTime", 0, REG_QWORD,
+                        reinterpret_cast<const BYTE*>(&started_data), sizeof(started_data))
+        : baseline_write;
+    RegCloseKey(key);
+    if (baseline_write == ERROR_SUCCESS && started_write == ERROR_SUCCESS) return true;
+
+    const LSTATUS failure = baseline_write != ERROR_SUCCESS ? baseline_write : started_write;
+    error = localization::Format(L"無法保存測試輪次（Win32 {}）",
+                                 L"Unable to save test run (Win32 {})", failure);
+    return false;
+}
+
 bool LoadCloseToTrayPreference() noexcept {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
@@ -255,6 +310,27 @@ bool SaveOsdPosition(const int x, const int y, std::wstring& error) {
     if (!OpenUserSettingsForWrite(key, error)) return false;
     const bool success = WriteDword(key, L"OsdX", x, error) &&
                          WriteDword(key, L"OsdY", y, error);
+    RegCloseKey(key);
+    return success;
+}
+
+WindowPosition LoadMainWindowPosition() noexcept {
+    WindowPosition result;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return result;
+    }
+    result.has_position = ReadSignedDword(key, L"MainWindowX", result.x) &&
+                          ReadSignedDword(key, L"MainWindowY", result.y);
+    RegCloseKey(key);
+    return result;
+}
+
+bool SaveMainWindowPosition(const int x, const int y, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"MainWindowX", x, error) &&
+                         WriteDword(key, L"MainWindowY", y, error);
     RegCloseKey(key);
     return success;
 }

@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Dedicated high-priority protection scheduling, independent of the desktop message loop, with delay and telemetry-loss safety handling.
+- Same-EXE supervisor for unexpected child failure, bounded restart backoff, and conservative driver-recovery checks.
+- Persistent lifetime trip totals and an explicit per-run Reset action that does not interrupt monitoring.
+- VBIOS display, pending-settings indication, and safety-checked application of the working power limit.
+- OSD protection alerts, delayed-data visualization, and persisted, monitor-validated window positions.
+
+### Improved
+
+- Bounded automatic restore retries, power-write/readback diagnostics, and verified safe-power fallback after restore failure.
+- Deferred bounded logging and OSD drawing/resource handling for long-running sessions.
+- Non-activating OSD visibility repair after session/display changes and sustained ordinary-window obstruction.
+- Updated English/Traditional Chinese documentation and screenshots, with a clearly separated preview of the unreleased private System Monitor integration.
+
+The synchronized source candidate uses version **0.9.0**. A release tag and date have not yet been assigned.
+
 ## [0.8.0-beta.1] - 2026-09-03
 
 ### Added

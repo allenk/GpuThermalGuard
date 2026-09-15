@@ -16,6 +16,8 @@ struct ProtectionConfig {
     int predictive_band_c{3};
     double prediction_horizon_s{1.5};
     double minimum_rise_c_per_s{0.75};
+    std::int64_t scheduler_delay_fail_safe_ms{400};
+    std::int64_t sensor_unavailable_fail_safe_ms{1'000};
     std::int64_t recovery_stable_ms{30'000};
     int recovery_delta_c{10};
 };
@@ -41,6 +43,8 @@ enum class TripReason {
     None,
     HardLimit,
     PredictedCrossing,
+    SchedulerDelaySafety,
+    TelemetryLossSafety,
 };
 
 struct ProtectionDecision {
@@ -58,8 +62,9 @@ public:
 
     [[nodiscard]] ProtectionDecision ObserveTemperature(
         std::int64_t monotonic_ms,
-        int temperature_c);
-    [[nodiscard]] ProtectionDecision SensorUnavailable();
+        int temperature_c,
+        std::int64_t scheduler_delay_ms = 0);
+    [[nodiscard]] ProtectionDecision SensorUnavailable(std::int64_t monotonic_ms);
     [[nodiscard]] ProtectionDecision SensorRecovered();
     [[nodiscard]] ProtectionDecision RestorePersistedSafeLatch();
     [[nodiscard]] ProtectionDecision RequestRestore(
@@ -69,6 +74,8 @@ public:
     [[nodiscard]] ProtectionState state() const noexcept { return state_; }
     [[nodiscard]] bool safe_latched() const noexcept { return safe_latched_; }
     [[nodiscard]] int recovery_temperature_c() const noexcept;
+    // Owner-thread only; preserve prediction samples and reject safety states.
+    [[nodiscard]] bool UpdateWorkingConfig(const ProtectionConfig& config);
 
 private:
     struct Sample {
@@ -90,6 +97,7 @@ private:
     bool safe_latched_{false};
     int predictive_hits_{0};
     std::optional<std::int64_t> recovery_since_ms_;
+    std::optional<std::int64_t> sensor_unavailable_since_ms_;
     std::array<Sample, kSampleCapacity> samples_{};
     std::size_t sample_start_{0};
     std::size_t sample_count_{0};
