@@ -2,6 +2,7 @@
 #include "supervision/recovery_policy.hpp"
 #include "supervision/supervisor.hpp"
 #include "tray/window_position.hpp"
+#include "tray/osd_compact.hpp"
 #include "core/working_power_apply.hpp"
 #include "core/restore_prompt_gate.hpp"
 #include "core/restore_policy.hpp"
@@ -39,6 +40,54 @@ void Require(const bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+void TestOsdCompact() {
+    using namespace gtg::tray::compact;
+    Require(Width(true) == 388 && Height(true) == 88, "compact dashboard footprint");
+    Require(Width(true) == Width(false), "toggle button stays at same x");
+    const auto flat = SparkRange(50.0, 50.0, 10.0);
+    Require(flat.second - flat.first >= 10.0 && flat.first < 50.0 && flat.second > 50.0,
+        "flat mini trend has stable padded range");
+    const auto zero = SparkRange(0.0, 1.0, 20.0);
+    Require(zero.first == 0.0 && zero.second >= 20.0, "near-zero range does not exaggerate");
+    const auto wide = SparkRange(10.0, 90.0, 20.0);
+    Require(wide.first <= 10.0 && wide.second >= 90.0, "range contains observed extremes");
+    Require(Width(false) == 388 && Height(false) == 330, "expanded unchanged");
+    for (float scale : {1.0F, 1.25F, 1.5F, 2.0F}) {
+        for (bool collapsed : {false, true}) {
+            const int width = static_cast<int>(Width(collapsed) * scale);
+            const int height = static_cast<int>(25 * scale);
+            Require(ToggleHit(width - 10, height / 2, width, height), "button hit");
+            Require(!ToggleHit(10, 10, width, height), "drag not button");
+            Require(!ToggleHit(width, 0, width, height), "right exclusive");
+            Require(!ToggleHit(width - 10, height, width, height), "bottom exclusive");
+            Require(!ToggleHit(-1, 0, width, height), "negative outside");
+        }
+    }
+    Gesture gesture;
+    Require(!gesture.Release(true), "up without down ignored");
+    gesture.Press(true);
+    Require(!gesture.Release(false), "release outside cancels");
+    gesture.Press(true);
+    gesture.Cancel();
+    Require(!gesture.Release(true), "capture loss cancels");
+    gesture.Press(false);
+    Require(!gesture.Release(true), "press outside ignored");
+    gesture.Press(true);
+    Require(gesture.Release(true) && !gesture.Release(true), "one click one toggle");
+    Require(Resolve(true, true, true, true, true, true) == Status::Fault, "fault first");
+    Require(Resolve(false, true, true, true, true, true) == Status::Protected, "latch before freshness");
+    Require(Resolve(false, false, true, true, true, true) == Status::Unavailable, "unavailable before warning");
+    Require(Resolve(false, false, false, true, true, true) == Status::Delayed, "delay before warning");
+    Require(Resolve(false, false, false, false, true, true) == Status::Warning, "warning before armed");
+    Require(Resolve(false, false, false, false, false, true) == Status::Monitoring, "armed");
+    Require(Resolve(false, false, false, false, false, false) == Status::Initializing, "initializing");
+    Require(PulseAlpha(false, true, 0) == 255 && PulseAlpha(true, false, 1000) == 255,
+        "normal or reduced motion static");
+    Require(PulseAlpha(true, true, 0) != PulseAlpha(true, true, 1000), "alert pulses");
+    for (unsigned i = 0; i < 10000; i += 100)
+        Require(PulseAlpha(true, true, i) >= 150, "pulse never disappears");
 }
 
 void TestWorkingPowerApply() {
@@ -1046,6 +1095,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
+        {"OsdCompact", TestOsdCompact},
         {"ConfigValidation", TestConfigValidation},
         {"WorkingPowerApply", TestWorkingPowerApply},
         {"WorkingPowerFailureAndContinuity", TestWorkingPowerFailureAndContinuity},

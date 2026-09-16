@@ -17,6 +17,16 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 Screenshots show one workstation's settings, not recommended limits for every GPU.
 
+### Compact OSD
+
+![Compact OSD with five live metrics and miniature trends](docs/images/osd-compact.png)
+
+Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode keeps the same width and toggle position, showing temperature, power, VRAM, GPU utilization, and CPU utilization in five small cards with live values and 30-second miniature trends.
+
+Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Drag the header outside the toggle button to move the OSD; restart returns to the expanded view.
+
+Compact mode is available in the current source tree; see the changelog for released versions.
+
 ## Why I built it
 
 This project started with an RTX PRO 6000 Blackwell Workstation Edition used for sustained AI inference. Under long-running workloads, Windows would occasionally report a TDR or lose the GPU. The recurring incident pattern was difficult to ignore:

@@ -12,6 +12,7 @@
 
 #include "telemetry/telemetry_history.hpp"
 #include "telemetry/telemetry_freshness.hpp"
+#include "tray/osd_compact.hpp"
 
 namespace gtg::tray {
 
@@ -22,6 +23,10 @@ public:
     DECLARE_WND_CLASS_EX(L"GpuThermalGuard.OsdDragHandle.v1", 0, 0)
 
     BEGIN_MSG_MAP(OsdDragHandle)
+        MESSAGE_HANDLER(WM_LBUTTONDOWN, OnTogglePointer)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnTogglePointer)
+        MESSAGE_HANDLER(WM_CAPTURECHANGED, OnTogglePointer)
+        MESSAGE_HANDLER(WM_CANCELMODE, OnTogglePointer)
         MESSAGE_HANDLER(WM_NCHITTEST, OnNcHitTest)
         MESSAGE_HANDLER(WM_MOUSEACTIVATE, OnMouseActivate)
         MESSAGE_HANDLER(WM_WINDOWPOSCHANGED, OnWindowPosChanged)
@@ -39,6 +44,7 @@ private:
     LRESULT OnEraseBackground(UINT, WPARAM, LPARAM, BOOL&);
 
     OsdOverlay* owner_{nullptr};
+    LRESULT OnTogglePointer(UINT, WPARAM, LPARAM, BOOL&);
 };
 
 enum class OsdVisual {
@@ -54,6 +60,10 @@ public:
     DECLARE_WND_CLASS_EX(L"GpuThermalGuard.OsdOverlay.v1", CS_HREDRAW | CS_VREDRAW, 0)
 
     BEGIN_MSG_MAP(OsdOverlay)
+        MESSAGE_HANDLER(WM_LBUTTONDOWN, OnTogglePointer)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnTogglePointer)
+        MESSAGE_HANDLER(WM_CAPTURECHANGED, OnTogglePointer)
+        MESSAGE_HANDLER(WM_CANCELMODE, OnTogglePointer)
         MESSAGE_HANDLER(WM_NCHITTEST, OnNcHitTest)
         MESSAGE_HANDLER(WM_MOUSEACTIVATE, OnMouseActivate)
         MESSAGE_HANDLER(WM_DPICHANGED, OnDpiChanged)
@@ -83,6 +93,12 @@ public:
 
 private:
     friend class OsdDragHandle;
+    LRESULT OnTogglePointer(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT HandleTogglePointer(UINT message, HWND input_window, LPARAM point) noexcept;
+    [[nodiscard]] bool ToggleHit(POINT point) const noexcept;
+    void ToggleCollapsed() noexcept;
+    bool collapsed_{};
+    compact::Gesture toggle_gesture_;
     struct Layout {
         int width{};
         int height{};

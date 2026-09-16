@@ -91,6 +91,60 @@ std::wstring FormatMetric(const std::optional<double> value, const wchar_t* suff
 
 using MetricMember = std::optional<double> telemetry::Sample::*;
 
+void DrawCompactSparkline(Gdiplus::Graphics& graphics,
+                          const std::deque<telemetry::Sample>& samples,
+                          std::uint64_t start, std::uint64_t end,
+                          MetricMember member, const Gdiplus::RectF& bounds,
+                          Gdiplus::Color color, double minimum_span, float scale) {
+    // Traverse only the visible tail, never the entire one-hour history.
+    std::vector<std::pair<std::uint64_t, double>> values;
+    double low = std::numeric_limits<double>::max();
+    double high = std::numeric_limits<double>::lowest();
+    for (auto it = samples.rbegin(); it != samples.rend(); ++it) {
+        if (it->monotonic_ms < start) break;
+        const auto value = (*it).*member;
+        if (it->monotonic_ms > end || !value || !std::isfinite(*value)) continue;
+        values.emplace_back(it->monotonic_ms, *value);
+        low = std::min(low, *value);
+        high = std::max(high, *value);
+    }
+    if (values.empty()) return;
+    const auto [bottom, top] = compact::SparkRange(low, high, minimum_span);
+    const double duration = static_cast<double>(std::max<std::uint64_t>(1, end - start));
+    std::vector<Gdiplus::PointF> points;
+    points.reserve(values.size());
+    for (auto it = values.rbegin(); it != values.rend(); ++it) {
+        points.emplace_back(bounds.X + static_cast<float>((it->first - start) / duration) * bounds.Width,
+            bounds.GetBottom() - static_cast<float>((it->second - bottom) / (top - bottom)) * bounds.Height);
+    }
+    Gdiplus::SolidBrush fill(Gdiplus::Color(40, color.GetR(), color.GetG(), color.GetB()));
+    Gdiplus::Pen pen(color, 1.0F * scale);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    if (points.size() == 1) {
+        graphics.FillEllipse(&fill, points.front().X - scale, points.front().Y - scale, 2 * scale, 2 * scale);
+        return;
+    }
+    Gdiplus::GraphicsPath area;
+    area.AddLines(points.data(), static_cast<INT>(points.size()));
+    area.AddLine(points.back(), {points.back().X, bounds.GetBottom()});
+    area.AddLine(Gdiplus::PointF(points.back().X, bounds.GetBottom()),
+                 Gdiplus::PointF(points.front().X, bounds.GetBottom()));
+    area.CloseFigure();
+    graphics.FillPath(&fill, &area);
+    // Same solid interpolation convention as full charts; darker intervals are
+    // inferred, not measured. Avoid extra tick marks/labels in this tiny view.
+    Gdiplus::SolidBrush gap_fill(Gdiplus::Color(110, 8, 19, 31));
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        const auto newer = values[values.size() - 1 - i].first;
+        const auto older = values[values.size() - i].first;
+        if (newer - older > telemetry::kPresentationGapMs) {
+            graphics.FillRectangle(&gap_fill, points[i - 1].X, bounds.Y,
+                std::max(scale, points[i].X - points[i - 1].X), bounds.Height);
+        }
+    }
+    graphics.DrawLines(&pen, points.data(), static_cast<INT>(points.size()));
+}
+
 void DrawMetricLane(Gdiplus::Graphics& graphics,
                     const std::deque<telemetry::Sample>& samples,
                     const std::uint64_t visible_start,
@@ -240,7 +294,15 @@ void DrawMetricLane(Gdiplus::Graphics& graphics,
 
 }  // namespace
 
-LRESULT OsdDragHandle::OnNcHitTest(UINT, WPARAM, LPARAM, BOOL&) { return HTCAPTION; }
+LRESULT OsdDragHandle::OnNcHitTest(UINT, WPARAM, const LPARAM lparam, BOOL&) {
+    POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    ScreenToClient(&point);
+    return owner_ != nullptr && owner_->ToggleHit(point) ? HTCLIENT : HTCAPTION;
+}
+
+LRESULT OsdDragHandle::OnTogglePointer(UINT message, WPARAM, LPARAM point, BOOL&) {
+    return owner_ != nullptr ? owner_->HandleTogglePointer(message, m_hWnd, point) : 0;
+}
 
 LRESULT OsdDragHandle::OnMouseActivate(UINT, WPARAM, LPARAM, BOOL&) { return MA_NOACTIVATE; }
 
@@ -328,6 +390,9 @@ bool OsdOverlay::Initialize(HWND notification_window,
 }
 
 void OsdOverlay::Shutdown() noexcept {
+    toggle_gesture_.Cancel();
+    if (::GetCapture() == m_hWnd || ::GetCapture() == drag_handle_.m_hWnd)
+        ::ReleaseCapture();
     if (m_hWnd != nullptr) {
         KillTimer(kRefreshTimerId);
         KillTimer(kTopmostRepairTimerId);
@@ -383,6 +448,10 @@ void OsdOverlay::SetVisible(const bool should_show) {
         }
         (void)SetTimer(kRefreshTimerId, static_cast<UINT>(kRenderIntervalMs));
     } else {
+        toggle_gesture_.Cancel();
+        if (::GetCapture() == m_hWnd ||
+            (drag_handle_.m_hWnd != nullptr && ::GetCapture() == drag_handle_.m_hWnd))
+            ::ReleaseCapture();
         KillTimer(kRefreshTimerId);
         KillTimer(kTopmostRepairTimerId);
         topmost_repair_passes_remaining_ = 0;
@@ -441,12 +510,48 @@ LRESULT OsdOverlay::OnNcHitTest(UINT, WPARAM, const LPARAM lparam, BOOL&) {
 #else
     POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     ScreenToClient(&point);
+    if (ToggleHit(point)) return HTCLIENT;
     if (point.y >= 0 && point.y < CurrentLayout().drag_height) return HTCAPTION;
     return HTCLIENT;
 #endif
 }
 
 LRESULT OsdOverlay::OnMouseActivate(UINT, WPARAM, LPARAM, BOOL&) { return MA_NOACTIVATE; }
+
+bool OsdOverlay::ToggleHit(const POINT point) const noexcept {
+    const auto layout = CurrentLayout();
+    return compact::ToggleHit(point.x, point.y, layout.width, layout.drag_height);
+}
+
+LRESULT OsdOverlay::OnTogglePointer(UINT message, WPARAM, LPARAM point, BOOL&) {
+    return HandleTogglePointer(message, m_hWnd, point);
+}
+
+LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_window,
+                                       const LPARAM point) noexcept {
+    const bool inside = ToggleHit({GET_X_LPARAM(point), GET_Y_LPARAM(point)});
+    if (message == WM_LBUTTONDOWN) {
+        toggle_gesture_.Press(inside);
+        if (inside) ::SetCapture(input_window);
+    } else if (message == WM_LBUTTONUP) {
+        const bool toggle = toggle_gesture_.Release(inside && ::GetCapture() == input_window);
+        if (::GetCapture() == input_window) ::ReleaseCapture();
+        if (toggle) ToggleCollapsed();
+    } else {
+        toggle_gesture_.Cancel();
+        if (message == WM_CANCELMODE && ::GetCapture() == input_window) ::ReleaseCapture();
+    }
+    return 0;
+}
+
+void OsdOverlay::ToggleCollapsed() noexcept {
+    POINT next = Position();
+    collapsed_ = !collapsed_;
+    const auto layout = CurrentLayout();
+    (void)FitToWorkArea(next, layout);
+    ApplyPosition(next, layout);
+    RenderLatest();
+}
 
 LRESULT OsdOverlay::OnDpiChanged(UINT, WPARAM, const LPARAM lparam, BOOL&) {
     const auto* suggested = reinterpret_cast<const RECT*>(lparam);
@@ -689,8 +794,8 @@ void OsdOverlay::RepairTopmost() noexcept {
 OsdOverlay::Layout OsdOverlay::CurrentLayout() const noexcept {
     const HWND dpi_window = m_hWnd != nullptr ? m_hWnd : drag_handle_.m_hWnd;
     const UINT dpi = dpi_window == nullptr ? 96U : GetDpiForWindow(dpi_window);
-    return {MulDiv(kWidthDip, static_cast<int>(dpi), 96),
-            MulDiv(kHeightDip, static_cast<int>(dpi), 96),
+    return {MulDiv(compact::Width(collapsed_), static_cast<int>(dpi), 96),
+            MulDiv(compact::Height(collapsed_), static_cast<int>(dpi), 96),
             MulDiv(kDragHeightDip, static_cast<int>(dpi), 96),
             static_cast<float>(dpi) / 96.0F};
 }
@@ -803,8 +908,8 @@ bool OsdOverlay::Render() noexcept {
                                  Gdiplus::UnitPixel);
         Gdiplus::Font value_font(&family, 12.5F * s, Gdiplus::FontStyleBold,
                                  Gdiplus::UnitPixel);
-        DrawText(graphics, L"GPU THERMAL GUARD",
-                 {10.0F * s, 2.0F * s, 142.0F * s, 22.0F * s}, title_font,
+        DrawText(graphics, L"GTG",
+                 {10.0F * s, 2.0F * s, 30.0F * s, 22.0F * s}, title_font,
                  Gdiplus::Color(222, 237, 243, 251), Gdiplus::StringAlignmentNear);
         const std::uint64_t now_ms = GetTickCount64();
         static const std::deque<telemetry::Sample> empty;
@@ -861,20 +966,67 @@ bool OsdOverlay::Render() noexcept {
                 L"遙測已恢復 · 圖表缺口已保留", L"Telemetry recovered · gap retained");
             status_color = Gdiplus::Color(255, 70, 210, 137);
         }
-        Gdiplus::SolidBrush dot(status_color);
-        graphics.FillEllipse(&dot, 158.0F * s, 9.0F * s, 6.0F * s, 6.0F * s);
+        if (collapsed_) {
+            const auto compact_status = compact::Resolve(visual_ == OsdVisual::Fault,
+                protection_alert, freshness.state == telemetry::FreshnessState::Unavailable ||
+                    freshness.state == telemetry::FreshnessState::NoData,
+                freshness.state == telemetry::FreshnessState::Delayed,
+                visual_ == OsdVisual::Warning, visual_ == OsdVisual::Armed);
+            switch (compact_status) {
+            case compact::Status::Fault:
+                displayed_status = localization::Select(L"FAULT · 保護未確認", L"FAULT · Unverified"); break;
+            case compact::Status::Protected:
+                displayed_status = localization::Select(L"ALERT · 安全功率", L"ALERT · Safe power"); break;
+            case compact::Status::Unavailable:
+                displayed_status = localization::Select(L"無遙測資料", L"No telemetry");
+                status_color = Gdiplus::Color(255, 255, 82, 92); break;
+            case compact::Status::Delayed:
+                displayed_status = localization::Select(L"遙測延遲", L"Telemetry delayed"); break;
+            case compact::Status::Warning:
+                displayed_status = localization::Select(L"溫度警示", L"Temperature warning");
+                status_color = VisualColor(OsdVisual::Warning); break;
+            case compact::Status::Monitoring:
+                displayed_status = localization::Select(L"監控中", L"Monitoring"); break;
+            case compact::Status::Initializing:
+                displayed_status = localization::Select(L"初始化中", L"Initializing"); break;
+            }
+            if ((protection_alert || visual_ == OsdVisual::Fault) &&
+                (stale || freshness.state == telemetry::FreshnessState::NoData)) {
+                displayed_status += localization::Select(L" · 過期", L" · stale");
+            }
+        }
+        BOOL animations = FALSE;
+        if (collapsed_) SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+        const bool attention = protection_alert || visual_ == OsdVisual::Fault ||
+            visual_ == OsdVisual::Warning || stale || freshness.state == telemetry::FreshnessState::NoData;
+        Gdiplus::SolidBrush dot(Gdiplus::Color(
+            compact::PulseAlpha(collapsed_ && attention, animations != FALSE, now_ms),
+            status_color.GetR(), status_color.GetG(), status_color.GetB()));
+        graphics.FillEllipse(&dot, 46.0F * s, 9.0F * s, 6.0F * s, 6.0F * s);
+        const float status_left = 58.0F * s;
         DrawText(graphics, displayed_status,
-                 {169.0F * s, 2.0F * s, 209.0F * s, 22.0F * s}, status_font,
+                 {status_left, 2.0F * s, layout.width - layout.drag_height - status_left - 4.0F * s,
+                  22.0F * s}, status_font,
                  status_color, Gdiplus::StringAlignmentNear);
         Gdiplus::Pen handle(Gdiplus::Color(38, 203, 215, 231), 1.0F * s);
-        graphics.DrawLine(&handle, 176.0F * s, 23.0F * s, 212.0F * s, 23.0F * s);
+        graphics.DrawLine(&handle, layout.width / 2.0F - 10.0F * s, 23.0F * s,
+                          layout.width / 2.0F + 10.0F * s, 23.0F * s);
+        const float button_x = static_cast<float>(layout.width - layout.drag_height);
+        Gdiplus::SolidBrush button_fill(Gdiplus::Color(22, 203, 215, 231));
+        graphics.FillRectangle(&button_fill, button_x + 3.0F * s, 3.0F * s, 19.0F * s, 19.0F * s);
+        Gdiplus::Pen chevron(Gdiplus::Color(235, 224, 235, 248), 1.5F * s);
+        chevron.SetLineJoin(Gdiplus::LineJoinRound);
+        const float edge_y = (collapsed_ ? 10.0F : 14.0F) * s;
+        const float middle_y = (collapsed_ ? 14.0F : 10.0F) * s;
+        const Gdiplus::PointF arrow[]{
+            {button_x + 8.0F * s, edge_y}, {button_x + 12.5F * s, middle_y},
+            {button_x + 17.0F * s, edge_y}};
+        graphics.DrawLines(&chevron, arrow, 3);
 
         const telemetry::Sample* latest = history_ == nullptr ? nullptr : history_->Latest();
         const std::uint64_t end = freshness.latest_valid_ms.value_or(
             latest == nullptr ? now_ms : latest->monotonic_ms);
         const std::uint64_t start = end > kVisibleDurationMs ? end - kVisibleDurationMs : 0;
-        const auto presentation_gaps =
-            telemetry::FindPresentationGaps(samples, start, end);
         const telemetry::Sample* displayed_sample = nullptr;
         if (freshness.latest_valid_ms) {
             for (auto it = samples.rbegin(); it != samples.rend(); ++it) {
@@ -887,6 +1039,47 @@ bool OsdOverlay::Render() noexcept {
         const auto optional = [&](const MetricMember member) -> std::optional<double> {
             return displayed_sample == nullptr ? std::nullopt : displayed_sample->*member;
         };
+        if (collapsed_) {
+            // Same width/header/button coordinates as expanded mode; only the
+            // chart body folds to one row. Never invent zero for missing data.
+            Gdiplus::Font small_font(&family, 9.0F * s, Gdiplus::FontStyleRegular,
+                                     Gdiplus::UnitPixel);
+            const float cell_width = 72.0F * s;
+            const auto cell = [&](int index, const std::wstring& label,
+                                  const std::wstring& value, MetricMember member,
+                                  const Gdiplus::Color color, double minimum_span) {
+                const float x = (6.0F + index * 76.0F) * s;
+                Gdiplus::SolidBrush background(Gdiplus::Color(15, color.GetR(), color.GetG(), color.GetB()));
+                Gdiplus::Pen border(Gdiplus::Color(42, color.GetR(), color.GetG(), color.GetB()), s);
+                Gdiplus::GraphicsPath path;
+                AddRoundedRectangle(path, {x, 30.0F * s, cell_width, 51.0F * s}, 3.0F * s);
+                graphics.FillPath(&background, &path);
+                graphics.DrawPath(&border, &path);
+                DrawText(graphics, label, {x + 4.0F * s, 31.0F * s, cell_width - 8.0F * s, 14.0F * s},
+                         small_font, color, Gdiplus::StringAlignmentNear);
+                DrawText(graphics, value, {x + 4.0F * s, 44.0F * s, cell_width - 8.0F * s, 22.0F * s},
+                         value_font, stale ? Gdiplus::Color(180, 205, 214, 226)
+                                          : Gdiplus::Color(255, 245, 248, 252),
+                         Gdiplus::StringAlignmentNear);
+                DrawCompactSparkline(graphics, samples, start, end, member,
+                    {x + 5.0F * s, 67.0F * s, cell_width - 10.0F * s, 10.0F * s},
+                    Gdiplus::Color(stale ? 140 : 235, color.GetR(), color.GetG(), color.GetB()),
+                    minimum_span, s);
+            };
+            cell(0, std::wstring(localization::Select(L"溫度", L"Temp")),
+                FormatMetric(optional(&telemetry::Sample::temperature_c), L" °C"),
+                &telemetry::Sample::temperature_c, Gdiplus::Color(255, 255, 91, 94), 10.0);
+            cell(1, std::wstring(localization::Select(L"功率", L"Power")),
+                FormatMetric(optional(&telemetry::Sample::power_w), L" W", 1),
+                &telemetry::Sample::power_w, Gdiplus::Color(255, 77, 160, 255), 100.0);
+            cell(2, L"VRAM", FormatMetric(optional(&telemetry::Sample::vram_utilization_percent), L"%"),
+                &telemetry::Sample::vram_utilization_percent, Gdiplus::Color(255, 255, 173, 69), 20.0);
+            cell(3, L"GPU", FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
+                &telemetry::Sample::gpu_utilization_percent, Gdiplus::Color(255, 75, 214, 139), 20.0);
+            cell(4, L"CPU", FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
+                &telemetry::Sample::cpu_utilization_percent, Gdiplus::Color(255, 183, 121, 255), 20.0);
+        } else {
+        const auto presentation_gaps = telemetry::FindPresentationGaps(samples, start, end);
         std::optional<double> maximum_temperature;
         std::optional<double> maximum_vram_percent;
         for (const auto& sample : samples) {
@@ -967,6 +1160,7 @@ bool OsdOverlay::Render() noexcept {
             presentation_gaps, false,
             std::nullopt, {}, stale);
 
+        }
         RECT window{};
         GetWindowRect(&window);
         POINT destination{window.left, window.top};

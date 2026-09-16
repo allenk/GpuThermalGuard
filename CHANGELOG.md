@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Equal-width compact OSD with a fixed-position header toggle, five live metric cards, and 30-second miniature trends. Protection alerts and telemetry warnings remain visible without interrupting monitoring.
+- Compact OSD screenshot and English/Traditional Chinese usage documentation.
+
 ## [0.9.0-beta.1] - 2026-09-15
 
 ### Added

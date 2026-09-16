@@ -17,6 +17,16 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 截圖中的設定屬於單一工作站，不是所有 GPU 的建議門檻。
 
+### Compact 精簡 OSD
+
+![精簡 OSD：五項即時數值與迷你趨勢曲線](docs/images/osd-compact.png)
+
+點擊 OSD 頂部的箭頭，可在完整圖表與 compact mode 之間切換。精簡模式維持相同寬度及按鈕位置，以五張小卡顯示溫度、功率、VRAM、GPU 與 CPU 使用率，搭配即時數值及最近 30 秒的迷你曲線，減少桌面遮擋。
+
+保護警報與遙測警示仍顯示於頂部；切換模式不會暫停監控或改變保護設定。頂部按鈕以外的拖曳區仍可移動 OSD；重新啟動程式後回到展開模式。
+
+此功能已加入目前原始碼；已發布版本請參閱 Changelog。
+
 ## 為什麼打造這個工具
 
 這個專案源自一張長時間執行 AI 推理的 RTX PRO 6000 Blackwell Workstation Edition。持續負載下，Windows 偶爾會發生 TDR 或失去 GPU；反覆出現的事故特徵包括：
