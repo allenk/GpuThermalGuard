@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(GpuThermalGuard VERSION 0.9.0 LANGUAGES CXX)
+project(GpuThermalGuard VERSION 0.9.1 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "GpuThermalGuard currently supports Windows only")

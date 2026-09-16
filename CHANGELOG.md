@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.9.1-beta.1] - 2026-09-17
+
 ### Added
 
 - Equal-width compact OSD with a fixed-position header toggle, five live metric cards, and 30-second miniature trends. Protection alerts and telemetry warnings remain visible without interrupting monitoring.
@@ -45,6 +47,7 @@ All notable changes to this project will be documented in this file.
 - A power-limit write is never reported as successful until the value is read back.
 - Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
-[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.1...HEAD
+[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.1-beta.1...HEAD
+[0.9.1-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.1...v0.9.1-beta.1
 [0.9.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.8.0-beta.1...v0.9.0-beta.1
 [0.8.0-beta.1]: https://github.com/allenk/GpuThermalGuard/releases/tag/v0.8.0-beta.1

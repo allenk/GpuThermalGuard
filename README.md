@@ -25,7 +25,7 @@ Use the chevron in the OSD header to switch between the full charts and compact 
 
 Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Drag the header outside the toggle button to move the OSD; restart returns to the expanded view.
 
-Compact mode is available in the current source tree; see the changelog for released versions.
+Compact mode is included starting with v0.9.1-beta.1.
 
 ## Why I built it
 
