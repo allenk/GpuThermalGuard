@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0-beta.1] - 2026-09-20
+
+### Added
+
+- Optional, default-on FPS display in the Main UI history and expanded/compact OSD. Turning it off clears the separate FPS history and restores the original five-metric layout.
+- Foreground-game Displayed FPS observation using a bounded Windows ETW correlator for validated DXGI presentation paths. No game injection, proxy DLL, PresentMon runtime, or dependency on the thermal protection worker.
+
+### Improved
+
+- FPS curves use the same area-fill treatment as other metrics. Dark visual connectors bridge unavailable intervals and app/surface switches without inventing measured samples; unavailable readings remain `-`.
+
+### Limitations
+
+- Native Vulkan FPS and in-game overlay rendering are not included. Unsupported, ambiguous, or unverified presentation paths show `-` rather than a submitted-frame estimate.
+
 ## [0.9.0-beta.2] - 2026-09-17
 
 ### Added
@@ -47,7 +62,8 @@ All notable changes to this project will be documented in this file.
 - A power-limit write is never reported as successful until the value is read back.
 - Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
-[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.2...HEAD
+[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.10.0-beta.1...HEAD
+[0.10.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.2...v0.10.0-beta.1
 [0.9.0-beta.2]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.1...v0.9.0-beta.2
 [0.9.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.8.0-beta.1...v0.9.0-beta.1
 [0.8.0-beta.1]: https://github.com/allenk/GpuThermalGuard/releases/tag/v0.8.0-beta.1

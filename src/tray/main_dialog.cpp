@@ -164,6 +164,11 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
         m_hWnd, &telemetry_history_, osd_overlay_, osd_preference);
     CheckDlgButton(IDC_OSD_ENABLED,
                    osd_ready_ && osd_preference.enabled ? BST_CHECKED : BST_UNCHECKED);
+    show_fps_ = settings::LoadFpsEnabled();
+    CheckDlgButton(IDC_SHOW_FPS, show_fps_ ? BST_CHECKED : BST_UNCHECKED);
+    history_chart_.SetFpsHistory(show_fps_ ? &fps_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetFpsHistory(show_fps_ ? &fps_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetFpsEnabled(show_fps_);
     taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
     activate_message_ = RegisterWindowMessageW(L"GpuThermalGuard.Activate.v1");
     nvml_ready_ = nvml_.Initialize();
@@ -209,6 +214,22 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
         }
         RefreshSnapshot();
         UpdateWallTime();
+        if (now - last_fps_refresh_ms_ >= 500) {
+            last_fps_refresh_ms_ = now;
+            if (show_fps_) {
+                const auto target = fps::ForegroundCandidate();
+                fps_observer_.SetTarget(target);
+                const auto observed = fps_observer_.TryRead();
+                const auto matched = target && observed.identity == *target
+                    ? observed : fps::Snapshot{};
+                fps_history_.Record(now, target, matched);
+                history_chart_.NotifyDataChanged();
+                if (osd_ready_ && osd_overlay_.Visible())
+                    osd_overlay_.SetFpsSnapshot(matched);
+            } else {
+                fps_observer_.SetTarget(std::nullopt);
+            }
+        }
     }
     return 0;
 }
@@ -236,6 +257,7 @@ LRESULT MainDialog::OnDestroy(UINT, WPARAM, LPARAM, BOOL&) {
     // blocking worker shutdown and before destroying the painted overlay.
     if (osd_ready_) (void)SaveOsdWindowPosition(osd_overlay_, L"normal exit");
     local_protection_.Stop();
+    fps_observer_.Stop();
     osd_overlay_.Shutdown();
     osd_ready_ = false;
     RemoveTrayIcon();
@@ -598,6 +620,26 @@ LRESULT MainDialog::OnOsdToggle(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 
+LRESULT MainDialog::OnFpsToggle(WORD, WORD, HWND, BOOL&) {
+    const bool enabled = IsDlgButtonChecked(IDC_SHOW_FPS) == BST_CHECKED;
+    std::wstring error;
+    if (!settings::SaveFpsEnabled(enabled, error)) {
+        CheckDlgButton(IDC_SHOW_FPS, show_fps_ ? BST_CHECKED : BST_UNCHECKED);
+        logging::Warning(error);
+        return 0;
+    }
+    show_fps_ = enabled;
+    history_chart_.SetFpsHistory(enabled ? &fps_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetFpsHistory(enabled ? &fps_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetFpsEnabled(enabled);
+    if (!enabled) {
+        fps_observer_.SetTarget(std::nullopt);
+        fps_history_.Clear();
+        osd_overlay_.SetFpsSnapshot({});
+    }
+    return 0;
+}
+
 LRESULT MainDialog::OnLanguageChanged(WORD, WORD, HWND, BOOL&) {
     const LRESULT selection = SendDlgItemMessageW(IDC_LANGUAGE, CB_GETCURSEL, 0, 0);
     if (selection == CB_ERR) return 0;
@@ -791,6 +833,11 @@ void MainDialog::SetOsdVisible(const bool should_show, const bool persist) {
         return;
     }
     osd_overlay_.SetVisible(should_show);
+    if (!should_show) {
+        // Checked FPS still records the current foreground App for the Main
+        // UI history while the OSD is hidden; only its painted value resets.
+        osd_overlay_.SetFpsSnapshot({});
+    }
     CheckDlgButton(IDC_OSD_ENABLED, should_show ? BST_CHECKED : BST_UNCHECKED);
     if (persist) {
         std::wstring error;
@@ -1353,6 +1400,7 @@ void MainDialog::ApplyLocalization() {
     SetControlText(IDC_AUTO_RESTORE, text(L"自動 Restore", L"Auto Restore"));
     SetControlText(IDC_CLOSE_TO_TRAY, text(L"[X] 隱藏到系統匣", L"[X] Hide to tray"));
     SetControlText(IDC_OSD_ENABLED, text(L"顯示 OSD", L"Show OSD"));
+    SetControlText(IDC_SHOW_FPS, text(L"顯示 FPS", L"Show FPS"));
     SetControlText(IDC_SAVE_SETTINGS,
                    apply_pending_ ? text(L"套用中…", L"Applying…")
                    : settings_dirty_ ? text(L"保存並套用 ●", L"Save & Apply ●")

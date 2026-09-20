@@ -11,21 +11,27 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 ## 畫面
 
-| 主監控面板 | 30 秒即時 OSD |
+| 含可選 FPS 紀錄的主監控面板 | 含 FPS 的 30 秒精簡 OSD |
 | --- | --- |
-| ![GpuThermalGuard 主面板](docs/images/dashboard.png) | ![GpuThermalGuard OSD](docs/images/osd.png) |
+| ![GpuThermalGuard 主面板顯示第六條 FPS 歷史](docs/images/dashboard.png) | ![精簡 OSD 顯示包含 FPS 的六張數值卡](docs/images/osd-compact.png) |
 
 截圖中的設定屬於單一工作站，不是所有 GPU 的建議門檻。
 
 ### Compact 精簡 OSD
 
-![精簡 OSD：五項即時數值與迷你趨勢曲線](docs/images/osd-compact.png)
+![精簡 OSD：啟用 FPS 時顯示六項即時數值與迷你趨勢曲線](docs/images/osd-compact.png)
 
-點擊 OSD 頂部的箭頭，可在完整圖表與 compact mode 之間切換。精簡模式維持相同寬度及按鈕位置，以五張小卡顯示溫度、功率、VRAM、GPU 與 CPU 使用率，搭配即時數值及最近 30 秒的迷你曲線，減少桌面遮擋。
+點擊 OSD 頂部的箭頭，可在完整圖表與 compact mode 之間切換。精簡模式以五張小卡顯示溫度、功率、VRAM、GPU 與 CPU 使用率，搭配即時數值及最近 30 秒的迷你曲線。勾選「顯示 FPS」時增加第六張卡；取消勾選後回到原本五張卡的配置。
 
 保護警報與遙測警示仍顯示於頂部；切換模式不會暫停監控或改變保護設定。頂部按鈕以外的拖曳區仍可移動 OSD；重新啟動程式後回到展開模式。
 
 此功能自 v0.9.0-beta.2 起提供。
+
+### 可選的遊戲 FPS
+
+自 v0.10.0-beta.1 起，「顯示 FPS」預設勾選，主視窗增加第六條獨立 FPS 歷史，OSD 增加一列／一張 FPS 卡。它跟隨目前前景程式；切換遊戲時，讀值會共用同一條時間軸。關閉後停止 FPS 觀測並清除其紀錄，原本五條溫度／硬體紀錄不變。FPS 收集器不參與獨立的 200 ms 保護迴圈。
+
+數值是支援的 Windows DXGI 呈現路徑中經驗證的「已上屏影格」速率，不是單純的 Present 呼叫次數或螢幕刷新率。暖機、切換焦點、未支援或無法確認的路徑會顯示 `-`；曲線上的暗色連接僅維持視覺連續，**不代表該段量到了 FPS**。本版尚不包含原生 Vulkan FPS 或獨佔全螢幕的遊戲內 overlay；桌面 TOPMOST OSD 不保證蓋住獨佔全螢幕。
 
 ## 為什麼打造這個工具
 

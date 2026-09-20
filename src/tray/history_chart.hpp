@@ -8,6 +8,7 @@
 #include <atlwin.h>
 
 #include "telemetry/telemetry_history.hpp"
+#include "fps/fps_history.hpp"
 
 namespace gtg::tray {
 
@@ -28,6 +29,10 @@ public:
     END_MSG_MAP()
 
     void SetHistory(const telemetry::History* history) noexcept { history_ = history; }
+    void SetFpsHistory(const fps::History* history) noexcept {
+        fps_history_ = history;
+        Invalidate(FALSE);
+    }
     void NotifyDataChanged();
     void SetThresholds(int trigger_temperature_c, int safe_power_w,
                        std::optional<double> maximum_power_w);
@@ -49,6 +54,7 @@ private:
 
     static constexpr std::uint64_t kVisibleHistoryMs = 5ULL * 60ULL * 1000ULL;
     const telemetry::History* history_{nullptr};
+    const fps::History* fps_history_{nullptr};
     int trigger_temperature_c_{85};
     int safe_power_w_{300};
     std::optional<double> maximum_power_w_;

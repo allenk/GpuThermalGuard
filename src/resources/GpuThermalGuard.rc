@@ -8,7 +8,7 @@ IDI_TRAY_PROTECTED  ICON "../../assets/icons/tray-protected.ico"
 IDI_TRAY_FAULT      ICON "../../assets/icons/tray-fault.ico"
 IDI_CAMERA          ICON "../../assets/icons/camera.ico"
 
-IDD_MAIN DIALOGEX 0, 0, 430, 250
+IDD_MAIN DIALOGEX 0, 0, 430, 272
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "GPU Thermal Guard"
@@ -52,17 +52,19 @@ BEGIN
             "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 18, 228, 75, 12
     CONTROL "Show OSD", IDC_OSD_ENABLED,
             "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 98, 228, 55, 12
-    COMBOBOX IDC_LANGUAGE, 158, 228, 62, 80,
+    CONTROL "Show FPS", IDC_SHOW_FPS,
+            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 158, 228, 55, 12
+    COMBOBOX IDC_LANGUAGE, 218, 228, 62, 80,
              CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON "Capture Snapshot", IDC_CAPTURE_SNAPSHOT, 242, 222, 24, 20, BS_ICON | WS_TABSTOP
+    PUSHBUTTON "Capture Snapshot", IDC_CAPTURE_SNAPSHOT, 242, 245, 24, 20, BS_ICON | WS_TABSTOP
     CONTROL "Save & Apply", IDC_SAVE_SETTINGS, "Button",
-            BS_OWNERDRAW | WS_TABSTOP, 271, 222, 65, 20
-    DEFPUSHBUTTON "Hide to Tray", IDC_HIDE_TO_TRAY, 341, 222, 81, 20
+            BS_OWNERDRAW | WS_TABSTOP, 271, 245, 65, 20
+    DEFPUSHBUTTON "Hide to Tray", IDC_HIDE_TO_TRAY, 341, 245, 81, 20
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,9,0,0
- PRODUCTVERSION 0,9,0,0
+ FILEVERSION 0,10,0,0
+ PRODUCTVERSION 0,10,0,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -78,12 +80,12 @@ BEGIN
   VALUE "Author", "AllenK (kwyshell)\0"
   VALUE "Comments", "GitHub: https://github.com/allenk | Medium: https://medium.com/@allenkuo\0"
   VALUE "FileDescription", "GPU Thermal Guard\0"
-  VALUE "FileVersion", "0.9.0.0\0"
+  VALUE "FileVersion", "0.10.0.0\0"
   VALUE "InternalName", "GpuThermalGuard.exe\0"
   VALUE "LegalCopyright", "Copyright (c) 2026 AllenK (kwyshell)\0"
   VALUE "OriginalFilename", "GpuThermalGuard.exe\0"
   VALUE "ProductName", "GPU Thermal Guard\0"
-  VALUE "ProductVersion", "0.9.0.0\0"
+  VALUE "ProductVersion", "0.10.0.0\0"
  END END
  BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x0409, 1200 END
 END

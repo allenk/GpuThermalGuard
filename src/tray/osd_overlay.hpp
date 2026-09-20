@@ -13,6 +13,8 @@
 #include "telemetry/telemetry_history.hpp"
 #include "telemetry/telemetry_freshness.hpp"
 #include "tray/osd_compact.hpp"
+#include "fps/fps_rate.hpp"
+#include "fps/fps_history.hpp"
 
 namespace gtg::tray {
 
@@ -89,6 +91,12 @@ public:
                        std::optional<double> maximum_power_w) noexcept;
     void SetCurrentPowerLimit(std::optional<double> current_power_limit_w) noexcept;
     void SetStatus(std::wstring_view status, OsdVisual visual);
+    void SetFpsEnabled(bool enabled) noexcept;
+    void SetFpsSnapshot(fps::Snapshot snapshot) noexcept;
+    void SetFpsHistory(const fps::History* history) noexcept {
+        fps_history_ = history;
+        RequestRefresh();
+    }
     [[nodiscard]] POINT Position() const noexcept;
 
 private:
@@ -104,6 +112,7 @@ private:
         int height{};
         int drag_height{};
         float scale{1.0F};
+        int columns{1};
     };
 
     LRESULT OnNcHitTest(UINT, WPARAM, LPARAM, BOOL&);
@@ -140,12 +149,15 @@ private:
 
     HWND notification_window_{nullptr};
     const telemetry::History* history_{nullptr};
+    const fps::History* fps_history_{nullptr};
     int trigger_temperature_c_{85};
     int safe_power_w_{300};
     std::optional<double> maximum_power_w_;
     std::optional<double> current_power_limit_w_;
     std::wstring status_{L"保護狀態初始化中"};
     OsdVisual visual_{OsdVisual::Neutral};
+    bool fps_enabled_{false};
+    fps::Snapshot fps_snapshot_{};
     OsdDragHandle drag_handle_;
     bool synchronizing_position_{false};
     bool refresh_pending_{false};

@@ -251,9 +251,10 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     const Gdiplus::REAL right_padding = 6.0F * scale;
     const Gdiplus::REAL footer_height = 25.0F * scale;
     const Gdiplus::REAL gap = 4.0F * scale;
+    const int plot_count = fps_history_ == nullptr ? 5 : 6;
     const Gdiplus::REAL plots_height = static_cast<Gdiplus::REAL>(height) -
-        margin * 2.0F - footer_height - gap * 4.0F;
-    const Gdiplus::REAL plot_height = std::max(16.0F, plots_height / 5.0F);
+        margin * 2.0F - footer_height - gap * (plot_count - 1);
+    const Gdiplus::REAL plot_height = std::max(16.0F, plots_height / plot_count);
     const Gdiplus::REAL plot_width = static_cast<Gdiplus::REAL>(width) -
         label_width - right_padding;
 
@@ -266,6 +267,8 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         label_width, vram_plot.GetBottom() + gap, plot_width, plot_height};
     const Gdiplus::RectF cpu_plot{
         label_width, gpu_plot.GetBottom() + gap, plot_width, plot_height};
+    const Gdiplus::RectF fps_plot{
+        label_width, cpu_plot.GetBottom() + gap, plot_width, plot_height};
 
     Gdiplus::FontFamily font_family(L"Segoe UI");
     Gdiplus::Font label_font(&font_family, 7.7F, Gdiplus::FontStyleRegular,
@@ -281,6 +284,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     const Gdiplus::Color vram_color(255, 213, 126, 38);
     const Gdiplus::Color gpu_color(255, 36, 153, 95);
     const Gdiplus::Color cpu_color(255, 132, 82, 190);
+    const Gdiplus::Color fps_color(255, 40, 165, 160);
     Gdiplus::SolidBrush plot_brush(plot_background);
     Gdiplus::Pen border_pen(border_color, 1.0F);
     Gdiplus::Pen grid_pen(grid_color, 0.7F);
@@ -297,6 +301,22 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         graphics.DrawLine(&grid_pen, plot.X + 1.0F, plot.Y + plot.Height / 2.0F,
                           plot.GetRight() - 1.0F, plot.Y + plot.Height / 2.0F);
     }
+    if (fps_history_ != nullptr) {
+        Gdiplus::GraphicsPath rounded;
+        AddRoundedRectangle(rounded, fps_plot, 3.5F * scale);
+        graphics.FillPath(&plot_brush, &rounded);
+        graphics.DrawPath(&border_pen, &rounded);
+        for (int i = 1; i < 4; ++i) {
+            const Gdiplus::REAL x = fps_plot.X +
+                fps_plot.Width * static_cast<Gdiplus::REAL>(i) / 4.0F;
+            graphics.DrawLine(&grid_pen, x, fps_plot.Y + 1.0F,
+                              x, fps_plot.GetBottom() - 1.0F);
+        }
+        graphics.DrawLine(&grid_pen, fps_plot.X + 1.0F,
+                          fps_plot.Y + fps_plot.Height / 2.0F,
+                          fps_plot.GetRight() - 1.0F,
+                          fps_plot.Y + fps_plot.Height / 2.0F);
+    }
 
     const auto draw_axis_label = [&](const std::wstring& label,
                                      const Gdiplus::RectF& plot,
@@ -312,6 +332,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     draw_axis_label(L"VRAM", vram_plot, vram_color);
     draw_axis_label(L"GPU %", gpu_plot, gpu_color);
     draw_axis_label(L"CPU %", cpu_plot, cpu_color);
+    if (fps_history_ != nullptr) draw_axis_label(L"FPS", fps_plot, fps_color);
 
     const std::uint64_t live_now = GetTickCount64();
     const std::uint64_t view_end = EffectiveViewEnd(live_now);
@@ -390,7 +411,8 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
 
     const auto draw_series = [&](const Gdiplus::RectF& plot,
                                  const std::vector<std::vector<Gdiplus::PointF>>& segments,
-                                 const Gdiplus::Color color) {
+                                 const Gdiplus::Color color,
+                                 const bool mark_all_singletons = false) {
         Gdiplus::LinearGradientBrush fill(
             Gdiplus::PointF(plot.X, plot.Y), Gdiplus::PointF(plot.X, plot.GetBottom()),
             Gdiplus::Color(62, color.GetR(), color.GetG(), color.GetB()),
@@ -398,6 +420,14 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         Gdiplus::Pen line(color, std::max(1.05F, 0.95F * scale));
         line.SetLineJoin(Gdiplus::LineJoinRound);
         for (const auto& segment : segments) {
+            if (segment.size() == 1 && mark_all_singletons) {
+                const auto& point = segment.front();
+                const Gdiplus::REAL radius = 1.8F * scale;
+                Gdiplus::SolidBrush dot(color);
+                graphics.FillEllipse(&dot, point.X - radius, point.Y - radius,
+                                     radius * 2.0F, radius * 2.0F);
+                continue;
+            }
             if (segment.size() < 2) continue;
             Gdiplus::GraphicsPath area;
             area.AddLines(segment.data(), static_cast<INT>(segment.size()));
@@ -408,7 +438,9 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
             graphics.FillPath(&fill, &area);
             graphics.DrawLines(&line, segment.data(), static_cast<INT>(segment.size()));
         }
-        if (!segments.empty() && !segments.back().empty()) {
+        if (!segments.empty() &&
+            (segments.back().size() >= 2 || !mark_all_singletons) &&
+            !segments.back().empty()) {
             const auto& point = segments.back().back();
             const Gdiplus::REAL radius = 1.8F * scale;
             Gdiplus::SolidBrush dot(color);
@@ -422,6 +454,70 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     draw_series(vram_plot, collect_segments(Series::Vram), vram_color);
     draw_series(gpu_plot, collect_segments(Series::Gpu), gpu_color);
     draw_series(cpu_plot, collect_segments(Series::Cpu), cpu_color);
+    if (fps_history_ != nullptr) {
+        double fps_max = 60.0;
+        for (const auto& sample : fps_history_->Samples()) {
+            if (sample.monotonic_ms >= visible_start &&
+                sample.monotonic_ms <= view_end && sample.displayed_fps)
+                fps_max = std::max(fps_max, *sample.displayed_fps * 1.1);
+        }
+        // No-data sits at the waterline, but dashed styling distinguishes it
+        // from a measured 0 FPS solid trace at the same height.
+        Gdiplus::Pen no_data(Gdiplus::Color(125, fps_color.GetR(),
+                                               fps_color.GetG(), fps_color.GetB()),
+                             std::max(1.0F, 0.8F * scale));
+        no_data.SetDashStyle(Gdiplus::DashStyleDot);
+        const Gdiplus::REAL baseline = y_for(fps_plot, 0.0, 0.0, fps_max);
+        graphics.DrawLine(&no_data, fps_plot.X, baseline,
+                          fps_plot.GetRight(), baseline);
+        std::vector<Gdiplus::PointF> points;
+        const fps::HistorySample* last_valid = nullptr;
+        const fps::HistorySample* last_sample = nullptr;
+        for (const auto& sample : fps_history_->Samples()) {
+            if (sample.monotonic_ms < visible_start ||
+                sample.monotonic_ms > view_end) continue;
+            last_sample = &sample;
+            if (sample.displayed_fps) {
+                points.emplace_back(x_for(sample.monotonic_ms),
+                    y_for(fps_plot, *sample.displayed_fps, 0.0, fps_max));
+                last_valid = &sample;
+            }
+        }
+        if (last_valid != nullptr && last_sample != nullptr &&
+            !last_sample->displayed_fps &&
+            last_sample->monotonic_ms > last_valid->monotonic_ms)
+            points.emplace_back(x_for(last_sample->monotonic_ms),
+                y_for(fps_plot, *last_valid->displayed_fps, 0.0, fps_max));
+        if (!points.empty()) {
+            std::vector<std::vector<Gdiplus::PointF>> segments;
+            segments.push_back(std::move(points));
+            draw_series(fps_plot, segments, fps_color, true);
+        }
+        Gdiplus::SolidBrush gap_fill(Gdiplus::Color(95, 8, 19, 31));
+        Gdiplus::Pen delayed(Gdiplus::Color(230,
+            static_cast<BYTE>(fps_color.GetR() * 0.45F),
+            static_cast<BYTE>(fps_color.GetG() * 0.55F),
+            static_cast<BYTE>(fps_color.GetB() * 0.55F)),
+            std::max(1.0F, 0.9F * scale));
+        fps::ForEachHistoryStroke(fps_history_->Samples(), visible_start, view_end,
+            [&](const fps::HistorySample& from, const fps::HistorySample& to,
+                const bool dim) {
+                if (!dim) return;
+                const Gdiplus::PointF a(x_for(from.monotonic_ms),
+                    y_for(fps_plot, *from.displayed_fps, 0.0, fps_max));
+                const Gdiplus::PointF b(x_for(to.monotonic_ms),
+                    to.displayed_fps
+                        ? y_for(fps_plot, *to.displayed_fps, 0.0, fps_max) : a.Y);
+                Gdiplus::GraphicsPath area;
+                area.AddLine(a, b);
+                area.AddLine(b, {b.X, baseline});
+                area.AddLine(Gdiplus::PointF(b.X, baseline),
+                             Gdiplus::PointF(a.X, baseline));
+                area.CloseFigure();
+                graphics.FillPath(&gap_fill, &area);
+                graphics.DrawLine(&delayed, a, b);
+            });
+    }
 
     const auto draw_marker_label = [&](const std::wstring& label,
                                        const Gdiplus::RectF& plot,

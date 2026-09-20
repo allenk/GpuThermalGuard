@@ -314,6 +314,28 @@ bool SaveOsdPosition(const int x, const int y, std::wstring& error) {
     return success;
 }
 
+bool LoadFpsEnabled() noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return true;
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const bool valid = RegQueryValueExW(key, L"ShowFps", nullptr, &type,
+        reinterpret_cast<BYTE*>(&value), &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value);
+    RegCloseKey(key);
+    return ResolveFpsPreference(valid, value);
+}
+
+bool SaveFpsEnabled(const bool enabled, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"ShowFps", enabled ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
 WindowPosition LoadMainWindowPosition() noexcept {
     WindowPosition result;
     HKEY key = nullptr;

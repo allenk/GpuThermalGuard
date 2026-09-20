@@ -11,21 +11,27 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 ## Screenshots
 
-| Main dashboard | 30-second OSD |
+| Main dashboard with optional FPS history | Compact 30-second OSD with FPS |
 | --- | --- |
-| ![GpuThermalGuard dashboard](docs/images/dashboard.png) | ![GpuThermalGuard OSD](docs/images/osd.png) |
+| ![GpuThermalGuard dashboard showing the sixth FPS history lane](docs/images/dashboard.png) | ![Compact OSD showing six metric cards including FPS](docs/images/osd-compact.png) |
 
 Screenshots show one workstation's settings, not recommended limits for every GPU.
 
 ### Compact OSD
 
-![Compact OSD with five live metrics and miniature trends](docs/images/osd-compact.png)
+![Compact OSD with six live metrics and miniature trends when FPS is enabled](docs/images/osd-compact.png)
 
-Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode keeps the same width and toggle position, showing temperature, power, VRAM, GPU utilization, and CPU utilization in five small cards with live values and 30-second miniature trends.
+Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode shows temperature, power, VRAM, GPU utilization, and CPU utilization in five small cards with live values and 30-second miniature trends. With **Show FPS** checked, a sixth FPS card appears; unchecking it returns to the original five-card layout.
 
 Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Drag the header outside the toggle button to move the OSD; restart returns to the expanded view.
 
 Compact mode is included starting with v0.9.0-beta.2.
+
+### Optional game FPS
+
+Starting with v0.10.0-beta.1, **Show FPS** is checked by default and adds a separate sixth history lane to the dashboard and an FPS row/card to the OSD. It follows the current foreground app, so switching games mixes their readings on one time axis. Turning it off stops FPS observation, clears that FPS history, and leaves the five thermal histories unchanged. The FPS collector is outside the independent 200 ms protection loop.
+
+The number represents verified displayed frames on supported Windows DXGI presentation paths, not raw Present calls or the monitor refresh rate. During warm-up, focus changes, or unsupported/ambiguous paths, it shows `-`; dark curve sections are visual continuity, **not measured FPS**. Native Vulkan FPS and an in-game overlay for exclusive fullscreen are not included in this release. Desktop TOPMOST OSD visibility in exclusive fullscreen is not guaranteed.
 
 ## Why I built it
 
@@ -69,6 +75,7 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 - VRAM usage percentage and GiB
 - GPU utilization
 - CPU utilization
+- optional foreground-game Displayed FPS on validated DXGI paths; unavailable otherwise
 - one hour of retained telemetry with a draggable five-minute dashboard view
 - a compact, non-activating 30-second always-on-top OSD
 

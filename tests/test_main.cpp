@@ -15,12 +15,20 @@
 #include "logging/logger.hpp"
 #include "service/pipe_server.hpp"
 #include "timing/protection_timing.hpp"
+#include "fps/fps_rate.hpp"
+#include "fps/observer_admission.hpp"
+#include "fps/fps_history.hpp"
+#include "fps/dxgi_event.hpp"
+#include "fps/display_correlator.hpp"
+#include "settings/settings.hpp"
 
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
 
 #include <cstdlib>
+#include <array>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -88,6 +96,451 @@ void TestOsdCompact() {
     Require(PulseAlpha(true, true, 0) != PulseAlpha(true, true, 1000), "alert pulses");
     for (unsigned i = 0; i < 10000; i += 100)
         Require(PulseAlpha(true, true, i) >= 150, "pulse never disappears");
+    const auto normal = ChooseFootprint(true, false, 1366, 768);
+    Require(normal.width == 388 && normal.height == 88 && normal.columns == 5,
+        "unchecked FPS retains the five-cell compact OSD");
+    const auto six = ChooseFootprint(true, true, 1366, 768);
+    Require(six.width == 464 && six.height == 88 && six.columns == 6,
+        "roomy 96 DPI compact OSD puts FPS in the last sixth cell");
+    const auto compact_grid = ChooseFootprint(true, true, 683, 384);
+    Require(compact_grid.width <= 320 && compact_grid.height <= 150 &&
+            compact_grid.columns == 3, "small high-DPI work area reflows compact OSD");
+    const auto expanded = ChooseFootprint(false, true, 1366, 768);
+    Require(expanded.height > 330 && expanded.height <= 384 &&
+            expanded.columns == 1, "roomy expanded OSD adds FPS without exceeding half height");
+    const auto expanded_grid = ChooseFootprint(false, true, 683, 384);
+    Require(expanded_grid.height <= 220 && expanded_grid.columns == 2,
+        "small high-DPI expanded OSD reflows to two columns");
+    for (int dpi : {96, 120, 144, 192}) {
+        const int work_width_dip = 1366 * 96 / dpi;
+        const int work_height_dip = 768 * 96 / dpi;
+        for (bool collapsed : {false, true}) {
+            const auto choice = ChooseFootprint(
+                collapsed, true, work_width_dip, work_height_dip);
+            Require(choice.width <= work_width_dip &&
+                    choice.height <= work_height_dip,
+                "FPS layout fits 1366x768 work area at each tested DPI");
+        }
+    }
+}
+
+void TestFpsRateIsIndependentAndHonest() {
+    using gtg::fps::Identity;
+    using gtg::fps::RateTracker;
+    using gtg::fps::Status;
+    RateTracker tracker;
+    const Identity game{42, 1234};
+    const Identity reused_pid{42, 5678};
+    Require(tracker.Read(1'000'000, true).status == Status::Unavailable,
+        "no target is unavailable, not zero");
+    tracker.SetTarget(game, 0);
+    Require(tracker.Read(500'000, true).status == Status::Warmup,
+        "one-second window must warm up");
+    for (std::uint64_t t = 0; t <= 1'000'000; t += 20'000) {
+        tracker.RecordDisplayed(game, 0xA, t);
+    }
+    const auto primary = tracker.Read(1'000'000, true);
+    Require(primary.status == Status::Ready && primary.displayed_fps >= 49.0 &&
+            primary.displayed_fps <= 51.0, "50 measured display changes become about 50 FPS");
+    tracker.RecordDisplayed(game, 0xB, 1'000'000);
+    const auto multiple = tracker.Read(1'000'000, true);
+    Require(multiple.status == Status::Ready && multiple.displayed_fps <= 51.0,
+        "secondary swapchain must not be summed into FPS");
+    const auto buffered = tracker.Read(2'100'000, true);
+    Require(buffered.status == Status::Ready && buffered.displayed_fps >= 49.0,
+        "ETW buffer delivery gap must not make a presenting game briefly zero");
+    Require(tracker.Read(1'100'000, false).status == Status::Unavailable,
+        "observer failure cannot retain plausible FPS");
+    tracker.SetTarget(reused_pid, 1'100'000);
+    tracker.RecordDisplayed(game, 0xA, 1'200'000);
+    Require(tracker.Read(1'200'000, true).status == Status::Warmup,
+        "PID reuse must not import old process frames");
+    Require(tracker.Read(2'200'000, true).status == Status::Unavailable,
+        "a foreground app with no DXGI evidence is unsupported, not zero FPS");
+    tracker.RecordDisplayed(reused_pid, 0xC, 2'200'000);
+    tracker.RecordDisplayed(reused_pid, 0xC, 2'220'000);
+    Require(tracker.Read(4'300'000, true).status == Status::Unavailable,
+        "stalled or occluded display outcome is unavailable, not assumed zero");
+    tracker.MarkLost(4'300'000);
+    Require(tracker.Read(4'300'000, true).status == Status::Warmup,
+        "event loss invalidates the prior window");
+    tracker.ClearTarget();
+    Require(tracker.Read(3'500'000, true).status == Status::Unavailable,
+        "no target after exit is unavailable");
+
+    RateTracker sustained;
+    sustained.SetTarget(game, 0);
+    for (std::uint64_t t = 0; t <= 24'000'000; t += 20'000) {
+        sustained.RecordDisplayed(game, 0xA, t);
+    }
+    Require(sustained.Read(24'000'000, true).status == Status::Ready,
+        "bounded ring must remain usable after many ordinary frames");
+    RateTracker overloaded;
+    overloaded.SetTarget(game, 0);
+    for (std::uint64_t t = 0; t <= 600'000; t += 500) {
+        overloaded.RecordDisplayed(game, 0xA, t);
+    }
+    Require(overloaded.Read(1'000'000, true).status == Status::Unavailable,
+        "ring overflow inside the measured window cannot publish a false rate");
+}
+
+void TestFpsRateRejectsShortStartupBurst() {
+    using gtg::fps::Identity;
+    using gtg::fps::RateTracker;
+    using gtg::fps::Status;
+    const Identity game{9, 100};
+    RateTracker tracker;
+    tracker.SetTarget(game, 0);
+    tracker.RecordDisplayed(game, 0xA, 1'000'000);
+    tracker.RecordDisplayed(game, 0xA, 1'001'000);
+    Require(tracker.Read(1'010'000, true).status == Status::Warmup,
+        "two Presents in 1 ms cannot establish sustained 1000 FPS");
+    for (std::uint64_t t = 1'010'000; t <= 1'610'000; t += 10'000)
+        tracker.RecordDisplayed(game, 0xA, t);
+    const auto sustained = tracker.Read(1'610'000, true);
+    Require(sustained.status == Status::Ready && sustained.displayed_fps > 90.0 &&
+            sustained.displayed_fps < 110.0,
+        "sustained high-rate Present stream remains measurable");
+}
+
+void TestFpsRateReclaimsOldSwapchains() {
+    using gtg::fps::Identity;
+    using gtg::fps::RateTracker;
+    using gtg::fps::Status;
+    const Identity game{88, 99};
+    RateTracker tracker;
+    tracker.SetTarget(game, 0);
+    for (std::uint64_t surface = 1; surface <= 5; ++surface) {
+        const auto begin = (surface - 1) * 2'000'000;
+        for (std::uint64_t t = begin; t <= begin + 1'000'000; t += 20'000)
+            tracker.RecordDisplayed(game, surface, t);
+    }
+    const auto latest = tracker.Read(9'000'000, true);
+    Require(latest.status == Status::Ready && latest.surface == 5 &&
+            latest.displayed_fps >= 49.0 && latest.displayed_fps <= 51.0,
+        "sequential swap-chain recreation cannot permanently exhaust surface slots");
+
+    RateTracker transient_overload;
+    transient_overload.SetTarget(game, 0);
+    for (std::uint64_t surface = 1; surface <= 5; ++surface)
+        transient_overload.RecordDisplayed(game, surface, 0);
+    Require(transient_overload.Read(1'000'000, true).status == Status::Unavailable,
+        "simultaneous fifth surface must fail closed");
+    for (std::uint64_t t = 20'000; t <= 5'000'000; t += 20'000)
+        transient_overload.RecordDisplayed(game, 1, t);
+    const auto recovered = transient_overload.Read(5'000'000, true);
+    Require(recovered.status == Status::Ready && recovered.surface == 1 &&
+            recovered.displayed_fps >= 49.0 && recovered.displayed_fps <= 51.0,
+        "transient capacity ambiguity must recover after one surface stabilizes");
+}
+
+void TestAccessDeniedObserverProbation() {
+    using gtg::fps::ModuleEvidence;
+    using gtg::fps::ObserverAdmission;
+    using gtg::fps::ChooseObserverAdmission;
+    using gtg::fps::ObserverProbation;
+    Require(ChooseObserverAdmission(ModuleEvidence::DxgiModules) ==
+            ObserverAdmission::Normal,
+        "inspectable DXGI module hint keeps the ordinary path");
+    Require(ChooseObserverAdmission(ModuleEvidence::AccessDenied) ==
+            ObserverAdmission::Probation,
+        "only access-denied module enumeration admits ETW probation");
+    Require(ChooseObserverAdmission(ModuleEvidence::NoDxgiModules) ==
+            ObserverAdmission::Reject &&
+            ChooseObserverAdmission(ModuleEvidence::OtherFailure) ==
+            ObserverAdmission::Reject,
+        "inspectable non-DXGI and other failures must not start ETW");
+
+    ObserverProbation probe;
+    probe.Begin(ObserverAdmission::Probation, 1'000);
+    Require(!probe.CanPublish() && !probe.Expired(5'999),
+        "module denial alone cannot publish FPS or expire early");
+    Require(probe.Expired(6'000) &&
+            probe.RetryAt(6'000) == 36'000,
+        "five-second no-evidence probation stops with thirty-second cooldown");
+    probe.Begin(ObserverAdmission::Probation, 40'000);
+    probe.NoteDisplayed();
+    Require(probe.CanPublish() && !probe.Expired(50'000),
+        "verified displayed frame unlocks normal FPS warm-up");
+    probe.Begin(ObserverAdmission::Normal, 60'000);
+    Require(probe.CanPublish() && !probe.Expired(70'000),
+        "ordinary module-hint target has no probation deadline");
+}
+
+void TestFpsHistoryFollowsSampledForeground() {
+    using gtg::fps::History;
+    using gtg::fps::Identity;
+    using gtg::fps::Snapshot;
+    using gtg::fps::Status;
+    History history;
+    const Identity a{42, 1234};
+    const Identity b{43, 5678};
+    history.Record(1'000, a, Snapshot{Status::Ready, 60.0, a});
+    history.Record(1'500, b, Snapshot{Status::Ready, 60.0, a});
+    history.Record(2'000, b, Snapshot{Status::Ready, 120.0, b});
+    history.Record(2'500, a, Snapshot{Status::Warmup, 0.0, a});
+    history.Record(3'000, a, Snapshot{Status::Ready, 72.0, a});
+    Require(history.Samples().size() == 5, "each presentation poll has a history point");
+    Require(history.Samples()[0].displayed_fps == 60.0 &&
+            !history.Samples()[1].displayed_fps &&
+            history.Samples()[2].displayed_fps == 120.0 &&
+            !history.Samples()[3].displayed_fps &&
+            history.Samples()[4].displayed_fps == 72.0,
+            "A-B-A focus switches cannot reuse another process's cached FPS");
+    history.Record(3'500, std::nullopt, Snapshot{Status::Ready, 72.0, a});
+    Require(!history.Samples().back().displayed_fps,
+            "shell or ineligible foreground leaves a no-data marker");
+    history.Record(4'000, Identity{42, 9999}, Snapshot{Status::Ready, 72.0, a});
+    Require(!history.Samples().back().displayed_fps,
+            "PID reuse cannot inherit an old process rate");
+    history.Clear();
+    Require(history.Samples().empty(), "disabling FPS clears its volatile history");
+}
+
+void TestFpsHistoryBoundsAndZeroSemantics() {
+    using gtg::fps::History;
+    using gtg::fps::Identity;
+    using gtg::fps::Snapshot;
+    using gtg::fps::Status;
+    History history;
+    const Identity app{77, 100};
+    history.Record(0, app, Snapshot{Status::Ready, 0.0, app});
+    history.Record(500, app, Snapshot{Status::Warmup, 0.0, app});
+    Require(history.Samples()[0].displayed_fps == 0.0 &&
+            !history.Samples()[1].displayed_fps,
+            "confirmed zero and unavailable waterline have different data states");
+    for (std::uint64_t ms = 1'000; ms <= History::kRetainedDurationMs + 1'000;
+         ms += 500) {
+        history.Record(ms, app, Snapshot{Status::Ready, 60.0, app});
+    }
+    Require(history.Samples().size() <= History::kMaxSamples &&
+            history.Samples().front().monotonic_ms >= 1'000,
+            "one-hour FPS history remains bounded");
+}
+
+void TestFpsHistoryBreaksTargetAndSurfaceTransitions() {
+    using gtg::fps::CanConnectHistorySamples;
+    using gtg::fps::History;
+    using gtg::fps::Identity;
+    using gtg::fps::Snapshot;
+    using gtg::fps::Status;
+    History history;
+    const Identity a{42, 1234};
+    const Identity b{43, 5678};
+    history.Record(1'000, a, Snapshot{Status::Ready, 60.0, a, 0xA});
+    history.Record(1'500, a, Snapshot{Status::Ready, 61.0, a, 0xA});
+    history.Record(2'000, b, Snapshot{Status::Ready, 120.0, b, 0xB});
+    history.Record(2'500, b, Snapshot{Status::Ready, 121.0, b, 0xC});
+    history.Record(3'000, b, Snapshot{Status::Warmup, 0.0, b, 0xC});
+    const auto& samples = history.Samples();
+    Require(samples[0].surface == 0xA && samples[2].surface == 0xB,
+        "history preserves the measured swap-chain identity");
+    Require(CanConnectHistorySamples(samples[0], samples[1]),
+        "consecutive samples from the same target and surface connect");
+    Require(!CanConnectHistorySamples(samples[1], samples[2]),
+        "foreground application transition must not be interpolated");
+    Require(!CanConnectHistorySamples(samples[2], samples[3]),
+        "swap-chain transition must not be interpolated");
+    Require(!CanConnectHistorySamples(samples[3], samples[4]),
+        "warm-up is a no-data break, not a measured zero");
+}
+
+void TestFpsHistoryDrawsDarkGapsWithoutInventingSamples() {
+    using gtg::fps::History;
+    using gtg::fps::Identity;
+    using gtg::fps::Snapshot;
+    using gtg::fps::Status;
+    const Identity a{42, 1234};
+    const Identity b{43, 5678};
+    History history;
+    history.Record(1'000, a, Snapshot{Status::Ready, 60.0, a, 0xA});
+    history.Record(1'500, a, Snapshot{Status::Unavailable, 0.0, a});
+    history.Record(2'000, a, Snapshot{Status::Ready, 65.0, a, 0xA});
+    history.Record(2'500, a, Snapshot{Status::Warmup, 0.0, a});
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dark;
+    gtg::fps::ForEachHistoryStroke(history.Samples(), 0, 3'000,
+        [&](const auto& from, const auto& to, bool dim) {
+            if (dim) dark.emplace_back(from.monotonic_ms, to.monotonic_ms);
+        });
+    Require(dark.size() == 2 && dark[0] == std::pair{1'000ULL, 2'000ULL} &&
+            dark[1] == std::pair{2'000ULL, 2'500ULL},
+        "same-target gaps and pending tail must use a dim connecting stroke");
+    Require(!history.Samples()[1].displayed_fps && !history.Samples()[3].displayed_fps,
+        "dim visual bridge must not materialize a measured FPS sample");
+
+    history.Record(3'000, b, Snapshot{Status::Warmup, 0.0, b});
+    history.Record(3'500, a, Snapshot{Status::Ready, 70.0, a, 0xA});
+    history.Record(4'000, a, Snapshot{Status::Ready, 75.0, a, 0xB});
+    dark.clear();
+    unsigned bright = 0;
+    gtg::fps::ForEachHistoryStroke(history.Samples(), 0, 4'000,
+        [&](const auto& from, const auto& to, bool dim) {
+            if (dim) dark.emplace_back(from.monotonic_ms, to.monotonic_ms);
+            else ++bright;
+        });
+    Require(dark.size() == 3 && dark[0] == std::pair{1'000ULL, 2'000ULL} &&
+            dark[1] == std::pair{2'000ULL, 3'500ULL} &&
+            dark[2] == std::pair{3'500ULL, 4'000ULL} && bright == 0,
+        "focus and surface changes must remain continuous but never bright");
+    Require(history.Samples()[4].identity == b &&
+            !history.Samples()[4].displayed_fps &&
+            history.Samples()[6].surface == 0xB,
+        "visual continuity cannot rewrite source identity or fill missing data");
+}
+
+void TestDxgiPresentMatchingRejectsFailedAndTestCalls() {
+    using gtg::fps::DxgiPresentMatcher;
+    using gtg::fps::RawDxgiEvent;
+    DxgiPresentMatcher matcher;
+    std::array<std::uint8_t, 20> start{};
+    const std::uint64_t surface = 0x1234;
+    std::memcpy(start.data(), &surface, sizeof(surface));
+    const std::int32_t success = 0;
+    const std::int32_t failed = static_cast<std::int32_t>(0x887A0001U);
+    const std::int32_t occluded = 0x087A0001;
+    Require(!matcher.OnEvent(RawDxgiEvent{42, 0, 8, start.data(), start.size(), 100})
+                 .has_value(), "Present start alone is not counted");
+    const auto good = matcher.OnEvent(RawDxgiEvent{
+        43, 0, 8, reinterpret_cast<const std::uint8_t*>(&success), sizeof(success), 110});
+    Require(good && good->surface == surface && good->timestamp_us == 100,
+        "successful stop matches original swapchain and start time");
+    (void)matcher.OnEvent(RawDxgiEvent{42, 0, 9, start.data(), start.size(), 200});
+    Require(!matcher.OnEvent(RawDxgiEvent{
+        43, 0, 9, reinterpret_cast<const std::uint8_t*>(&failed), sizeof(failed), 210}),
+        "failed Present must not count");
+    (void)matcher.OnEvent(RawDxgiEvent{42, 0, 9, start.data(), start.size(), 220});
+    Require(!matcher.OnEvent(RawDxgiEvent{
+        43, 0, 9, reinterpret_cast<const std::uint8_t*>(&occluded), sizeof(occluded), 230}),
+        "positive DXGI status is not a verified presented frame");
+    const std::uint32_t test_flag = 1;
+    std::memcpy(start.data() + sizeof(surface), &test_flag, sizeof(test_flag));
+    (void)matcher.OnEvent(RawDxgiEvent{42, 0, 10, start.data(), start.size(), 300});
+    Require(!matcher.OnEvent(RawDxgiEvent{
+        43, 0, 10, reinterpret_cast<const std::uint8_t*>(&success), sizeof(success), 310}),
+        "DXGI_PRESENT_TEST must not count");
+    Require(!matcher.OnEvent(RawDxgiEvent{42, 1, 8, start.data(), start.size(), 400}),
+        "unknown event schema version must be rejected");
+    Require(!matcher.OnEvent(RawDxgiEvent{42, 0, 8, start.data(), 4, 500}),
+        "truncated payload must be rejected");
+    Require(gtg::fps::FirstStageD3D11Candidate(true, false),
+        "known D3D11-only process is eligible for first-stage FPS");
+    Require(!gtg::fps::FirstStageD3D11Candidate(false, true) &&
+            !gtg::fps::FirstStageD3D11Candidate(true, true) &&
+            !gtg::fps::FirstStageD3D11Candidate(false, false),
+        "D3D12, mixed API and unknown targets stay unavailable");
+    Require(gtg::fps::ValidatedDxgiCandidate(false, true),
+        "trace-validated D3D12-only target is eligible");
+    Require(gtg::fps::ValidatedDxgiCandidate(true, false) &&
+            gtg::fps::ValidatedDxgiCandidate(true, true) &&
+            !gtg::fps::ValidatedDxgiCandidate(false, false),
+        "either DXGI-capable module is a hint; event evidence decides FPS");
+}
+
+void TestComposedFlipRequiresVerifiedScanout() {
+    using gtg::fps::DisplayCorrelator;
+    using gtg::fps::TokenKey;
+    DisplayCorrelator tracker;
+    const TokenKey first{0xA, 1, 7};
+    tracker.OnPresentStart(11, 0x1234, 0, 100);
+    tracker.OnPresentStop(11, 0);
+    tracker.OnToken(21, first, 110);  // Driver work may use another thread.
+    tracker.OnInFrame(first);
+    tracker.OnSurfaceUpdate(first);
+    tracker.SetDwmThread(31);
+    tracker.OnDwmFlip(31, 120);
+    tracker.OnDwmQueue(31, 40);
+    Require(!tracker.Pop().has_value(),
+        "DXGI, Win32k and DWM submissions are not yet displayed");
+    tracker.OnVSync(40, 130);
+    const auto shown = tracker.Pop();
+    Require(shown && shown->surface == 0x1234 && shown->timestamp_us == 130,
+        "matching scanout emits one displayed frame for the target surface");
+    tracker.OnVSync(40, 140);
+    Require(!tracker.Pop().has_value(), "duplicate scanout cannot count twice");
+}
+
+void TestComposedFlipDropsAndLossFailClosed() {
+    using gtg::fps::DisplayCorrelator;
+    using gtg::fps::TokenKey;
+    DisplayCorrelator tracker;
+    tracker.SetDwmThread(31);
+    const TokenKey dropped{0xA, 2, 7};
+    tracker.OnPresentStart(11, 0x1234, 0, 200);
+    tracker.OnPresentStop(11, 0);
+    tracker.OnToken(21, dropped, 210);
+    tracker.OnInFrame(dropped);
+    tracker.OnSurfaceUpdate(dropped);
+    tracker.OnDwmFlip(31, 220);
+    tracker.OnDwmQueue(31, 41);
+    tracker.OnDiscard(dropped);
+    tracker.OnVSync(41, 230);
+    Require(!tracker.Pop().has_value(), "discarded target frame stays absent");
+    const TokenKey failed{0xA, 3, 7};
+    tracker.OnPresentStart(11, 0x1234, 0, 300);
+    tracker.OnPresentStop(11, static_cast<std::int32_t>(0x887A0001U));
+    tracker.OnToken(21, failed, 310);
+    tracker.OnInFrame(failed);
+    tracker.OnSurfaceUpdate(failed);
+    tracker.OnDwmFlip(31, 320);
+    tracker.OnDwmQueue(31, 42);
+    tracker.OnVSync(42, 330);
+    Require(!tracker.Pop().has_value(), "failed DXGI call stays absent");
+    tracker.MarkLost();
+    Require(!tracker.Pop().has_value() && !tracker.Healthy(),
+        "ETW loss invalidates every queued result");
+}
+
+void TestComposedFlipLongRunAndDwmThreadSwitch() {
+    using gtg::fps::DisplayCorrelator;
+    using gtg::fps::TokenKey;
+    DisplayCorrelator tracker;
+    tracker.SetDwmThread(31);
+    for (std::uint32_t i = 1; i <= 1500; ++i) {
+        const auto time_us = 100'000ULL + static_cast<std::uint64_t>(i) * 8'000;
+        const TokenKey key{0xB, i, 9};
+        tracker.OnPresentStart(11, 0x5678, 0, time_us);
+        tracker.OnPresentStop(11, 0);
+        tracker.OnToken(21, key, time_us + 100);
+        tracker.OnInFrame(key);
+        tracker.OnSurfaceUpdate(key);
+        tracker.OnDwmFlip(31, time_us + 200);
+        tracker.OnDwmQueue(31, i);
+        tracker.OnVSync(i, time_us + 300);
+        Require(tracker.Pop().has_value() && tracker.Healthy(),
+            "fixed capacity must recycle completed frames during long runs");
+    }
+    tracker.SetDwmThread(32);
+    const TokenKey next{0xB, 1501, 9};
+    tracker.OnPresentStart(11, 0x5678, 0, 12'200'000);
+    tracker.OnPresentStop(11, 0);
+    tracker.OnToken(21, next, 12'200'100);
+    tracker.OnInFrame(next);
+    tracker.OnSurfaceUpdate(next);
+    tracker.OnDwmFlip(32, 12'200'200);
+    tracker.OnDwmQueue(32, 1501);
+    tracker.OnVSync(1501, 12'200'300);
+    Require(tracker.Pop().has_value() && tracker.Healthy(),
+        "completed DWM thread migration must not permanently disable FPS");
+}
+
+void TestComposedFlipAmbiguousSurfacesFailClosed() {
+    gtg::fps::DisplayCorrelator tracker;
+    tracker.OnPresentStart(11, 0xAAAA, 0, 100);
+    tracker.OnPresentStop(11, 0);
+    tracker.OnPresentStart(12, 0xBBBB, 0, 101);
+    tracker.OnPresentStop(12, 0);
+    tracker.OnToken(21, {0xC, 1, 9}, 110);
+    Require(!tracker.Healthy() && !tracker.Pop(),
+        "deferred driver token cannot guess between two presenting surfaces");
+}
+
+void TestFpsPreferenceDefaultsOnWithoutTouchingProtectionSettings() {
+    Require(gtg::settings::ResolveFpsPreference(false, 0),
+        "missing user preference defaults Show FPS on");
+    Require(!gtg::settings::ResolveFpsPreference(true, 0),
+        "explicit user disable remains off");
+    Require(gtg::settings::ResolveFpsPreference(true, 1),
+        "explicit user enable remains on");
 }
 
 void TestWorkingPowerApply() {
@@ -1096,6 +1549,26 @@ int main(int argc, char** argv) {
     }
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
         {"OsdCompact", TestOsdCompact},
+        {"FpsRateIsIndependentAndHonest", TestFpsRateIsIndependentAndHonest},
+        {"FpsRateRejectsShortStartupBurst", TestFpsRateRejectsShortStartupBurst},
+        {"FpsRateReclaimsOldSwapchains", TestFpsRateReclaimsOldSwapchains},
+        {"AccessDeniedObserverProbation", TestAccessDeniedObserverProbation},
+        {"FpsHistoryBreaksTargetAndSurfaceTransitions",
+         TestFpsHistoryBreaksTargetAndSurfaceTransitions},
+        {"FpsHistoryDrawsDarkGapsWithoutInventingSamples",
+         TestFpsHistoryDrawsDarkGapsWithoutInventingSamples},
+        {"FpsHistoryFollowsSampledForeground", TestFpsHistoryFollowsSampledForeground},
+        {"FpsHistoryBoundsAndZeroSemantics", TestFpsHistoryBoundsAndZeroSemantics},
+        {"DxgiPresentMatchingRejectsFailedAndTestCalls",
+         TestDxgiPresentMatchingRejectsFailedAndTestCalls},
+        {"ComposedFlipRequiresVerifiedScanout", TestComposedFlipRequiresVerifiedScanout},
+        {"ComposedFlipDropsAndLossFailClosed", TestComposedFlipDropsAndLossFailClosed},
+        {"ComposedFlipLongRunAndDwmThreadSwitch",
+         TestComposedFlipLongRunAndDwmThreadSwitch},
+        {"ComposedFlipAmbiguousSurfacesFailClosed",
+         TestComposedFlipAmbiguousSurfacesFailClosed},
+        {"FpsPreferenceDefaultsOnWithoutTouchingProtectionSettings",
+         TestFpsPreferenceDefaultsOnWithoutTouchingProtectionSettings},
         {"ConfigValidation", TestConfigValidation},
         {"WorkingPowerApply", TestWorkingPowerApply},
         {"WorkingPowerFailureAndContinuity", TestWorkingPowerFailureAndContinuity},

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(GpuThermalGuard VERSION 0.9.0 LANGUAGES CXX)
+project(GpuThermalGuard VERSION 0.10.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "GpuThermalGuard currently supports Windows only")
@@ -13,6 +13,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(GTG_OSD_CLICK_THROUGH
     "Allow pointer input to pass through the OSD body (the top drag strip remains interactive)"
+    OFF
+)
+option(GTG_BUILD_INTERACTIVE_SMOKE
+    "Build local HWND smoke tests (requires an interactive desktop)"
     OFF
 )
 
@@ -101,6 +105,10 @@ add_executable(GpuThermalGuard WIN32
     src/tray/main_dialog.hpp
     src/tray/osd_overlay.cpp
     src/tray/osd_overlay.hpp
+    src/fps/fps_rate.hpp
+    src/fps/dxgi_event.hpp
+    src/fps/dxgi_observer.cpp
+    src/fps/dxgi_observer.hpp
     src/resources/resource.h
     src/resources/GpuThermalGuard.rc
     src/resources/GpuThermalGuard.manifest
@@ -119,6 +127,8 @@ target_link_libraries(GpuThermalGuard PRIVATE
     gdiplus
     wtsapi32
     dwmapi
+    advapi32
+    tdh
 )
 if(GTG_OSD_CLICK_THROUGH)
     target_compile_definitions(GpuThermalGuard PRIVATE GTG_OSD_CLICK_THROUGH=1)
@@ -139,6 +149,41 @@ if(BUILD_TESTING)
         gtg_build_options nvml_headers wtl user32 gdi32 advapi32)
     add_test(NAME gtg_tests COMMAND gtg_tests)
     set_tests_properties(gtg_tests PROPERTIES TIMEOUT 45)
+
+    if(GTG_BUILD_INTERACTIVE_SMOKE)
+        add_executable(gtg_osd_fps_smoke
+            tests/osd_overlay_smoke.cpp
+            src/logging/logger.cpp
+        )
+        target_include_directories(gtg_osd_fps_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(gtg_osd_fps_smoke PRIVATE
+            gtg_telemetry gtg_build_options wtl gdiplus wtsapi32 dwmapi advapi32
+            user32 gdi32 shell32)
+        add_test(NAME gtg_osd_fps_smoke COMMAND gtg_osd_fps_smoke)
+        set_tests_properties(gtg_osd_fps_smoke PROPERTIES TIMEOUT 30)
+        add_executable(gtg_fps_history_chart_smoke
+            tests/fps_history_chart_smoke.cpp
+            src/tray/history_chart.cpp
+        )
+        target_include_directories(gtg_fps_history_chart_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(gtg_fps_history_chart_smoke PRIVATE
+            gtg_telemetry gtg_build_options wtl gdiplus user32 gdi32)
+        add_test(NAME gtg_fps_history_chart_smoke
+            COMMAND gtg_fps_history_chart_smoke)
+        set_tests_properties(gtg_fps_history_chart_smoke PROPERTIES TIMEOUT 15)
+        add_executable(gtg_fps_observer_smoke
+            tests/fps_observer_smoke.cpp
+            src/fps/dxgi_observer.cpp
+        )
+        target_include_directories(gtg_fps_observer_smoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(gtg_fps_observer_smoke PRIVATE
+            GTG_FPS_ISOLATED_SMOKE=1)
+        target_link_libraries(gtg_fps_observer_smoke PRIVATE
+            gtg_build_options advapi32 tdh user32)
+    endif()
 endif()
 
 if(MSVC)

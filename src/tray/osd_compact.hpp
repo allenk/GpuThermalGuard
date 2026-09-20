@@ -9,6 +9,25 @@ namespace gtg::tray::compact {
 // Presentation-only policy shared by rendering, hit testing and native tests.
 constexpr int Width(bool) noexcept { return 388; }
 constexpr int Height(bool collapsed) noexcept { return collapsed ? 88 : 330; }
+struct Footprint {
+    int width{};
+    int height{};
+    int columns{};
+};
+
+constexpr Footprint ChooseFootprint(bool collapsed, bool show_fps,
+                                    int work_width_dip,
+                                    int work_height_dip) noexcept {
+    if (!show_fps) return {388, Height(collapsed), collapsed ? 5 : 1};
+    if (collapsed) {
+        if (work_width_dip >= 464 && 464 <= work_width_dip * 55 / 100)
+            return {464, 88, 6};
+        return {std::min(320, std::max(1, work_width_dip)), 142, 3};
+    }
+    if (work_height_dip >= 710 && work_width_dip >= 388)
+        return {388, 355, 1};
+    return {std::min(320, std::max(1, work_width_dip)), 190, 2};
+}
 inline std::pair<double, double> SparkRange(double low, double high, double minimum_span) noexcept {
     const double span = std::max(minimum_span, (high - low) * 1.2);
     const double bottom = std::max(0.0, (low + high - span) / 2.0);

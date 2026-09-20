@@ -23,6 +23,8 @@
 #include "telemetry/telemetry_history.hpp"
 #include "snapshot/ui_snapshot.hpp"
 #include "protection/local_protection_worker.hpp"
+#include "fps/dxgi_observer.hpp"
+#include "fps/fps_history.hpp"
 
 namespace gtg::tray {
 
@@ -54,6 +56,7 @@ public:
         COMMAND_ID_HANDLER(IDC_HIDE_TO_TRAY, OnHideToTray)
         COMMAND_HANDLER(IDC_CLOSE_TO_TRAY, BN_CLICKED, OnCloseBehaviorChanged)
         COMMAND_HANDLER(IDC_OSD_ENABLED, BN_CLICKED, OnOsdToggle)
+        COMMAND_HANDLER(IDC_SHOW_FPS, BN_CLICKED, OnFpsToggle)
         COMMAND_HANDLER(IDC_LANGUAGE, CBN_SELCHANGE, OnLanguageChanged)
         COMMAND_HANDLER(IDC_NORMAL_POWER, EN_CHANGE, OnProtectionSettingChanged)
         COMMAND_HANDLER(IDC_SAFE_POWER, EN_CHANGE, OnProtectionSettingChanged)
@@ -108,6 +111,7 @@ private:
     LRESULT OnHideToTray(WORD, WORD, HWND, BOOL&);
     LRESULT OnCloseBehaviorChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnOsdToggle(WORD, WORD, HWND, BOOL&);
+    LRESULT OnFpsToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnLanguageChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnProtectionSettingChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnManualSnapshot(WORD, WORD, HWND, BOOL&);
@@ -151,8 +155,10 @@ private:
 
     nvml::Library nvml_;
     telemetry::History telemetry_history_;
+    fps::History fps_history_;
     HistoryChart history_chart_;
     OsdOverlay osd_overlay_;
+    fps::DxgiObserver fps_observer_;
     ProtectionConfig config_{};
     protection::LocalProtectionWorker local_protection_;
     NOTIFYICONDATAW tray_data_{};
@@ -160,6 +166,8 @@ private:
     UINT activate_message_{0};
     bool tray_added_{false};
     bool osd_ready_{false};
+    bool show_fps_{true};
+    std::uint64_t last_fps_refresh_ms_{};
     std::uint64_t last_tray_add_attempt_ms_{0};
     UINT current_tray_icon_id_{0};
     std::wstring current_tray_tooltip_;

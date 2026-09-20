@@ -1,5 +1,6 @@
 // Standalone hardware-free HWND integration test. Never initializes NVML/GTG.
 #include <windows.h>
+#include <objidl.h>
 #include <gdiplus.h>
 #include <filesystem>
 #include <iostream>
@@ -134,8 +135,47 @@ int main(int argc, char** argv) {
             ClickToggle(osd);
             check_size(false);
             screenshot("expanded.png");
+            gtg::fps::History fps_history;
+            const gtg::fps::Identity game{77, 1234};
+            osd.SetFpsHistory(&fps_history);
+            osd.SetFpsEnabled(true);
+            const auto check_fps_size = [&](const bool compact) {
+                RECT rect{};
+                GetWindowRect(osd, &rect);
+                MONITORINFO monitor_info{sizeof(monitor_info)};
+                Check(GetMonitorInfoW(MonitorFromWindow(osd, MONITOR_DEFAULTTONEAREST),
+                    &monitor_info) != FALSE, "monitor work area");
+                const int dpi = static_cast<int>(GetDpiForWindow(osd));
+                const auto footprint = gtg::tray::compact::ChooseFootprint(compact, true,
+                    MulDiv(monitor_info.rcWork.right - monitor_info.rcWork.left, 96, dpi),
+                    MulDiv(monitor_info.rcWork.bottom - monitor_info.rcWork.top, 96, dpi));
+                Check(rect.right - rect.left == MulDiv(footprint.width, dpi, 96) &&
+                    rect.bottom - rect.top == MulDiv(footprint.height, dpi, 96),
+                    "FPS OSD fits its DPI-aware footprint");
+            };
+            check_fps_size(false);
+            screenshot("fps-expanded-no-data.png");
+            ClickToggle(osd);
+            check_fps_size(true);
+            screenshot("fps-compact-no-data.png");
+            const auto fps_now = GetTickCount64();
+            for (unsigned i = 0; i < 60; ++i) {
+                const auto status = i >= 20 && i < 25
+                    ? gtg::fps::Status::Warmup : gtg::fps::Status::Ready;
+                fps_history.Record(fps_now - 30'000 + i * 500, game,
+                    gtg::fps::Snapshot{status, 55.0 + i % 20, game});
+            }
+            osd.SetFpsSnapshot({gtg::fps::Status::Ready, 74.0, game});
+            screenshot("fps-compact-trend.png");
+            ClickToggle(osd);
+            check_fps_size(false);
+            screenshot("fps-expanded-trend.png");
+            osd.SetFpsEnabled(false);
+            osd.SetFpsHistory(nullptr);
+            fps_history.Clear();
+            check_size(false);
             Check(GetModuleHandleW(L"nvml.dll") == nullptr, "no hardware library loaded");
-            std::cout << "PASS: actual HWND toggle, cancel, hide/show, dimensions, helper, focus, 200 toggles, resources, rendered PNGs\n";
+            std::cout << "PASS: actual HWND toggle, cancel, hide/show, FPS curves/footprint, helper, focus, 200 toggles, resources, rendered PNGs\n";
         } catch (const std::exception& error) {
             std::cerr << error.what() << '\n';
             result = 1;

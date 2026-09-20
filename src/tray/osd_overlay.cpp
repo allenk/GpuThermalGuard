@@ -145,6 +145,91 @@ void DrawCompactSparkline(Gdiplus::Graphics& graphics,
     graphics.DrawLines(&pen, points.data(), static_cast<INT>(points.size()));
 }
 
+void DrawFpsSparkline(Gdiplus::Graphics& graphics,
+                      const std::deque<fps::HistorySample>& samples,
+                      const std::uint64_t start, const std::uint64_t end,
+                      const Gdiplus::RectF& bounds,
+                      const Gdiplus::Color color, const float scale) {
+    double maximum = 60.0;
+    for (auto it = samples.rbegin(); it != samples.rend(); ++it) {
+        if (it->monotonic_ms < start) break;
+        if (it->monotonic_ms <= end && it->displayed_fps)
+            maximum = std::max(maximum, *it->displayed_fps * 1.1);
+    }
+    Gdiplus::Pen no_data(Gdiplus::Color(145, color.GetR(), color.GetG(), color.GetB()),
+                         std::max(1.0F, 0.8F * scale));
+    no_data.SetDashStyle(Gdiplus::DashStyleDot);
+    graphics.DrawLine(&no_data, bounds.X, bounds.GetBottom(),
+                      bounds.GetRight(), bounds.GetBottom());
+
+    const double duration = static_cast<double>(std::max<std::uint64_t>(1, end - start));
+    const auto point_for = [&](const fps::HistorySample& sample) {
+        const float x = bounds.X +
+            static_cast<float>((sample.monotonic_ms - start) / duration) * bounds.Width;
+        const float fraction = static_cast<float>(*sample.displayed_fps / maximum);
+        return Gdiplus::PointF(x, bounds.GetBottom() - fraction * bounds.Height);
+    };
+    Gdiplus::Pen line(color, std::max(1.0F, scale));
+    line.SetLineJoin(Gdiplus::LineJoinRound);
+    std::vector<Gdiplus::PointF> points;
+    const fps::HistorySample* last_valid = nullptr;
+    const fps::HistorySample* last_sample = nullptr;
+    for (const auto& sample : samples) {
+        if (sample.monotonic_ms < start || sample.monotonic_ms > end) continue;
+        last_sample = &sample;
+        if (sample.displayed_fps) {
+            points.push_back(point_for(sample));
+            last_valid = &sample;
+        }
+    }
+    if (last_valid != nullptr && last_sample != nullptr &&
+        !last_sample->displayed_fps &&
+        last_sample->monotonic_ms > last_valid->monotonic_ms) {
+        const float x = bounds.X +
+            static_cast<float>((last_sample->monotonic_ms - start) / duration) * bounds.Width;
+        points.emplace_back(x, point_for(*last_valid).Y);
+    }
+    if (points.size() >= 2) {
+        Gdiplus::GraphicsPath area;
+        area.AddLines(points.data(), static_cast<INT>(points.size()));
+        area.AddLine(points.back(), {points.back().X, bounds.GetBottom()});
+        area.AddLine(Gdiplus::PointF(points.back().X, bounds.GetBottom()),
+                     Gdiplus::PointF(points.front().X, bounds.GetBottom()));
+        area.CloseFigure();
+        Gdiplus::SolidBrush fill(Gdiplus::Color(40, color.GetR(),
+                                     color.GetG(), color.GetB()));
+        graphics.FillPath(&fill, &area);
+        graphics.DrawLines(&line, points.data(), static_cast<INT>(points.size()));
+    } else if (points.size() == 1) {
+        Gdiplus::SolidBrush dot(color);
+        graphics.FillEllipse(&dot, points.front().X - scale,
+                             points.front().Y - scale, 2 * scale, 2 * scale);
+    }
+    Gdiplus::SolidBrush gap_fill(Gdiplus::Color(95, 8, 19, 31));
+    Gdiplus::Pen delayed(Gdiplus::Color(230,
+        static_cast<BYTE>(color.GetR() * 0.45F),
+        static_cast<BYTE>(color.GetG() * 0.55F),
+        static_cast<BYTE>(color.GetB() * 0.55F)),
+        std::max(1.0F, 0.9F * scale));
+    fps::ForEachHistoryStroke(samples, start, end,
+        [&](const fps::HistorySample& from, const fps::HistorySample& to,
+            const bool dim) {
+            if (!dim) return;
+            const auto a = point_for(from);
+            const float x = bounds.X +
+                static_cast<float>((to.monotonic_ms - start) / duration) * bounds.Width;
+            const Gdiplus::PointF b(x, to.displayed_fps ? point_for(to).Y : a.Y);
+            Gdiplus::GraphicsPath area;
+            area.AddLine(a, b);
+            area.AddLine(b, {b.X, bounds.GetBottom()});
+            area.AddLine(Gdiplus::PointF(b.X, bounds.GetBottom()),
+                         Gdiplus::PointF(a.X, bounds.GetBottom()));
+            area.CloseFigure();
+            graphics.FillPath(&gap_fill, &area);
+            graphics.DrawLine(&delayed, a, b);
+        });
+}
+
 void DrawMetricLane(Gdiplus::Graphics& graphics,
                     const std::deque<telemetry::Sample>& samples,
                     const std::uint64_t visible_start,
@@ -488,6 +573,22 @@ void OsdOverlay::SetStatus(const std::wstring_view status, const OsdVisual visua
     RequestRefresh();
 }
 
+void OsdOverlay::SetFpsEnabled(const bool enabled) noexcept {
+    if (fps_enabled_ == enabled) return;
+    fps_enabled_ = enabled;
+    if (m_hWnd == nullptr) return;
+    POINT next = Position();
+    const Layout layout = CurrentLayout();
+    (void)FitToWorkArea(next, layout);
+    ApplyPosition(next, layout);
+    RequestRefresh();
+}
+
+void OsdOverlay::SetFpsSnapshot(const fps::Snapshot snapshot) noexcept {
+    fps_snapshot_ = snapshot;
+    RequestRefresh();
+}
+
 POINT OsdOverlay::Position() const noexcept {
     RECT bounds{};
     // The painted OSD is the placement authority. A transparent helper must
@@ -794,10 +895,23 @@ void OsdOverlay::RepairTopmost() noexcept {
 OsdOverlay::Layout OsdOverlay::CurrentLayout() const noexcept {
     const HWND dpi_window = m_hWnd != nullptr ? m_hWnd : drag_handle_.m_hWnd;
     const UINT dpi = dpi_window == nullptr ? 96U : GetDpiForWindow(dpi_window);
-    return {MulDiv(compact::Width(collapsed_), static_cast<int>(dpi), 96),
-            MulDiv(compact::Height(collapsed_), static_cast<int>(dpi), 96),
+    int work_width_dip = 1920;
+    int work_height_dip = 1080;
+    const HMONITOR monitor = dpi_window == nullptr ? nullptr :
+        MonitorFromWindow(dpi_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (monitor != nullptr && GetMonitorInfoW(monitor, &info) != FALSE) {
+        work_width_dip = MulDiv(info.rcWork.right - info.rcWork.left, 96,
+                                static_cast<int>(dpi));
+        work_height_dip = MulDiv(info.rcWork.bottom - info.rcWork.top, 96,
+                                 static_cast<int>(dpi));
+    }
+    const auto footprint = compact::ChooseFootprint(
+        collapsed_, fps_enabled_, work_width_dip, work_height_dip);
+    return {MulDiv(footprint.width, static_cast<int>(dpi), 96),
+            MulDiv(footprint.height, static_cast<int>(dpi), 96),
             MulDiv(kDragHeightDip, static_cast<int>(dpi), 96),
-            static_cast<float>(dpi) / 96.0F};
+            static_cast<float>(dpi) / 96.0F, footprint.columns};
 }
 
 bool OsdOverlay::FitToWorkArea(POINT& point, const Layout& layout) const noexcept {
@@ -1044,27 +1158,38 @@ bool OsdOverlay::Render() noexcept {
             // chart body folds to one row. Never invent zero for missing data.
             Gdiplus::Font small_font(&family, 9.0F * s, Gdiplus::FontStyleRegular,
                                      Gdiplus::UnitPixel);
-            const float cell_width = 72.0F * s;
+            const float cell_width_dip = layout.columns == 3
+                ? (static_cast<float>(layout.width) / s - 20.0F) / 3.0F
+                : 72.0F;
+            const float cell_width = cell_width_dip * s;
             const auto cell = [&](int index, const std::wstring& label,
                                   const std::wstring& value, MetricMember member,
                                   const Gdiplus::Color color, double minimum_span) {
-                const float x = (6.0F + index * 76.0F) * s;
+                const float x = (6.0F + (layout.columns == 3
+                    ? (index % 3) * (cell_width_dip + 4.0F)
+                    : index * 76.0F)) * s;
+                const float y = (30.0F + (layout.columns == 3
+                    ? (index / 3) * 55.0F : 0.0F)) * s;
+                const bool unavailable = member == nullptr
+                    ? fps_snapshot_.status != fps::Status::Ready : stale;
                 Gdiplus::SolidBrush background(Gdiplus::Color(15, color.GetR(), color.GetG(), color.GetB()));
                 Gdiplus::Pen border(Gdiplus::Color(42, color.GetR(), color.GetG(), color.GetB()), s);
                 Gdiplus::GraphicsPath path;
-                AddRoundedRectangle(path, {x, 30.0F * s, cell_width, 51.0F * s}, 3.0F * s);
+                AddRoundedRectangle(path, {x, y, cell_width, 51.0F * s}, 3.0F * s);
                 graphics.FillPath(&background, &path);
                 graphics.DrawPath(&border, &path);
-                DrawText(graphics, label, {x + 4.0F * s, 31.0F * s, cell_width - 8.0F * s, 14.0F * s},
+                DrawText(graphics, label, {x + 4.0F * s, y + 1.0F * s, cell_width - 8.0F * s, 14.0F * s},
                          small_font, color, Gdiplus::StringAlignmentNear);
-                DrawText(graphics, value, {x + 4.0F * s, 44.0F * s, cell_width - 8.0F * s, 22.0F * s},
-                         value_font, stale ? Gdiplus::Color(180, 205, 214, 226)
+                DrawText(graphics, value, {x + 4.0F * s, y + 14.0F * s, cell_width - 8.0F * s, 22.0F * s},
+                         value_font, unavailable ? Gdiplus::Color(180, 205, 214, 226)
                                           : Gdiplus::Color(255, 245, 248, 252),
                          Gdiplus::StringAlignmentNear);
-                DrawCompactSparkline(graphics, samples, start, end, member,
-                    {x + 5.0F * s, 67.0F * s, cell_width - 10.0F * s, 10.0F * s},
-                    Gdiplus::Color(stale ? 140 : 235, color.GetR(), color.GetG(), color.GetB()),
-                    minimum_span, s);
+                if (member != nullptr) {
+                    DrawCompactSparkline(graphics, samples, start, end, member,
+                        {x + 5.0F * s, y + 37.0F * s, cell_width - 10.0F * s, 10.0F * s},
+                        Gdiplus::Color(stale ? 140 : 235, color.GetR(), color.GetG(), color.GetB()),
+                        minimum_span, s);
+                }
             };
             cell(0, std::wstring(localization::Select(L"溫度", L"Temp")),
                 FormatMetric(optional(&telemetry::Sample::temperature_c), L" °C"),
@@ -1078,6 +1203,71 @@ bool OsdOverlay::Render() noexcept {
                 &telemetry::Sample::gpu_utilization_percent, Gdiplus::Color(255, 75, 214, 139), 20.0);
             cell(4, L"CPU", FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
                 &telemetry::Sample::cpu_utilization_percent, Gdiplus::Color(255, 183, 121, 255), 20.0);
+            if (fps_enabled_) {
+                const std::wstring fps_value = fps_snapshot_.status == fps::Status::Ready
+                    ? std::format(L"{:.0f}", fps_snapshot_.displayed_fps) : L"-";
+                cell(5, L"FPS", fps_value, nullptr,
+                     Gdiplus::Color(255, 92, 220, 215), 0.0);
+                if (fps_history_ != nullptr) {
+                    const float x = (6.0F + (layout.columns == 3
+                        ? 2 * (cell_width_dip + 4.0F) : 5 * 76.0F)) * s;
+                    const float y = (30.0F + (layout.columns == 3 ? 55.0F : 0.0F)) * s;
+                    DrawFpsSparkline(graphics, fps_history_->Samples(), start, end,
+                        {x + 5.0F * s, y + 37.0F * s,
+                         cell_width - 10.0F * s, 10.0F * s},
+                        Gdiplus::Color(235, 92, 220, 215), s);
+                }
+            }
+        } else {
+        const std::wstring fps_value = fps_snapshot_.status == fps::Status::Ready
+            ? std::format(L"{:.1f}", fps_snapshot_.displayed_fps) : L"-";
+        if (fps_enabled_ && layout.columns == 2) {
+            const float card_width_dip =
+                (static_cast<float>(layout.width) / s - 18.0F) / 2.0F;
+            const auto card = [&](const int index, const std::wstring& label,
+                                  const std::wstring& value,
+                                  const Gdiplus::Color color) {
+                const float x = (6.0F + (index % 2) *
+                    (card_width_dip + 6.0F)) * s;
+                const float y = (31.0F + (index / 2) * 53.0F) * s;
+                const Gdiplus::RectF bounds(x, y, card_width_dip * s, 50.0F * s);
+                Gdiplus::SolidBrush background(Gdiplus::Color(
+                    18, color.GetR(), color.GetG(), color.GetB()));
+                graphics.FillRectangle(&background, bounds);
+                DrawText(graphics, label,
+                    {x + 7.0F * s, y + 2.0F * s,
+                     bounds.Width - 14.0F * s, 19.0F * s},
+                    label_font, color, Gdiplus::StringAlignmentNear);
+                DrawText(graphics, value,
+                    {x + 7.0F * s, y + (index == 5 ? 18.0F : 22.0F) * s,
+                     bounds.Width - 14.0F * s, (index == 5 ? 20.0F : 24.0F) * s},
+                    value_font, Gdiplus::Color(255, 245, 248, 252),
+                    Gdiplus::StringAlignmentNear);
+            };
+            card(0, std::wstring(localization::Select(L"溫度", L"Temp")),
+                 FormatMetric(optional(&telemetry::Sample::temperature_c), L" °C"),
+                 Gdiplus::Color(255, 255, 91, 94));
+            card(1, std::wstring(localization::Select(L"功率", L"Power")),
+                 FormatMetric(optional(&telemetry::Sample::power_w), L" W", 1),
+                 Gdiplus::Color(255, 77, 160, 255));
+            card(2, L"VRAM %",
+                 FormatMetric(optional(&telemetry::Sample::vram_utilization_percent), L"%"),
+                 Gdiplus::Color(255, 255, 173, 69));
+            card(3, L"GPU %",
+                 FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
+                 Gdiplus::Color(255, 75, 214, 139));
+            card(4, L"CPU %",
+                 FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
+                 Gdiplus::Color(255, 183, 121, 255));
+            card(5, L"FPS", fps_value, Gdiplus::Color(255, 92, 220, 215));
+            if (fps_history_ != nullptr) {
+                const float x = (12.0F + card_width_dip + 6.0F) * s;
+                const float y = (31.0F + 2.0F * 53.0F) * s;
+                DrawFpsSparkline(graphics, fps_history_->Samples(), start, end,
+                    {x + 7.0F * s, y + 41.0F * s,
+                     card_width_dip * s - 14.0F * s, 6.0F * s},
+                    Gdiplus::Color(235, 92, 220, 215), s);
+            }
         } else {
         const auto presentation_gaps = telemetry::FindPresentationGaps(samples, start, end);
         std::optional<double> maximum_temperature;
@@ -1095,7 +1285,7 @@ bool OsdOverlay::Render() noexcept {
             }
         }
 
-        const float row_height = 57.0F * s;
+        const float row_height = (fps_enabled_ ? 52.0F : 57.0F) * s;
         const float row_width = 376.0F * s;
         const float row_x = 6.0F * s;
         const float row_start = 31.0F * s;
@@ -1160,6 +1350,30 @@ bool OsdOverlay::Render() noexcept {
             presentation_gaps, false,
             std::nullopt, {}, stale);
 
+        if (fps_enabled_) {
+            const Gdiplus::RectF fps_row(
+                row_x, row_start + (row_height + 2.0F * s) * 5.0F,
+                row_width, row_height);
+            Gdiplus::SolidBrush background(Gdiplus::Color(12, 255, 255, 255));
+            graphics.FillRectangle(&background, fps_row);
+            DrawText(graphics, L"FPS",
+                {fps_row.X + 8.0F * s, fps_row.Y,
+                 70.0F * s, fps_row.Height},
+                label_font, Gdiplus::Color(255, 92, 220, 215),
+                Gdiplus::StringAlignmentNear);
+            DrawText(graphics, fps_value,
+                {fps_row.GetRight() - 140.0F * s, fps_row.Y,
+                 132.0F * s, 22.0F * s},
+                value_font, Gdiplus::Color(255, 245, 248, 252),
+                Gdiplus::StringAlignmentFar);
+            if (fps_history_ != nullptr)
+                DrawFpsSparkline(graphics, fps_history_->Samples(), start, end,
+                    {fps_row.X + 78.0F * s, fps_row.Y + 25.0F * s,
+                     fps_row.Width - 86.0F * s, fps_row.Height - 31.0F * s},
+                    Gdiplus::Color(235, 92, 220, 215), s);
+        }
+
+        }
         }
         RECT window{};
         GetWindowRect(&window);
