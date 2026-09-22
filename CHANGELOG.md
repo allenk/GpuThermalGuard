@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Optional, default-on host RAM record in the Main UI history and the expanded and compact OSD. Physical memory is the foreground reading; virtual commit is drawn behind it in a second accent so both are legible at a glance without competing. Turning the record off clears its history immediately.
+- Arrangeable compact OSD. A lock control in the compact header unlocks the metric cells: press a cell and release it where it belongs to reorder it, or to move it between the first and second row. The arrangement is remembered, and a tray-menu entry restores the default. The overlay still moves by its top bar whether locked or not.
+- The compact OSD now defaults to a single row of every enabled record, so it grows sideways with the record count rather than wrapping. A second row is something you choose.
 - A DPI legibility bench (`gtg_dpi_legibility_bench`) that renders the production history chart offscreen at a chosen DPI and reports base units, font sizes and lane heights.
 
 ### Improved

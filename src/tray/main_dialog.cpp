@@ -174,6 +174,17 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     history_chart_.SetRamHistory(show_ram_ ? &ram_history_ : nullptr);
     if (osd_ready_) osd_overlay_.SetRamHistory(show_ram_ ? &ram_history_ : nullptr);
     if (osd_ready_) osd_overlay_.SetRamEnabled(show_ram_);
+    // The stored arrangement is validated before use: a value that is not a
+    // permutation of every record is discarded whole for the default, so no
+    // registry content can hide a record.
+    saved_compact_layout_ = compact::PackLayout(
+        compact::SanitizeLayout(settings::LoadCompactLayout()));
+    saved_compact_locked_ = settings::LoadCompactLocked();
+    if (osd_ready_) {
+        osd_overlay_.SetCompactLayout(
+            compact::SanitizeLayout(saved_compact_layout_));
+        osd_overlay_.SetCompactLocked(saved_compact_locked_);
+    }
     taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
     activate_message_ = RegisterWindowMessageW(L"GpuThermalGuard.Activate.v1");
     nvml_ready_ = nvml_.Initialize();
@@ -245,6 +256,7 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
             last_ram_sample_ms_ = now;
             ram_history_.Record(now, sysmem::Query());
         }
+        PersistCompactArrangement();
     }
     return 0;
 }
@@ -635,6 +647,32 @@ LRESULT MainDialog::OnOsdToggle(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 
+// The overlay owns the arrangement while the reader is changing it; this side
+// notices the result and stores it. A failed write updates the remembered
+// value anyway so a broken registry cannot turn into a warning every 200 ms.
+void MainDialog::PersistCompactArrangement() {
+    if (!osd_ready_) return;
+    const auto packed = compact::PackLayout(osd_overlay_.compact_layout());
+    if (packed != saved_compact_layout_) {
+        saved_compact_layout_ = packed;
+        std::wstring error;
+        if (!settings::SaveCompactLayout(packed, error)) logging::Warning(error);
+    }
+    const bool locked = osd_overlay_.compact_locked();
+    if (locked != saved_compact_locked_) {
+        saved_compact_locked_ = locked;
+        std::wstring error;
+        if (!settings::SaveCompactLocked(locked, error)) logging::Warning(error);
+    }
+}
+
+LRESULT MainDialog::OnResetOsdLayout(WORD, WORD, HWND, BOOL&) {
+    if (!osd_ready_) return 0;
+    osd_overlay_.SetCompactLayout(compact::Layout{});
+    PersistCompactArrangement();
+    return 0;
+}
+
 LRESULT MainDialog::OnRamToggle(WORD, WORD, HWND, BOOL&) {
     const bool enabled = IsDlgButtonChecked(IDC_SHOW_RAM) == BST_CHECKED;
     std::wstring error;
@@ -847,6 +885,8 @@ void MainDialog::ShowTrayMenu() {
                 localization::Select(L"顯示即時 OSD", L"Show Live OSD").data());
     AppendMenuW(menu, MF_STRING, IDM_TRAY_CAPTURE_SNAPSHOT,
                 localization::Select(L"保存監控快照", L"Save Monitoring Snapshot").data());
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_RESET_OSD_LAYOUT,
+                localization::Select(L"重設 OSD 版面", L"Reset OSD Layout").data());
     AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG,
                 localization::Select(L"開啟診斷記錄檔", L"Open Diagnostic Log").data());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);

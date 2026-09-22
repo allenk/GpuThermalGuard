@@ -50,6 +50,20 @@ private:
     LRESULT OnTogglePointer(UINT, WPARAM, LPARAM, BOOL&);
 };
 
+// A drag image is a layered popup owned by the overlay, showing the carried
+// cell. Its content is set once at press, so moving it is a SetWindowPos and
+// never a repaint -- which is why the 500 ms presentation cadence survives
+// dragging untouched.
+class OsdDragImage final : public ATL::CWindowImpl<OsdDragImage, ATL::CWindow> {
+public:
+    DECLARE_WND_CLASS_EX(L"GpuThermalGuard.OsdDragImage.v1", 0, 0)
+    BEGIN_MSG_MAP(OsdDragImage)
+        MESSAGE_HANDLER(WM_NCHITTEST, OnNcHitTest)
+    END_MSG_MAP()
+private:
+    LRESULT OnNcHitTest(UINT, WPARAM, LPARAM, BOOL&) { return HTTRANSPARENT; }
+};
+
 enum class OsdVisual {
     Neutral,
     Armed,
@@ -77,6 +91,8 @@ public:
         MESSAGE_HANDLER(WM_EXITSIZEMOVE, OnExitSizeMove)
         MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBackground)
         MESSAGE_HANDLER(WM_TIMER, OnRefreshTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnDragMove)
+        MESSAGE_HANDLER(WM_SETCURSOR, OnDragCursor)
     END_MSG_MAP()
 
     [[nodiscard]] bool Initialize(HWND notification_window,
@@ -98,6 +114,12 @@ public:
         fps_history_ = history;
         RequestRefresh();
     }
+    // The reader's arrangement governs both the compact cells and the
+    // expanded lanes; only the compact view can edit it.
+    void SetCompactLayout(compact::Layout layout) noexcept;
+    void SetCompactLocked(bool locked) noexcept;
+    [[nodiscard]] compact::Layout compact_layout() const noexcept { return layout_; }
+    [[nodiscard]] bool compact_locked() const noexcept { return compact_locked_; }
     void SetRamEnabled(bool enabled) noexcept;
     void SetRamHistory(const sysmem::History* history) noexcept {
         ram_history_ = history;
@@ -110,9 +132,32 @@ private:
     LRESULT OnTogglePointer(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT HandleTogglePointer(UINT message, HWND input_window, LPARAM point) noexcept;
     [[nodiscard]] bool ToggleHit(POINT point) const noexcept;
+    [[nodiscard]] bool LockHit(POINT point) const noexcept;
     void ToggleCollapsed() noexcept;
+    [[nodiscard]] bool Arrangeable() const noexcept {
+        return ShowsLock() && !compact_locked_;
+    }
+    void FinishArrangement(int from_slot, POINT point) noexcept;
+    void BeginDragImage(compact::Metric metric, const compact::CellGrid& grid,
+                        POINT cursor, POINT cell_origin) noexcept;
+    void MoveDragImage(POINT cursor) noexcept;
+    void EndDragImage() noexcept;
+    // Arranging needs pointer input on the body, which click-through builds
+    // deliberately do not have, so the control is not offered there.
+    [[nodiscard]] bool ShowsLock() const noexcept {
+#if GTG_OSD_CLICK_THROUGH
+        return false;
+#else
+        return collapsed_;
+#endif
+    }
     bool collapsed_{};
     compact::Gesture toggle_gesture_;
+    compact::Gesture lock_gesture_;
+    int drag_from_{-1};
+    OsdDragImage drag_image_;
+    compact::Metric drag_metric_{compact::Metric::Temperature};
+    POINT drag_hotspot_{};
     struct Layout {
         int width{};
         int height{};
@@ -131,6 +176,8 @@ private:
     LRESULT OnExitSizeMove(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnEraseBackground(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnRefreshTimer(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnDragMove(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnDragCursor(UINT, WPARAM, LPARAM, BOOL&);
 
     [[nodiscard]] Layout CurrentLayout() const noexcept;
     [[nodiscard]] bool FitToWorkArea(POINT& position, const Layout& layout) const noexcept;
@@ -164,6 +211,8 @@ private:
     std::wstring status_{L"保護狀態初始化中"};
     OsdVisual visual_{OsdVisual::Neutral};
     // Default off like FPS: MainDialog applies the stored preference.
+    compact::Layout layout_{};
+    bool compact_locked_{true};
     bool ram_enabled_{false};
     const sysmem::History* ram_history_{nullptr};
     bool fps_enabled_{false};

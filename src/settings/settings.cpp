@@ -358,6 +358,53 @@ bool SaveRamEnabled(const bool enabled, std::wstring& error) {
     return success;
 }
 
+std::uint32_t LoadCompactLayout() noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return 0;
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const bool valid = RegQueryValueExW(key, L"CompactLayout", nullptr, &type,
+        reinterpret_cast<BYTE*>(&value), &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value);
+    RegCloseKey(key);
+    // Zero is the absent case and also sanitizes to the default arrangement,
+    // so a missing value and a malformed one take the same safe path.
+    return valid ? static_cast<std::uint32_t>(value) : 0;
+}
+
+bool SaveCompactLayout(const std::uint32_t packed, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"CompactLayout",
+                                    static_cast<DWORD>(packed), error);
+    RegCloseKey(key);
+    return success;
+}
+
+bool LoadCompactLocked() noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return true;
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const bool valid = RegQueryValueExW(key, L"CompactLocked", nullptr, &type,
+        reinterpret_cast<BYTE*>(&value), &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value);
+    RegCloseKey(key);
+    return ResolveCompactLockPreference(valid, value);
+}
+
+bool SaveCompactLocked(const bool locked, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"CompactLocked", locked ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
 WindowPosition LoadMainWindowPosition() noexcept {
     WindowPosition result;
     HKEY key = nullptr;

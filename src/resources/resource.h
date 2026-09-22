@@ -52,3 +52,4 @@
 #define IDM_TRAY_OPEN_LOG               40004
 #define IDM_TRAY_TOGGLE_OSD             40005
 #define IDM_TRAY_CAPTURE_SNAPSHOT       40006
+#define IDM_TRAY_RESET_OSD_LAYOUT       40007

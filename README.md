@@ -21,11 +21,19 @@ Screenshots show one workstation's settings, not recommended limits for every GP
 
 ![Compact OSD with six live metrics and miniature trends when FPS is enabled](docs/images/osd-compact.png)
 
-Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode shows temperature, power, VRAM, GPU utilization, and CPU utilization in five small cards with live values and 30-second miniature trends. With **Show FPS** checked, a sixth FPS card appears; unchecking it returns to the original five-card layout.
+Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode shows temperature, power, VRAM, GPU utilization, and CPU utilization in small cards with live values and 30-second miniature trends. **Show RAM** and **Show FPS** each add a card; unchecking one returns the layout to the records that remain.
 
-Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Drag the header outside the toggle button to move the OSD; restart returns to the expanded view.
+Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Drag the header outside the buttons to move the OSD; restart returns to the expanded view.
 
 Compact mode is included starting with v0.9.0-beta.2.
+
+### Arranging the compact OSD
+
+Starting with v0.11.0-beta.1, the compact dashboard is a single row of whichever records are enabled, and you can rearrange it. The lock control left of the chevron toggles between locked, where the cells ignore the pointer, and unlocked, where they do not.
+
+Unlocked, press a cell and release it where you want it. Release it on the same row to reorder; release it below to move it into a second row, or above to bring it back. The first row keeps at least five cells, so five records are always a single row. The arrangement is remembered between runs, and **Reset OSD layout** in the tray menu restores the default.
+
+The lock governs the cells only. The OSD itself still moves by its top bar whether locked or not.
 
 ### Optional host RAM
 

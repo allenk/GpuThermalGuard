@@ -71,6 +71,7 @@ public:
         COMMAND_ID_HANDLER(IDM_TRAY_OPEN_LOG, OnTrayOpenLog)
         COMMAND_ID_HANDLER(IDM_TRAY_TOGGLE_OSD, OnTrayToggleOsd)
         COMMAND_ID_HANDLER(IDM_TRAY_CAPTURE_SNAPSHOT, OnManualSnapshot)
+        COMMAND_ID_HANDLER(IDM_TRAY_RESET_OSD_LAYOUT, OnResetOsdLayout)
         COMMAND_ID_HANDLER(IDM_TRAY_EXIT, OnTrayExit)
     END_MSG_MAP()
 
@@ -115,6 +116,8 @@ private:
     LRESULT OnOsdToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnFpsToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnRamToggle(WORD, WORD, HWND, BOOL&);
+    LRESULT OnResetOsdLayout(WORD, WORD, HWND, BOOL&);
+    void PersistCompactArrangement();
     LRESULT OnLanguageChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnProtectionSettingChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnManualSnapshot(WORD, WORD, HWND, BOOL&);
@@ -160,6 +163,8 @@ private:
     telemetry::History telemetry_history_;
     fps::History fps_history_;
     sysmem::History ram_history_;
+    std::uint32_t saved_compact_layout_{};
+    bool saved_compact_locked_{true};
     HistoryChart history_chart_;
     OsdOverlay osd_overlay_;
     fps::DxgiObserver fps_observer_;

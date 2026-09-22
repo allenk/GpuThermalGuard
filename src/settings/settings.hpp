@@ -44,6 +44,13 @@ struct TriggerTestRun {
     return !has_valid_value || value != 0;
 }
 
+// An absent value leaves the compact dashboard locked, so an arrangement
+// cannot be disturbed by a reader who has never opened it.
+[[nodiscard]] constexpr bool ResolveCompactLockPreference(
+    bool has_valid_value, std::uint32_t value) noexcept {
+    return !has_valid_value || value != 0;
+}
+
 [[nodiscard]] LoadResult Load();
 [[nodiscard]] bool Save(const ProtectionConfig& config, std::wstring& error);
 [[nodiscard]] bool LoadSafeLatch() noexcept;
@@ -63,6 +70,13 @@ struct TriggerTestRun {
 [[nodiscard]] bool SaveFpsEnabled(bool enabled, std::wstring& error);
 [[nodiscard]] bool LoadRamEnabled() noexcept;
 [[nodiscard]] bool SaveRamEnabled(bool enabled, std::wstring& error);
+// The arrangement is returned as the raw stored word, not as a layout: this
+// layer must not depend on the tray's presentation headers. The caller
+// validates it, and an absent value reads as 0, which sanitizes to the default.
+[[nodiscard]] std::uint32_t LoadCompactLayout() noexcept;
+[[nodiscard]] bool SaveCompactLayout(std::uint32_t packed, std::wstring& error);
+[[nodiscard]] bool LoadCompactLocked() noexcept;
+[[nodiscard]] bool SaveCompactLocked(bool locked, std::wstring& error);
 [[nodiscard]] WindowPosition LoadMainWindowPosition() noexcept;
 [[nodiscard]] bool SaveMainWindowPosition(int x, int y, std::wstring& error);
 [[nodiscard]] localization::UiLanguage LoadUiLanguagePreference() noexcept;

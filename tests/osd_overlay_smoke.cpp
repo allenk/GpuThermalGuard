@@ -161,8 +161,9 @@ int main(int argc, char** argv) {
             check_fps_size(true);
             screenshot("fps-compact-no-data.png");
 
-            // RAM joins as the second-from-last record. The overlay must grow
-            // downward only: its width may not change.
+            // RAM joins as the second-from-last record. The default
+            // arrangement is one row, so the overlay gains exactly one cell
+            // stride of width and no height.
             // Same 200 ms grid as the thermal telemetry above, because RAM is
             // sampled on the same tick and must span the same window.
             gtg::sysmem::History ram_history;
@@ -181,14 +182,14 @@ int main(int argc, char** argv) {
             check_fps_size(true, true);
             RECT after_ram{};
             GetWindowRect(osd, &after_ram);
+            const int ram_dpi = static_cast<int>(GetDpiForWindow(osd));
             Check(after_ram.right - after_ram.left ==
-                      before_ram.right - before_ram.left,
-                  "enabling RAM must not change the overlay width");
-            // Six cells are 5 + 1 and seven are 5 + 2, so the seventh fills the
-            // second row that already exists and costs no extra height.
+                      before_ram.right - before_ram.left +
+                          MulDiv(gtg::tray::compact::kCellStrideDip, ram_dpi, 96),
+                  "enabling RAM widens the default row by one cell");
             Check(after_ram.bottom - after_ram.top ==
                       before_ram.bottom - before_ram.top,
-                  "the seventh cell fills the existing second row");
+                  "the seventh cell costs no extra height");
             screenshot("ram-compact.png");
             ClickToggle(osd);
             check_fps_size(false, true);
@@ -283,6 +284,85 @@ int main(int argc, char** argv) {
                       "RAM reaches the left edge of its plot area");
             }
             ClickToggle(osd);
+
+            // --- arranging the compact dashboard ---------------------------
+            // The toggle above left the dashboard collapsed, which is the only
+            // mode that offers the lock.
+            // Go through WM_NCHITTEST exactly as Windows does. Sending button
+            // messages straight to the window bypasses the caption band, which
+            // is what let a control that could never be clicked pass its test.
+            const auto press_release = [&](const POINT from, const POINT to) {
+                POINT screen_from{from.x, from.y};
+                ClientToScreen(osd, &screen_from);
+                Check(SendMessageW(osd, WM_NCHITTEST, 0,
+                                   MAKELPARAM(screen_from.x, screen_from.y)) == HTCLIENT,
+                      "a press target must not be claimed by the caption band");
+                SendMessageW(osd, WM_LBUTTONDOWN, MK_LBUTTON,
+                             MAKELPARAM(from.x, from.y));
+                SendMessageW(osd, WM_MOUSEMOVE, MK_LBUTTON,
+                             MAKELPARAM(to.x, to.y));
+                SendMessageW(osd, WM_LBUTTONUP, 0, MAKELPARAM(to.x, to.y));
+            };
+            const auto cell_centre = [&](const int slot) {
+                const int dpi = static_cast<int>(GetDpiForWindow(osd));
+                const float scale = static_cast<float>(dpi) / 96.0F;
+                const auto placed = gtg::tray::compact::Resolve(
+                    osd.compact_layout(), true, true);
+                RECT r{};
+                GetWindowRect(osd, &r);
+                const auto grid = gtg::tray::compact::MakeCellGrid(
+                    placed.row1, r.right - r.left, scale);
+                const auto origin = gtg::tray::compact::CellOriginAt(grid, slot);
+                return POINT{
+                    static_cast<LONG>(origin.x + grid.cell_width_dip * scale / 2),
+                    static_cast<LONG>(origin.y +
+                                      gtg::tray::compact::kCellHeightDip * scale / 2)};
+            };
+
+            const auto before = osd.compact_layout();
+            Check(osd.compact_locked(), "the dashboard starts locked");
+            press_release(cell_centre(0), cell_centre(3));
+            Check(osd.compact_layout().order == before.order,
+                  "a locked dashboard refuses to be rearranged");
+
+            // Unlock through the header control, then rearrange.
+            RECT bounds{};
+            GetWindowRect(osd, &bounds);
+            const int header = MulDiv(25, static_cast<int>(GetDpiForWindow(osd)), 96);
+            const POINT lock_point{bounds.right - bounds.left - header * 3 / 2,
+                                   header / 2};
+            press_release(lock_point, lock_point);
+            Check(!osd.compact_locked(), "the lock control unlocks the cells");
+
+            RECT before_move{};
+            GetWindowRect(osd, &before_move);
+            press_release(cell_centre(0), cell_centre(3));
+            const auto rearranged = osd.compact_layout();
+            Check(rearranged.order != before.order,
+                  "an unlocked dashboard rearranges on release");
+            Check(gtg::tray::compact::IsValidLayout(rearranged),
+                  "rearranging leaves every record present exactly once");
+            RECT after_move{};
+            GetWindowRect(osd, &after_move);
+            Check(after_move.left == before_move.left &&
+                      after_move.top == before_move.top,
+                  "arranging a cell never moves the overlay itself");
+            screenshot("arranged.png");
+
+            // An abandoned drag changes nothing.
+            const auto settled = osd.compact_layout();
+            SendMessageW(osd, WM_LBUTTONDOWN, MK_LBUTTON,
+                         MAKELPARAM(cell_centre(0).x, cell_centre(0).y));
+            SendMessageW(osd, WM_CANCELMODE, 0, 0);
+            Check(osd.compact_layout().order == settled.order,
+                  "a cancelled drag leaves the arrangement untouched");
+            Check(FindWindowW(L"GpuThermalGuard.OsdDragImage.v1", nullptr) == nullptr,
+                  "a cancelled drag destroys the drag image");
+
+            osd.SetCompactLayout(gtg::tray::compact::Layout{});
+            osd.SetCompactLocked(true);
+            osd.RequestRefresh();
+            screenshot("locked.png");
             osd.SetRamEnabled(false);
             osd.SetRamHistory(nullptr);
             check_fps_size(true);

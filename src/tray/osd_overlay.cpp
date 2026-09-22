@@ -642,6 +642,23 @@ void OsdOverlay::SetStatus(const std::wstring_view status, const OsdVisual visua
     RequestRefresh();
 }
 
+void OsdOverlay::SetCompactLayout(const compact::Layout layout) noexcept {
+    if (!compact::IsValidLayout(layout)) return;
+    layout_ = layout;
+    if (m_hWnd == nullptr) return;
+    POINT next = Position();
+    const Layout geometry = CurrentLayout();
+    (void)FitToWorkArea(next, geometry);
+    ApplyPosition(next, geometry);
+    RequestRefresh();
+}
+
+void OsdOverlay::SetCompactLocked(const bool locked) noexcept {
+    if (compact_locked_ == locked) return;
+    compact_locked_ = locked;
+    RequestRefresh();
+}
+
 void OsdOverlay::SetRamEnabled(const bool enabled) noexcept {
     if (ram_enabled_ == enabled) return;
     ram_enabled_ = enabled;
@@ -691,7 +708,9 @@ LRESULT OsdOverlay::OnNcHitTest(UINT, WPARAM, const LPARAM lparam, BOOL&) {
 #else
     POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     ScreenToClient(&point);
-    if (ToggleHit(point)) return HTCLIENT;
+    // Both header controls must be carved out of the caption band or Windows
+    // turns the press into a window drag and no button message ever arrives.
+    if (ToggleHit(point) || LockHit(point)) return HTCLIENT;
     if (point.y >= 0 && point.y < CurrentLayout().drag_height) return HTCAPTION;
     return HTCLIENT;
 #endif
@@ -704,24 +723,256 @@ bool OsdOverlay::ToggleHit(const POINT point) const noexcept {
     return compact::ToggleHit(point.x, point.y, layout.width, layout.drag_height);
 }
 
+bool OsdOverlay::LockHit(const POINT point) const noexcept {
+    if (!ShowsLock()) return false;
+    const auto layout = CurrentLayout();
+    return compact::LockHit(point.x, point.y, layout.width, layout.drag_height);
+}
+
 LRESULT OsdOverlay::OnTogglePointer(UINT message, WPARAM, LPARAM point, BOOL&) {
     return HandleTogglePointer(message, m_hWnd, point);
 }
 
+LRESULT OsdOverlay::OnDragMove(UINT, WPARAM, const LPARAM point, BOOL& handled) {
+    if (drag_from_ < 0) {
+        handled = FALSE;
+        return 0;
+    }
+    MoveDragImage({GET_X_LPARAM(point), GET_Y_LPARAM(point)});
+    return 0;
+}
+
+LRESULT OsdOverlay::OnDragCursor(UINT, WPARAM, LPARAM, BOOL& handled) {
+    if (drag_from_ < 0) {
+        handled = FALSE;
+        return 0;
+    }
+    POINT cursor{};
+    ::GetCursorPos(&cursor);
+    ::ScreenToClient(m_hWnd, &cursor);
+    const Layout geometry = CurrentLayout();
+    const auto grid = compact::MakeCellGrid(geometry.columns, geometry.width,
+                                            geometry.scale);
+    // A release outside the two rows changes nothing, so say so before the
+    // reader commits to it.
+    const bool droppable =
+        compact::DropTargetAt(grid, cursor.x, cursor.y).row >= 0;
+    ::SetCursor(::LoadCursorW(nullptr, droppable ? IDC_SIZEALL : IDC_NO));
+    return TRUE;
+}
+
+namespace {
+
+Gdiplus::Color CompactAccent(const compact::Metric metric) noexcept {
+    switch (metric) {
+        case compact::Metric::Temperature: return {255, 255, 91, 94};
+        case compact::Metric::Power: return {255, 77, 160, 255};
+        case compact::Metric::Vram: return {255, 255, 173, 69};
+        case compact::Metric::Gpu: return {255, 75, 214, 139};
+        case compact::Metric::Cpu: return {255, 183, 121, 255};
+        case compact::Metric::Ram: return {255, 255, 122, 196};
+        case compact::Metric::Fps: return {255, 92, 220, 215};
+    }
+    return {255, 245, 248, 252};
+}
+
+std::wstring CompactLabel(const compact::Metric metric) {
+    switch (metric) {
+        case compact::Metric::Temperature:
+            return std::wstring(localization::Select(L"溫度", L"Temp"));
+        case compact::Metric::Power:
+            return std::wstring(localization::Select(L"功率", L"Power"));
+        case compact::Metric::Vram: return L"VRAM";
+        case compact::Metric::Gpu: return L"GPU";
+        case compact::Metric::Cpu: return L"CPU";
+        case compact::Metric::Ram: return L"RAM";
+        case compact::Metric::Fps: return L"FPS";
+    }
+    return L"";
+}
+
+}  // namespace
+
+void OsdOverlay::BeginDragImage(const compact::Metric metric,
+                                const compact::CellGrid& grid,
+                                const POINT cursor,
+                                const POINT cell_origin) noexcept {
+    try {
+        EndDragImage();
+        drag_metric_ = metric;
+        drag_hotspot_ = {cursor.x - cell_origin.x, cursor.y - cell_origin.y};
+        const int width =
+            static_cast<int>(grid.cell_width_dip * grid.scale);
+        const int height = static_cast<int>(compact::kCellHeightDip * grid.scale);
+        if (width <= 0 || height <= 0) return;
+
+        const DWORD ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT |
+                               WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
+                               WS_EX_TOPMOST;
+        RECT bounds{0, 0, width, height};
+        // Owned by the overlay so Windows keeps it above its owner, the same
+        // arrangement the click-through drag strip already relies on.
+        if (drag_image_.Create(m_hWnd, bounds, nullptr, WS_POPUP, ex_style) ==
+            nullptr)
+            return;
+
+        ScopedScreenDc screen;
+        if (screen.value == nullptr) { EndDragImage(); return; }
+        ScopedMemoryDc memory(screen.value);
+        if (memory.value == nullptr) { EndDragImage(); return; }
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* pixels = nullptr;
+        ScopedBitmap bitmap;
+        bitmap.value = CreateDIBSection(screen.value, &info, DIB_RGB_COLORS,
+                                        &pixels, nullptr, 0);
+        if (bitmap.value == nullptr) { EndDragImage(); return; }
+        const HGDIOBJ previous = SelectObject(memory.value, bitmap.value);
+        ScopedSelection selection{memory.value, previous};
+        {
+            Gdiplus::Graphics graphics(memory.value);
+            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            graphics.SetTextRenderingHint(
+                Gdiplus::TextRenderingHintClearTypeGridFit);
+            const Gdiplus::Color accent = CompactAccent(metric);
+            const Gdiplus::RectF face(0.0F, 0.0F, static_cast<float>(width),
+                                      static_cast<float>(height));
+            Gdiplus::GraphicsPath rounded;
+            AddRoundedRectangle(rounded, face, 3.0F * grid.scale);
+            Gdiplus::SolidBrush fill(Gdiplus::Color(
+                150, accent.GetR(), accent.GetG(), accent.GetB()));
+            graphics.FillPath(&fill, &rounded);
+            Gdiplus::Pen border(Gdiplus::Color(220, accent.GetR(), accent.GetG(),
+                                               accent.GetB()),
+                                grid.scale);
+            graphics.DrawPath(&border, &rounded);
+            Gdiplus::FontFamily family(L"Segoe UI");
+            Gdiplus::Font font(&family, 9.0F * grid.scale,
+                               Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+            DrawText(graphics, CompactLabel(metric),
+                     {4.0F * grid.scale, 0.0F,
+                      static_cast<float>(width) - 8.0F * grid.scale,
+                      static_cast<float>(height)},
+                     font, Gdiplus::Color(255, 16, 26, 38),
+                     Gdiplus::StringAlignmentNear);
+            graphics.Flush(Gdiplus::FlushIntentionSync);
+        }
+        POINT origin{cursor.x - drag_hotspot_.x, cursor.y - drag_hotspot_.y};
+        ::ClientToScreen(m_hWnd, &origin);
+        POINT source{};
+        SIZE size{width, height};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 235, AC_SRC_ALPHA};
+        ::UpdateLayeredWindow(drag_image_, screen.value, &origin, &size,
+                              memory.value, &source, 0, &blend, ULW_ALPHA);
+        ::ShowWindow(drag_image_, SW_SHOWNOACTIVATE);
+    } catch (...) {
+        EndDragImage();
+    }
+}
+
+void OsdOverlay::MoveDragImage(const POINT cursor) noexcept {
+    if (drag_image_.m_hWnd == nullptr) return;
+    POINT origin{cursor.x - drag_hotspot_.x, cursor.y - drag_hotspot_.y};
+    ::ClientToScreen(m_hWnd, &origin);
+    // Static content: this is a move, not a repaint.
+    ::SetWindowPos(drag_image_, HWND_TOPMOST, origin.x, origin.y, 0, 0,
+                   SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void OsdOverlay::EndDragImage() noexcept {
+    if (drag_image_.m_hWnd != nullptr) drag_image_.DestroyWindow();
+}
+
+void OsdOverlay::FinishArrangement(const int from_slot, const POINT point) noexcept {
+    const Layout geometry = CurrentLayout();
+    const auto placed = compact::Resolve(layout_, ram_enabled_, fps_enabled_);
+    const auto grid = compact::MakeCellGrid(geometry.columns, geometry.width,
+                                            geometry.scale);
+    const auto target = compact::DropTargetAt(grid, point.x, point.y);
+    if (target.row < 0) return;  // released outside the cells: change nothing
+    const auto next =
+        compact::ApplyDrop(layout_, placed, from_slot, target.row, target.column);
+    if (next.order == layout_.order && next.row1 == layout_.row1) return;
+    SetCompactLayout(next);
+    RenderLatest();
+}
+
 LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_window,
                                        const LPARAM point) noexcept {
-    const bool inside = ToggleHit({GET_X_LPARAM(point), GET_Y_LPARAM(point)});
+    const POINT cursor{GET_X_LPARAM(point), GET_Y_LPARAM(point)};
+    const Layout geometry = CurrentLayout();
+    const bool on_chevron =
+        compact::ToggleHit(cursor.x, cursor.y, geometry.width, geometry.drag_height);
+    const bool on_lock = ShowsLock() &&
+        compact::LockHit(cursor.x, cursor.y, geometry.width, geometry.drag_height);
+
     if (message == WM_LBUTTONDOWN) {
-        toggle_gesture_.Press(inside);
-        if (inside) ::SetCapture(input_window);
-    } else if (message == WM_LBUTTONUP) {
-        const bool toggle = toggle_gesture_.Release(inside && ::GetCapture() == input_window);
-        if (::GetCapture() == input_window) ::ReleaseCapture();
-        if (toggle) ToggleCollapsed();
-    } else {
-        toggle_gesture_.Cancel();
-        if (message == WM_CANCELMODE && ::GetCapture() == input_window) ::ReleaseCapture();
+        if (on_lock) {
+            lock_gesture_.Press(true);
+            ::SetCapture(input_window);
+            return 0;
+        }
+        // A press only begins a drag when it lands squarely on a cell, so an
+        // aim that misses leaves the chevron and the drag bar their own input.
+        if (Arrangeable()) {
+            const auto placed =
+                compact::Resolve(layout_, ram_enabled_, fps_enabled_);
+            const int slot = compact::CellSlotAt(
+                compact::MakeCellGrid(geometry.columns, geometry.width,
+                                      geometry.scale),
+                placed.count, cursor.x, cursor.y);
+            if (slot >= 0) {
+                drag_from_ = slot;
+                ::SetCapture(input_window);
+                const auto grid = compact::MakeCellGrid(
+                    geometry.columns, geometry.width, geometry.scale);
+                const auto origin = compact::CellOriginAt(grid, slot);
+                BeginDragImage(placed.cells[static_cast<std::size_t>(slot)],
+                               grid, cursor,
+                               POINT{static_cast<LONG>(origin.x),
+                                     static_cast<LONG>(origin.y)});
+                return 0;
+            }
+        }
+        toggle_gesture_.Press(on_chevron);
+        if (on_chevron) ::SetCapture(input_window);
+        return 0;
     }
+
+    if (message == WM_LBUTTONUP) {
+        const bool captured = ::GetCapture() == input_window;
+        // Every gesture is settled and capture released exactly once, whichever
+        // one was in flight; the outcomes are mutually exclusive.
+        const int from_slot = drag_from_;
+        drag_from_ = -1;
+        const bool lock_click = lock_gesture_.Release(on_lock && captured);
+        const bool toggle = toggle_gesture_.Release(on_chevron && captured);
+        if (captured) ::ReleaseCapture();
+        EndDragImage();
+        if (from_slot >= 0) {
+            if (captured) FinishArrangement(from_slot, cursor);
+        } else if (lock_click) {
+            SetCompactLocked(!compact_locked_);
+            RenderLatest();
+        } else if (toggle) {
+            ToggleCollapsed();
+        }
+        return 0;
+    }
+
+    // Capture loss or cancellation ends every gesture and changes nothing. A
+    // drag abandoned this way must leave the arrangement exactly as it was.
+    drag_from_ = -1;
+    lock_gesture_.Cancel();
+    toggle_gesture_.Cancel();
+    EndDragImage();
+    if (message == WM_CANCELMODE && ::GetCapture() == input_window)
+        ::ReleaseCapture();
     return 0;
 }
 
@@ -869,7 +1120,10 @@ void OsdOverlay::CheckZOrder() noexcept {
     HWND window = ::GetWindow(m_hWnd, GW_HWNDPREV);
     for (int inspected = 0; window && inspected < 128; ++inspected) {
         const HWND next = ::GetWindow(window, GW_HWNDPREV);
-        if (window != drag_handle_.m_hWnd && ::IsWindowVisible(window) && !::IsIconic(window)) {
+        // Our own drag image is topmost by design; without this it would look
+        // like a legitimate overlay and silently suspend the watchdog.
+        if (window != drag_handle_.m_hWnd && window != drag_image_.m_hWnd &&
+            ::IsWindowVisible(window) && !::IsIconic(window)) {
             RECT other{}, overlap{};
             DWORD window_cloaked = 0;
             if (::GetWindowRect(window, &other) && IntersectRect(&overlap, &ours, &other) &&
@@ -987,7 +1241,8 @@ OsdOverlay::Layout OsdOverlay::CurrentLayout() const noexcept {
                                  static_cast<int>(dpi));
     }
     const auto footprint = compact::ChooseFootprint(
-        collapsed_, ram_enabled_, fps_enabled_, work_width_dip, work_height_dip);
+        collapsed_, compact::Resolve(layout_, ram_enabled_, fps_enabled_),
+        work_width_dip, work_height_dip);
     return {MulDiv(footprint.width, static_cast<int>(dpi), 96),
             MulDiv(footprint.height, static_cast<int>(dpi), 96),
             MulDiv(kDragHeightDip, static_cast<int>(dpi), 96),
@@ -1198,8 +1453,13 @@ bool OsdOverlay::Render() noexcept {
             status_color.GetR(), status_color.GetG(), status_color.GetB()));
         graphics.FillEllipse(&dot, 46.0F * s, 9.0F * s, 6.0F * s, 6.0F * s);
         const float status_left = 58.0F * s;
+        // The lock takes one more button width from the status line. At the
+        // narrowest arrangement this still leaves every Traditional Chinese
+        // status intact: the longest is 210 dip against 274 available.
+        const float header_buttons = static_cast<float>(layout.drag_height) *
+                                     (ShowsLock() ? 2.0F : 1.0F);
         DrawText(graphics, displayed_status,
-                 {status_left, 2.0F * s, layout.width - layout.drag_height - status_left - 4.0F * s,
+                 {status_left, 2.0F * s, layout.width - header_buttons - status_left - 4.0F * s,
                   22.0F * s}, status_font,
                  status_color, Gdiplus::StringAlignmentNear);
         Gdiplus::Pen handle(Gdiplus::Color(38, 203, 215, 231), 1.0F * s);
@@ -1216,6 +1476,43 @@ bool OsdOverlay::Render() noexcept {
             {button_x + 8.0F * s, edge_y}, {button_x + 12.5F * s, middle_y},
             {button_x + 17.0F * s, edge_y}};
         graphics.DrawLines(&chevron, arrow, 3);
+
+        // The lock is offered only where arranging is possible: the compact
+        // dashboard, and only in builds whose body receives pointer input.
+        if (ShowsLock()) {
+            const float lock_x = button_x - static_cast<float>(layout.drag_height);
+            graphics.FillRectangle(&button_fill, lock_x + 3.0F * s, 3.0F * s,
+                                   19.0F * s, 19.0F * s);
+            // Locked is the resting state of an always-on-top window, so it
+            // carries exactly the weight of the chevron beside it: the same
+            // tint, the same pen, outline only. Unlocked is an alert -- amber
+            // and filled. The two differ in weight and shape as well as
+            // colour, so the state reads without relying on hue.
+            //
+            // The glyph is drawn a size smaller than its 19 dip button and
+            // centred in it. A padlock is taller than a chevron at equal
+            // width, so matching their widths would still leave the lock the
+            // louder of the two; the extra padding is what evens them out.
+            // The button itself, and the hit rectangle, are unchanged.
+            const Gdiplus::Color lock_tint = compact_locked_
+                ? Gdiplus::Color(235, 224, 235, 248)
+                : Gdiplus::Color(235, 255, 184, 72);
+            Gdiplus::Pen lock_pen(lock_tint, 1.4F * s);
+            lock_pen.SetLineJoin(Gdiplus::LineJoinRound);
+            // Closed: the shackle sits on the body. Open: it lifts and shifts.
+            const float body_top = 12.0F * s;
+            const float arc_x = lock_x + (compact_locked_ ? 9.0F : 10.75F) * s;
+            graphics.DrawArc(&lock_pen, arc_x, body_top - 5.25F * s, 7.0F * s,
+                             7.0F * s, 180.0F, 180.0F);
+            const Gdiplus::RectF body(lock_x + 7.75F * s, body_top, 9.5F * s,
+                                      6.5F * s);
+            if (compact_locked_) {
+                graphics.DrawRectangle(&lock_pen, body);
+            } else {
+                Gdiplus::SolidBrush fill(lock_tint);
+                graphics.FillRectangle(&fill, body);
+            }
+        }
 
         const telemetry::Sample* latest = history_ == nullptr ? nullptr : history_->Latest();
         const std::uint64_t end = freshness.latest_valid_ms.value_or(
@@ -1282,58 +1579,87 @@ bool OsdOverlay::Render() noexcept {
                         minimum_span, s);
                 }
             };
-            cell(0, std::wstring(localization::Select(L"溫度", L"Temp")),
-                FormatMetric(optional(&telemetry::Sample::temperature_c), L" °C"),
-                &telemetry::Sample::temperature_c, Gdiplus::Color(255, 255, 91, 94), 10.0);
-            cell(1, std::wstring(localization::Select(L"功率", L"Power")),
-                FormatMetric(optional(&telemetry::Sample::power_w), L" W", 1),
-                &telemetry::Sample::power_w, Gdiplus::Color(255, 77, 160, 255), 100.0);
-            cell(2, L"VRAM", FormatMetric(optional(&telemetry::Sample::vram_utilization_percent), L"%"),
-                &telemetry::Sample::vram_utilization_percent, Gdiplus::Color(255, 255, 173, 69), 20.0);
-            cell(3, L"GPU", FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
-                &telemetry::Sample::gpu_utilization_percent, Gdiplus::Color(255, 75, 214, 139), 20.0);
-            cell(4, L"CPU", FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
-                &telemetry::Sample::cpu_utilization_percent, Gdiplus::Color(255, 183, 121, 255), 20.0);
-            // RAM is second from last; FPS is always the final populated cell.
             const Gdiplus::Color ram_color(255, 255, 122, 196);
             const Gdiplus::Color commit_color(255, 228, 196, 76);
-            if (ram_enabled_) {
-                const int index =
-                    compact::CellIndexOf(compact::Metric::Ram, true, fps_enabled_);
-                // One coherent live reading, as in the expanded lane.
-                const auto live_ram = sysmem::Query();
-                const std::wstring ram_value =
-                    live_ram.physical_percent
-                        ? std::format(L"{:.0f}%", *live_ram.physical_percent)
-                        : L"-";
-                cell(index, L"RAM", ram_value, nullptr, ram_color, 0.0,
-                     !live_ram.physical_percent);
-                if (ram_history_ != nullptr) {
-                    const auto [x, y] = cell_origin(index);
-                    DrawMemorySparkline(graphics, ram_history_->Samples(), start,
-                        end,
-                        {x + 5.0F * s, y + 37.0F * s,
-                         cell_width - 10.0F * s, 10.0F * s},
-                        Gdiplus::Color(235, ram_color.GetR(), ram_color.GetG(),
-                                       ram_color.GetB()),
-                        Gdiplus::Color(200, commit_color.GetR(),
-                                       commit_color.GetG(), commit_color.GetB()),
-                        s);
+            // Cells are drawn by walking the reader's arrangement, so the
+            // order lives in one place instead of being implied by a sequence
+            // of calls. A record appears once or not at all; nothing here can
+            // place one twice or drop one.
+            const auto placed =
+                compact::Resolve(layout_, ram_enabled_, fps_enabled_);
+            for (int slot = 0; slot < placed.count; ++slot) {
+                switch (placed.cells[static_cast<std::size_t>(slot)]) {
+                case compact::Metric::Temperature:
+                    cell(slot, std::wstring(localization::Select(L"溫度", L"Temp")),
+                        FormatMetric(optional(&telemetry::Sample::temperature_c), L" °C"),
+                        &telemetry::Sample::temperature_c,
+                        Gdiplus::Color(255, 255, 91, 94), 10.0);
+                    break;
+                case compact::Metric::Power:
+                    cell(slot, std::wstring(localization::Select(L"功率", L"Power")),
+                        FormatMetric(optional(&telemetry::Sample::power_w), L" W", 1),
+                        &telemetry::Sample::power_w,
+                        Gdiplus::Color(255, 77, 160, 255), 100.0);
+                    break;
+                case compact::Metric::Vram:
+                    cell(slot, L"VRAM",
+                        FormatMetric(optional(&telemetry::Sample::vram_utilization_percent), L"%"),
+                        &telemetry::Sample::vram_utilization_percent,
+                        Gdiplus::Color(255, 255, 173, 69), 20.0);
+                    break;
+                case compact::Metric::Gpu:
+                    cell(slot, L"GPU",
+                        FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
+                        &telemetry::Sample::gpu_utilization_percent,
+                        Gdiplus::Color(255, 75, 214, 139), 20.0);
+                    break;
+                case compact::Metric::Cpu:
+                    cell(slot, L"CPU",
+                        FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
+                        &telemetry::Sample::cpu_utilization_percent,
+                        Gdiplus::Color(255, 183, 121, 255), 20.0);
+                    break;
+                case compact::Metric::Ram: {
+                    // One coherent live reading, as in the expanded lane.
+                    const auto live_ram = sysmem::Query();
+                    const std::wstring ram_value =
+                        live_ram.physical_percent
+                            ? std::format(L"{:.0f}%", *live_ram.physical_percent)
+                            : L"-";
+                    cell(slot, L"RAM", ram_value, nullptr, ram_color, 0.0,
+                         !live_ram.physical_percent);
+                    if (ram_history_ != nullptr) {
+                        const auto [x, y] = cell_origin(slot);
+                        DrawMemorySparkline(graphics, ram_history_->Samples(),
+                            start, end,
+                            {x + 5.0F * s, y + 37.0F * s,
+                             cell_width - 10.0F * s, 10.0F * s},
+                            Gdiplus::Color(235, ram_color.GetR(),
+                                           ram_color.GetG(), ram_color.GetB()),
+                            Gdiplus::Color(200, commit_color.GetR(),
+                                           commit_color.GetG(),
+                                           commit_color.GetB()),
+                            s);
+                    }
+                    break;
                 }
-            }
-            if (fps_enabled_) {
-                const int index = compact::CellIndexOf(compact::Metric::Fps,
-                                                       ram_enabled_, true);
-                const std::wstring fps_value = fps_snapshot_.status == fps::Status::Ready
-                    ? std::format(L"{:.0f}", fps_snapshot_.displayed_fps) : L"-";
-                cell(index, L"FPS", fps_value, nullptr,
-                     Gdiplus::Color(255, 92, 220, 215), 0.0);
-                if (fps_history_ != nullptr) {
-                    const auto [x, y] = cell_origin(index);
-                    DrawFpsSparkline(graphics, fps_history_->Samples(), start, end,
-                        {x + 5.0F * s, y + 37.0F * s,
-                         cell_width - 10.0F * s, 10.0F * s},
-                        Gdiplus::Color(235, 92, 220, 215), s);
+                case compact::Metric::Fps: {
+                    const std::wstring fps_value =
+                        fps_snapshot_.status == fps::Status::Ready
+                            ? std::format(L"{:.0f}", fps_snapshot_.displayed_fps)
+                            : L"-";
+                    cell(slot, L"FPS", fps_value, nullptr,
+                         Gdiplus::Color(255, 92, 220, 215), 0.0);
+                    if (fps_history_ != nullptr) {
+                        const auto [x, y] = cell_origin(slot);
+                        DrawFpsSparkline(graphics, fps_history_->Samples(),
+                            start, end,
+                            {x + 5.0F * s, y + 37.0F * s,
+                             cell_width - 10.0F * s, 10.0F * s},
+                            Gdiplus::Color(235, 92, 220, 215), s);
+                    }
+                    break;
+                }
                 }
             }
         } else {
@@ -1413,12 +1739,29 @@ bool OsdOverlay::Render() noexcept {
         const float row_width = 376.0F * s;
         const float row_x = 6.0F * s;
         const float row_start = 31.0F * s;
+        // Lanes follow the same arrangement as the compact cells. Each record
+        // asks where it sits rather than being placed by the order of the
+        // calls below, so the two views cannot drift apart.
+        const auto expanded_placed =
+            compact::Resolve(layout_, ram_enabled_, fps_enabled_);
+        const auto lane_row = [&](const compact::Metric metric) {
+            int slot = 0;
+            for (int i = 0; i < expanded_placed.count; ++i) {
+                if (expanded_placed.cells[static_cast<std::size_t>(i)] == metric) {
+                    slot = i;
+                    break;
+                }
+            }
+            return Gdiplus::RectF{row_x,
+                row_start + (row_height + 2.0F * s) * static_cast<float>(slot),
+                row_width, row_height};
+        };
         const std::optional<double> temperature = optional(&telemetry::Sample::temperature_c);
         const std::wstring temperature_maximum = maximum_temperature
             ? localization::Format(L"最高 {:.0f} °C", L"max {:.0f} °C",
                                    *maximum_temperature) : L"";
         DrawMetricLane(graphics, samples, start, end,
-            {row_x, row_start, row_width, row_height},
+            lane_row(compact::Metric::Temperature),
             std::wstring(localization::Select(L"溫度", L"Temp")),
             FormatMetric(temperature, L" °C"),
             Gdiplus::Color(255, 255, 91, 94), 30.0, 105.0,
@@ -1434,7 +1777,7 @@ bool OsdOverlay::Render() noexcept {
             power_value += std::format(L" ({:.0f} W)", *current_power_limit_w_);
         }
         DrawMetricLane(graphics, samples, start, end,
-            {row_x, row_start + row_height + 2.0F * s, row_width, row_height},
+            lane_row(compact::Metric::Power),
             std::wstring(localization::Select(L"功率", L"Power")),
             power_value,
             Gdiplus::Color(255, 77, 160, 255), 0.0, power_maximum,
@@ -1453,35 +1796,29 @@ bool OsdOverlay::Render() noexcept {
             ? localization::Format(L"最高 {:.0f}%", L"max {:.0f}%",
                                    *maximum_vram_percent) : L"";
         DrawMetricLane(graphics, samples, start, end,
-            {row_x, row_start + (row_height + 2.0F * s) * 2.0F, row_width, row_height},
+            lane_row(compact::Metric::Vram),
             L"VRAM %", vram_value,
             Gdiplus::Color(255, 255, 173, 69), 0.0, 100.0,
             &telemetry::Sample::vram_utilization_percent, label_font, value_font,
             presentation_gaps, false,
             std::nullopt, vram_maximum, stale);
         DrawMetricLane(graphics, samples, start, end,
-            {row_x, row_start + (row_height + 2.0F * s) * 3.0F, row_width, row_height},
+            lane_row(compact::Metric::Gpu),
             L"GPU %", FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
             Gdiplus::Color(255, 75, 214, 139), 0.0, 100.0,
             &telemetry::Sample::gpu_utilization_percent, label_font, value_font,
             presentation_gaps, false,
             std::nullopt, {}, stale);
         DrawMetricLane(graphics, samples, start, end,
-            {row_x, row_start + (row_height + 2.0F * s) * 4.0F, row_width, row_height},
+            lane_row(compact::Metric::Cpu),
             L"CPU %", FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
             Gdiplus::Color(255, 183, 121, 255), 0.0, 100.0,
             &telemetry::Sample::cpu_utilization_percent, label_font, value_font,
             presentation_gaps, false,
             std::nullopt, {}, stale);
 
-        // RAM occupies the sixth lane when enabled; FPS always follows it.
-        int expanded_row = 5;
         if (ram_enabled_) {
-            const Gdiplus::RectF ram_row(
-                row_x,
-                row_start + (row_height + 2.0F * s) *
-                                static_cast<float>(expanded_row++),
-                row_width, row_height);
+            const Gdiplus::RectF ram_row = lane_row(compact::Metric::Ram);
             const Gdiplus::Color ram_color(255, 255, 122, 196);
             const Gdiplus::Color commit_color(255, 228, 196, 76);
             // The readout is one coherent live reading; the history drives the
@@ -1520,11 +1857,7 @@ bool OsdOverlay::Render() noexcept {
                     ram_scale);
         }
         if (fps_enabled_) {
-            const Gdiplus::RectF fps_row(
-                row_x,
-                row_start + (row_height + 2.0F * s) *
-                                static_cast<float>(expanded_row),
-                row_width, row_height);
+            const Gdiplus::RectF fps_row = lane_row(compact::Metric::Fps);
             // Same derived scale as DrawMetricLane, not the raw DPI scale.
             const float fps_scale = compact::LaneScale(fps_row.Height);
             const auto fps_label = compact::LaneLabelSpan(fps_row.X, fps_scale);

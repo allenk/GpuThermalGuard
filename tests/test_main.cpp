@@ -101,14 +101,22 @@ void TestOsdCompact() {
     Require(normal.width == 388 && normal.height == 88 && normal.columns == 5 &&
             normal.rows == 1,
         "five records stay one row in the compact OSD");
-    // A sixth record used to widen the overlay to 464. It now wraps to a
-    // second row so the width never changes.
+    // History of this line, because it has now turned twice: a sixth record
+    // widened the overlay to 464, then wrapped to a second row at 388, and now
+    // widens again. One row is the intended default, and it became safe to
+    // return to once the arrangement editor made two rows a choice.
     const auto six = ChooseFootprint(true, false, true, 1366, 768);
-    Require(six.width == 388 && six.height == 142 && six.rows == 2,
-        "a sixth record wraps downward instead of widening the overlay");
+    Require(six.width == 464 && six.height == 88 && six.rows == 1,
+        "a sixth record widens the default single row");
     const auto compact_grid = ChooseFootprint(true, false, true, 683, 384);
-    Require(compact_grid.width == 388 && compact_grid.height == 142,
-        "a high-DPI work area still fits the constant-width compact OSD");
+    Require(compact_grid.width == 464 && compact_grid.height == 88,
+        "a high-DPI work area still fits the single default row");
+    // Narrower than the default row: wrap to the model's minimum first row
+    // rather than shrinking the cells.
+    const auto wrapped = ChooseFootprint(true, true, true, 400, 768);
+    Require(wrapped.width == 388 && wrapped.height == 142 &&
+            wrapped.columns == 5 && wrapped.rows == 2,
+        "a work area too narrow for one row falls back to five plus the rest");
     const auto expanded = ChooseFootprint(false, false, true, 1366, 768);
     Require(expanded.height > 330 && expanded.height <= 384 &&
             expanded.columns == 1, "roomy expanded OSD adds FPS without exceeding half height");
@@ -705,9 +713,10 @@ void TestRamPreferenceDefaultsOn() {
             "an explicit zero disables it");
 }
 
-void TestCompactFootprintKeepsWidthAndFpsLast() {
+void TestCompactDefaultFootprintIsOneRow() {
     using namespace gtg::tray::compact;
-    // Five cells per row; the overlay grows downward, never sideways.
+    // The default arrangement is a single row of every enabled record, so the
+    // overlay grows sideways with the count and stays one row high.
     const auto five = ChooseFootprint(true, false, false, 2560, 1440);
     const auto six_fps = ChooseFootprint(true, false, true, 2560, 1440);
     const auto six_ram = ChooseFootprint(true, true, false, 2560, 1440);
@@ -715,14 +724,14 @@ void TestCompactFootprintKeepsWidthAndFpsLast() {
 
     Require(five.width == 388 && five.height == 88 && five.rows == 1,
             "five cells stay one row");
-    Require(six_fps.width == 388 && six_fps.height == 142 && six_fps.rows == 2,
-            "six cells wrap to a second row");
+    Require(six_fps.width == 464 && six_fps.height == 88 && six_fps.rows == 1,
+            "six cells widen rather than wrap");
     Require(six_ram.width == six_fps.width && six_ram.height == six_fps.height,
             "either sixth record gives the same footprint");
-    Require(seven.width == 388 && seven.height == 142 && seven.rows == 2,
-            "seven cells fit the same two rows");
-    Require(five.width == six_fps.width && five.width == seven.width,
-            "the compact overlay never changes width");
+    Require(seven.width == 540 && seven.height == 88 && seven.rows == 1,
+            "seven cells are one wide row by default");
+    Require(five.height == six_fps.height && five.height == seven.height,
+            "the default arrangement never gains a second row");
 
     // Record order, and the invariant the default arrangement preserves.
     Require(CellIndexOf(Metric::Fps, true, true) == 6, "FPS is the last cell");
@@ -731,6 +740,310 @@ void TestCompactFootprintKeepsWidthAndFpsLast() {
             "FPS stays last without RAM");
     Require(CellIndexOf(Metric::Ram, true, false) == 5,
             "RAM is last when FPS is off");
+}
+
+// --- compact dashboard arrangement -----------------------------------------
+
+std::wstring Describe(const gtg::tray::compact::Placement& placed) {
+    std::wstring text;
+    for (int i = 0; i < placed.count; ++i) {
+        if (i == placed.row1) text += L"| ";
+        switch (placed.cells[static_cast<std::size_t>(i)]) {
+            case gtg::tray::compact::Metric::Temperature: text += L"T "; break;
+            case gtg::tray::compact::Metric::Power: text += L"P "; break;
+            case gtg::tray::compact::Metric::Vram: text += L"V "; break;
+            case gtg::tray::compact::Metric::Gpu: text += L"G "; break;
+            case gtg::tray::compact::Metric::Cpu: text += L"C "; break;
+            case gtg::tray::compact::Metric::Ram: text += L"R "; break;
+            case gtg::tray::compact::Metric::Fps: text += L"F "; break;
+        }
+    }
+    return text;
+}
+
+void TestCompactLayoutPlacement() {
+    using namespace gtg::tray::compact;
+    const Layout def{};
+    Require(def.row1 == kRecordCount,
+            "the default arrangement is one row of every record");
+
+    // All seven enabled: one row, FPS last.
+    const auto all = Resolve(def, true, true);
+    Require(Describe(all) == L"T P V G C R F ", "default places all seven in a row");
+    Require(all.rows == 1 && all.count == 7, "seven records are one row by default");
+    Require(all.cells[6] == Metric::Fps, "FPS is last by default");
+
+    // A second row exists only once the reader arranges one.
+    const Layout narrow{DefaultOrder(), 5};
+    const auto split = Resolve(narrow, true, true);
+    Require(Describe(split) == L"T P V G C | R F ", "an arranged five splits the rest");
+    Require(split.rows == 2, "an arrangement of five wraps the remainder");
+
+    // Backfill worked through: disabling CPU promotes RAM into row one.
+    const auto no_cpu = Resolve(narrow, true, true, /*enabled=*/[](Metric m) {
+        return m != Metric::Cpu;
+    });
+    Require(Describe(no_cpu) == L"T P V G R | F ",
+            "disabling a record backfills the first row");
+
+    // Five enabled records can only be one row.
+    const auto five = Resolve(def, false, false);
+    Require(Describe(five) == L"T P V G C ", "five records fill one row");
+    Require(five.rows == 1 && five.row1 == 5, "five records force a single row");
+
+    // A first row longer than the records shown is clamped, never wrapped.
+    Require(Resolve(def, true, false).rows == 1, "six records stay one row");
+    Require(Resolve(def, false, true).row1 == 6, "the first row clamps to the count");
+
+    // A record is never placed twice and a disabled one is never placed.
+    for (bool ram : {false, true}) {
+        for (bool fps : {false, true}) {
+            const auto placed = Resolve(def, ram, fps);
+            int seen[7]{};
+            for (int i = 0; i < placed.count; ++i)
+                ++seen[static_cast<int>(placed.cells[static_cast<std::size_t>(i)])];
+            Require(seen[static_cast<int>(Metric::Ram)] == (ram ? 1 : 0),
+                    "RAM placed exactly when enabled");
+            Require(seen[static_cast<int>(Metric::Fps)] == (fps ? 1 : 0),
+                    "FPS placed exactly when enabled");
+            for (int m = 0; m < 5; ++m)
+                Require(seen[m] == 1, "every mandatory record placed exactly once");
+        }
+    }
+}
+
+void TestCompactLayoutMoveInsert() {
+    using namespace gtg::tray::compact;
+    const Order start = DefaultOrder();
+
+    // Forward: the dropped record takes the slot, the rest shift back.
+    const auto forward = MoveInsert(start, 0, 3);
+    Require(forward[0] == Metric::Power && forward[1] == Metric::Vram &&
+            forward[2] == Metric::Gpu && forward[3] == Metric::Temperature,
+            "moving forward shifts the intervening records back");
+
+    // Backward: the rest shift forward.
+    const auto backward = MoveInsert(start, 6, 0);
+    Require(backward[0] == Metric::Fps && backward[1] == Metric::Temperature &&
+            backward[6] == Metric::Ram,
+            "moving backward shifts the intervening records forward");
+
+    // Identity and refusal.
+    Require(MoveInsert(start, 2, 2) == start, "moving onto its own slot changes nothing");
+    Require(MoveInsert(start, -1, 3) == start, "a negative index is refused");
+    Require(MoveInsert(start, 0, 7) == start, "an out-of-range target is refused");
+
+    // A move can never lose or duplicate a record.
+    for (int from = 0; from < kRecordCount; ++from) {
+        for (int to = 0; to < kRecordCount; ++to) {
+            Require(IsValidOrder(MoveInsert(start, from, to)),
+                    "every move yields a permutation");
+        }
+    }
+}
+
+void TestCompactLayoutStoredValueCannotHideARecord() {
+    using namespace gtg::tray::compact;
+
+    // Round trip.
+    Layout custom{MoveInsert(DefaultOrder(), 6, 0), 6};
+    const auto restored = UnpackLayout(PackLayout(custom));
+    Require(restored.has_value(), "a well-formed value round trips");
+    Require(restored->order == custom.order && restored->row1 == custom.row1,
+            "the round trip preserves order and row count");
+
+    // A duplicated record, and therefore a missing one, is refused.
+    Order duplicated = DefaultOrder();
+    duplicated[6] = duplicated[0];
+    Require(!IsValidOrder(duplicated), "a duplicated record is not a valid order");
+    Require(!UnpackLayout(PackLayout({duplicated, 5})).has_value(),
+            "a duplicated record is refused on load");
+
+    // Illegal row counts are refused.
+    Require(!UnpackLayout(PackLayout({DefaultOrder(), 4})).has_value(),
+            "fewer than five in the first row is refused");
+    Require(!UnpackLayout(PackLayout({DefaultOrder(), 8})).has_value(),
+            "more records than exist in the first row is refused");
+
+    // Arbitrary rubbish never yields a layout that hides a record.
+    for (std::uint32_t raw : {0u, 1u, 0xFFFFFFFFu, 0xDEADBEEFu, 0x00FFFFFFu}) {
+        const Layout used = SanitizeLayout(raw);
+        Require(IsValidOrder(used.order),
+                "a rejected stored value still yields every record exactly once");
+        Require(used.row1 >= kCellsPerRow && used.row1 <= kRecordCount,
+                "a rejected stored value still yields a legal row count");
+    }
+    Require(SanitizeLayout(0u).order == DefaultOrder(),
+            "an absent or zero value is the default arrangement");
+}
+
+void TestCellHitTestingAcrossScales() {
+    using namespace gtg::tray::compact;
+    for (float scale : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
+        const Layout two_rows{DefaultOrder(), 5};
+        const auto placed = Resolve(two_rows, true, true);
+        const int width = static_cast<int>(CollapsedWidth(placed.row1) * scale);
+        const auto grid = MakeCellGrid(placed.row1, width, scale);
+
+        // Every slot finds itself, and no slot finds another.
+        for (int slot = 0; slot < placed.count; ++slot) {
+            const CellOrigin origin = CellOriginAt(grid, slot);
+            const int cx = static_cast<int>(origin.x + grid.cell_width_dip * scale / 2.0F);
+            const int cy = static_cast<int>(origin.y + kCellHeightDip * scale / 2.0F);
+            Require(CellSlotAt(grid, placed.count, cx, cy) == slot,
+                    "a cell centre hits its own slot");
+            const auto target = DropTargetAt(grid, cx, cy);
+            Require(target.row == slot / grid.per_row &&
+                    target.column == slot % grid.per_row,
+                    "a cell centre resolves to its own row and column");
+        }
+
+        // The header belongs to the drag bar and the two buttons, never a cell.
+        const int header = static_cast<int>(25 * scale);
+        for (int x = 0; x < width; x += 7)
+            Require(CellSlotAt(grid, placed.count, x, header / 2) == -1,
+                    "the header is never a cell");
+        Require(DropTargetAt(grid, width / 2, header / 2).row == -1,
+                "a release in the header is refused");
+
+        // Releasing below the second row is refused rather than clamped into it.
+        const int far_below =
+            static_cast<int>((kCellsTopDip + kCollapsedRowPitch * 3) * scale);
+        Require(DropTargetAt(grid, width / 2, far_below).row == -1,
+                "a release below the rows is refused");
+
+        // A release in the gap between two cells still resolves.
+        const CellOrigin first = CellOriginAt(grid, 0);
+        const int gap_x =
+            static_cast<int>(first.x + grid.cell_width_dip * scale + 1.0F);
+        const int gap_y = static_cast<int>(first.y + kCellHeightDip * scale / 2.0F);
+        Require(CellSlotAt(grid, placed.count, gap_x, gap_y) == -1,
+                "the gap is not inside a cell");
+        Require(DropTargetAt(grid, gap_x, gap_y).row == 0,
+                "but a release in the gap still lands in the first row");
+    }
+}
+
+void TestCompactDropRules() {
+    using namespace gtg::tray::compact;
+    const Layout two_rows{DefaultOrder(), 5};          // T P V G C | R F
+    const auto placed = Resolve(two_rows, true, true);
+
+    // Reordering within a row moves the record and leaves the rows alone.
+    const Layout reordered = ApplyDrop(two_rows, placed, 0, 0, 3);
+    Require(reordered.row1 == 5, "a same-row drop does not change the rows");
+    Require(Describe(Resolve(reordered, true, true)) == L"P V G T C | R F ",
+            "a same-row drop reorders only");
+
+    // Dragging down opens a second row by shrinking the first.
+    const Layout one_row{DefaultOrder(), 7};           // T P V G C R F
+    const auto wide = Resolve(one_row, true, true);
+    const Layout dropped_down = ApplyDrop(one_row, wide, 0, 1, 0);
+    Require(dropped_down.row1 == 6, "dragging down shrinks the first row by one");
+    Require(Resolve(dropped_down, true, true).rows == 2,
+            "dragging down opens the second row");
+
+    // Dragging up from the second row grows the first row again.
+    const Layout dropped_up = ApplyDrop(two_rows, placed, 5, 0, 0);
+    Require(dropped_up.row1 == 6, "dragging up grows the first row by one");
+
+    // Moving everything up ends with a single row.
+    Layout climbing{DefaultOrder(), 5};
+    for (int i = 0; i < 4; ++i) {
+        const auto now = Resolve(climbing, true, true);
+        if (now.rows == 1) break;
+        climbing = ApplyDrop(climbing, now, now.row1, 0, 0);
+    }
+    Require(Resolve(climbing, true, true).rows == 1,
+            "moving every record up leaves a single row");
+
+    // The floor holds: five in the first row cannot be reduced further.
+    const Layout floored = ApplyDrop(two_rows, placed, 0, 1, 0);
+    Require(floored.row1 == 5 && floored.order == two_rows.order,
+            "the first row never falls below five");
+
+    // Nonsense drops are refused rather than clamped into something plausible.
+    Require(ApplyDrop(two_rows, placed, -1, 0, 0).order == two_rows.order,
+            "a drop with no source is refused");
+    Require(ApplyDrop(two_rows, placed, 99, 0, 0).order == two_rows.order,
+            "a drop from a slot that does not exist is refused");
+    Require(ApplyDrop(two_rows, placed, 0, 5, 0).order == two_rows.order,
+            "a drop outside the two rows is refused");
+
+    // Whatever happens, no record is lost.
+    for (int from = 0; from < placed.count; ++from)
+        for (int row = 0; row < 2; ++row)
+            for (int column = 0; column < 7; ++column)
+                Require(IsValidLayout(ApplyDrop(two_rows, placed, from, row, column)),
+                        "every drop yields a valid arrangement");
+}
+
+void TestLockAndChevronNeverOverlap() {
+    using namespace gtg::tray::compact;
+    for (float scale : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
+        for (int row1 : {5, 6, 7}) {
+            const int width = static_cast<int>(CollapsedWidth(row1) * scale);
+            const int header = static_cast<int>(25 * scale);
+            // Neither control may claim a point belonging to the other, and
+            // neither may reach into the drag bar that moves the window.
+            for (int x = 0; x < width; ++x) {
+                const bool chevron = ToggleHit(x, header / 2, width, header);
+                const bool lock = LockHit(x, header / 2, width, header);
+                Require(!(chevron && lock), "lock and chevron are disjoint");
+                if (x < width - header * 2)
+                    Require(!chevron && !lock,
+                            "the drag bar keeps the rest of the header");
+            }
+            Require(LockHit(width - header - 1, header / 2, width, header),
+                    "the lock occupies the slot left of the chevron");
+            Require(ToggleHit(width - 1, header / 2, width, header),
+                    "the chevron keeps the corner");
+            Require(!LockHit(width - header * 2 - 1, header / 2, width, header),
+                    "the lock does not extend further left");
+            Require(!LockHit(width - header, header, width, header),
+                    "below the header belongs to the cells");
+        }
+    }
+}
+
+void TestCompactLayoutDrivesFootprint() {
+    using namespace gtg::tray::compact;
+    // The arithmetic reproduces the shipped widths rather than re-deriving
+    // them: five records is 388 dip and six is 464, exactly as before.
+    Require(CollapsedWidth(5) == 388, "five in the first row is 388 dip");
+    Require(CollapsedWidth(6) == 464, "six in the first row is 464 dip");
+    Require(CollapsedWidth(7) == 540, "seven in the first row is 540 dip");
+
+    const Layout wide{DefaultOrder(), 7};
+    const auto one_row = ChooseFootprint(true, Resolve(wide, true, true),
+                                         2560, 1440);
+    Require(one_row.width == 540 && one_row.rows == 1,
+            "an arrangement of seven is a single wide row");
+
+    const Layout narrow{DefaultOrder(), 5};
+    const auto two_rows = ChooseFootprint(true, Resolve(narrow, true, true),
+                                          2560, 1440);
+    Require(two_rows.width == 388 && two_rows.rows == 2,
+            "an arrangement of five plus two is narrow and tall");
+
+    // Honest consequence of the model: a first row longer than the records
+    // available is clamped, so disabling a record can narrow the overlay.
+    // Width is stable for a given arrangement, not across every toggle.
+    const auto clamped = ChooseFootprint(true, Resolve(wide, true, false),
+                                         2560, 1440);
+    Require(clamped.width == 464 && clamped.rows == 1,
+            "disabling a record shrinks an over-long first row");
+}
+
+void TestCompactLockPreferenceDefaultsToLocked() {
+    // Absent means locked: a reader who has never opened the arrangement
+    // cannot disturb it by accident.
+    Require(gtg::settings::ResolveCompactLockPreference(false, 0),
+            "an absent preference leaves the dashboard locked");
+    Require(gtg::settings::ResolveCompactLockPreference(true, 1),
+            "an explicit non-zero locks");
+    Require(!gtg::settings::ResolveCompactLockPreference(true, 0),
+            "an explicit zero unlocks");
 }
 
 void TestConfigValidation() {
@@ -1697,8 +2010,18 @@ int main(int argc, char** argv) {
         {"HostMemoryHistoryRetentionAndClear",
          TestHostMemoryHistoryRetentionAndClear},
         {"RamPreferenceDefaultsOn", TestRamPreferenceDefaultsOn},
-        {"CompactFootprintKeepsWidthAndFpsLast",
-         TestCompactFootprintKeepsWidthAndFpsLast},
+        {"CompactDefaultFootprintIsOneRow",
+         TestCompactDefaultFootprintIsOneRow},
+        {"CellHitTestingAcrossScales", TestCellHitTestingAcrossScales},
+        {"CompactDropRules", TestCompactDropRules},
+        {"LockAndChevronNeverOverlap", TestLockAndChevronNeverOverlap},
+        {"CompactLayoutDrivesFootprint", TestCompactLayoutDrivesFootprint},
+        {"CompactLockPreferenceDefaultsToLocked",
+         TestCompactLockPreferenceDefaultsToLocked},
+        {"CompactLayoutPlacement", TestCompactLayoutPlacement},
+        {"CompactLayoutMoveInsert", TestCompactLayoutMoveInsert},
+        {"CompactLayoutStoredValueCannotHideARecord",
+         TestCompactLayoutStoredValueCannotHideARecord},
         {"ConfigValidation", TestConfigValidation},
         {"WorkingPowerApply", TestWorkingPowerApply},
         {"WorkingPowerFailureAndContinuity", TestWorkingPowerFailureAndContinuity},
