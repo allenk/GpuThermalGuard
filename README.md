@@ -11,17 +11,21 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 ## Screenshots
 
-| Main dashboard with optional FPS history | Compact 30-second OSD with FPS |
+| Main dashboard, seven history records | Expanded OSD, arranged by the reader |
 | --- | --- |
-| ![GpuThermalGuard dashboard showing the sixth FPS history lane](docs/images/dashboard.png) | ![Compact OSD showing six metric cards including FPS](docs/images/osd-compact.png) |
+| ![GpuThermalGuard dashboard with temperature, power, VRAM, GPU, CPU, RAM and FPS history](docs/images/dashboard.png) | ![Expanded OSD showing seven metric rows in a custom order](docs/images/osd.png) |
 
 Screenshots show one workstation's settings, not recommended limits for every GPU.
 
 ### Compact OSD
 
-![Compact OSD with six live metrics and miniature trends when FPS is enabled](docs/images/osd-compact.png)
+![Compact OSD, one row of seven live metrics with 30-second miniature trends](docs/images/osd-compact.png)
 
-Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode shows temperature, power, VRAM, GPU utilization, and CPU utilization in small cards with live values and 30-second miniature trends. **Show RAM** and **Show FPS** each add a card; unchecking one returns the layout to the records that remain.
+Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode shows each record as a small card with a live value and a 30-second miniature trend. **Show RAM** and **Show FPS** each add a card; unchecking one returns the layout to the records that remain.
+
+By default every enabled record sits on one row, so the OSD grows sideways with the record count rather than getting taller. You can also arrange it into two rows:
+
+![The same compact OSD arranged into two rows, five cards above and two below](docs/images/osd-compact-two-rows.png)
 
 Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Drag the header outside the buttons to move the OSD; restart returns to the expanded view.
 
@@ -29,11 +33,19 @@ Compact mode is included starting with v0.9.0-beta.2.
 
 ### Arranging the compact OSD
 
-Starting with v0.11.0-beta.1, the compact dashboard is a single row of whichever records are enabled, and you can rearrange it. The lock control left of the chevron toggles between locked, where the cells ignore the pointer, and unlocked, where they do not.
+![Unlocking the compact OSD, dragging cards to reorder them and into a second row, then locking it again](docs/images/osd-arrange.gif)
 
-Unlocked, press a cell and release it where you want it. Release it on the same row to reorder; release it below to move it into a second row, or above to bring it back. The first row keeps at least five cells, so five records are always a single row. The arrangement is remembered between runs, and **Reset OSD layout** in the tray menu restores the default.
+Starting with v0.11.0-beta.1 you can rearrange the compact dashboard. The lock control left of the chevron toggles between locked, where the cards ignore the pointer, and unlocked, where they do not. Locked is the resting state and is drawn quietly; unlocked turns amber, because an always-on-top window that accepts drags should say so.
 
-The lock governs the cells only. The OSD itself still moves by its top bar whether locked or not.
+Unlocked, press a card and release it where you want it:
+
+- release it on the same row to reorder,
+- release it below the row to move it into a second row,
+- release it on the first row to bring it back up.
+
+The first row keeps at least five cards, so five records are always a single row. The expanded OSD follows the same order. The arrangement is remembered between runs, and **Reset OSD layout** in the tray menu restores the default.
+
+The lock governs the cards only. The OSD itself still moves by its top bar whether locked or not.
 
 ### Optional host RAM
 
