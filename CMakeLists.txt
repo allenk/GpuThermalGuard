@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(GpuThermalGuard VERSION 0.10.0 LANGUAGES CXX)
+project(GpuThermalGuard VERSION 0.11.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "GpuThermalGuard currently supports Windows only")
@@ -68,6 +68,7 @@ add_library(gtg_telemetry STATIC
     src/telemetry/telemetry_history.cpp
     src/telemetry/telemetry_history.hpp
     src/telemetry/telemetry_freshness.hpp
+    src/sysmem/host_memory.hpp
 )
 target_include_directories(gtg_telemetry PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(gtg_telemetry PUBLIC gtg_build_options)
@@ -109,6 +110,7 @@ add_executable(GpuThermalGuard WIN32
     src/fps/dxgi_event.hpp
     src/fps/dxgi_observer.cpp
     src/fps/dxgi_observer.hpp
+    src/sysmem/host_memory.hpp
     src/resources/resource.h
     src/resources/GpuThermalGuard.rc
     src/resources/GpuThermalGuard.manifest
@@ -173,6 +175,18 @@ if(BUILD_TESTING)
         add_test(NAME gtg_fps_history_chart_smoke
             COMMAND gtg_fps_history_chart_smoke)
         set_tests_properties(gtg_fps_history_chart_smoke PROPERTIES TIMEOUT 15)
+        add_executable(gtg_dpi_legibility_bench
+            tests/dpi_legibility_probe.cpp
+            src/tray/history_chart.cpp
+        )
+        target_include_directories(gtg_dpi_legibility_bench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(gtg_dpi_legibility_bench PRIVATE
+            gtg_telemetry gtg_build_options wtl gdiplus user32 gdi32)
+        add_test(NAME gtg_dpi_legibility_bench
+            COMMAND gtg_dpi_legibility_bench
+                    "${CMAKE_CURRENT_BINARY_DIR}/dpi-legibility" 96)
+        set_tests_properties(gtg_dpi_legibility_bench PROPERTIES TIMEOUT 30)
         add_executable(gtg_fps_observer_smoke
             tests/fps_observer_smoke.cpp
             src/fps/dxgi_observer.cpp

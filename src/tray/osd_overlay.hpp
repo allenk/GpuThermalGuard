@@ -15,6 +15,7 @@
 #include "tray/osd_compact.hpp"
 #include "fps/fps_rate.hpp"
 #include "fps/fps_history.hpp"
+#include "sysmem/host_memory.hpp"
 
 namespace gtg::tray {
 
@@ -97,6 +98,11 @@ public:
         fps_history_ = history;
         RequestRefresh();
     }
+    void SetRamEnabled(bool enabled) noexcept;
+    void SetRamHistory(const sysmem::History* history) noexcept {
+        ram_history_ = history;
+        RequestRefresh();
+    }
     [[nodiscard]] POINT Position() const noexcept;
 
 private:
@@ -113,6 +119,7 @@ private:
         int drag_height{};
         float scale{1.0F};
         int columns{1};
+        int rows{1};
     };
 
     LRESULT OnNcHitTest(UINT, WPARAM, LPARAM, BOOL&);
@@ -156,6 +163,9 @@ private:
     std::optional<double> current_power_limit_w_;
     std::wstring status_{L"保護狀態初始化中"};
     OsdVisual visual_{OsdVisual::Neutral};
+    // Default off like FPS: MainDialog applies the stored preference.
+    bool ram_enabled_{false};
+    const sysmem::History* ram_history_{nullptr};
     bool fps_enabled_{false};
     fps::Snapshot fps_snapshot_{};
     OsdDragHandle drag_handle_;

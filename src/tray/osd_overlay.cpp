@@ -145,6 +145,72 @@ void DrawCompactSparkline(Gdiplus::Graphics& graphics,
     graphics.DrawLines(&pen, points.data(), static_cast<INT>(points.size()));
 }
 
+// Two overlaid series on a shared 0-100 % scale: Virtual Commit first, then
+// physical RAM, so RAM always reads as the subject. Unavailable readings break
+// the stroke rather than dropping to a fabricated 0 %.
+void DrawMemorySparkline(Gdiplus::Graphics& graphics,
+                         const std::deque<sysmem::HistorySample>& samples,
+                         const std::uint64_t start, const std::uint64_t end,
+                         const Gdiplus::RectF& bounds,
+                         const Gdiplus::Color physical_color,
+                         const Gdiplus::Color commit_color, const float scale) {
+    const double duration = static_cast<double>(std::max<std::uint64_t>(1, end - start));
+    const auto x_for = [&](const std::uint64_t timestamp) {
+        return bounds.X +
+               static_cast<float>((timestamp - start) / duration) * bounds.Width;
+    };
+
+    // A history younger than the window leaves a real absence at the left. Mark
+    // it the way FPS does, so it reads as "not observed yet" rather than as a
+    // broken curve. The first sample is never dragged to the edge: that would
+    // draw a value nobody measured.
+    std::optional<std::uint64_t> first_visible;
+    for (const auto& sample : samples) {
+        if (sample.monotonic_ms < start || sample.monotonic_ms > end) continue;
+        if (!sample.physical_percent && !sample.commit_percent) continue;
+        first_visible = sample.monotonic_ms;
+        break;
+    }
+    const float data_left = first_visible ? x_for(*first_visible) : bounds.GetRight();
+    if (data_left > bounds.X + 1.0F) {
+        Gdiplus::Pen no_data(
+            Gdiplus::Color(120, physical_color.GetR(), physical_color.GetG(),
+                           physical_color.GetB()),
+            std::max(1.0F, 0.8F * scale));
+        no_data.SetDashStyle(Gdiplus::DashStyleDot);
+        const float y = bounds.Y + bounds.Height / 2.0F;
+        graphics.DrawLine(&no_data, bounds.X, y, data_left, y);
+    }
+
+    const auto stroke = [&](const bool commit, const Gdiplus::Color color,
+                            const float width) {
+        Gdiplus::Pen line(color, std::max(1.0F, width * scale));
+        line.SetLineJoin(Gdiplus::LineJoinRound);
+        std::vector<Gdiplus::PointF> points;
+        const auto flush = [&] {
+            if (points.size() >= 2)
+                graphics.DrawLines(&line, points.data(),
+                                   static_cast<INT>(points.size()));
+            points.clear();
+        };
+        for (const auto& sample : samples) {
+            if (sample.monotonic_ms < start || sample.monotonic_ms > end) continue;
+            const auto value = commit ? sample.commit_percent
+                                      : sample.physical_percent;
+            if (!value) {
+                flush();
+                continue;
+            }
+            const float fraction = std::clamp(*value / 100.0F, 0.0F, 1.0F);
+            points.push_back({x_for(sample.monotonic_ms),
+                              bounds.GetBottom() - fraction * bounds.Height});
+        }
+        flush();
+    };
+    stroke(true, commit_color, 0.8F);
+    stroke(false, physical_color, 1.0F);
+}
+
 void DrawFpsSparkline(Gdiplus::Graphics& graphics,
                       const std::deque<fps::HistorySample>& samples,
                       const std::uint64_t start, const std::uint64_t end,
@@ -248,19 +314,22 @@ void DrawMetricLane(Gdiplus::Graphics& graphics,
                     const std::optional<double> threshold = std::nullopt,
                     const std::wstring_view annotation = {},
                     const bool stale = false) {
-    const Gdiplus::REAL scale = row.Height / 60.0F;
+    const Gdiplus::REAL scale = compact::LaneScale(row.Height);
     Gdiplus::SolidBrush background(Gdiplus::Color(12, 255, 255, 255));
     graphics.FillRectangle(&background, row);
     Gdiplus::Pen separator(Gdiplus::Color(28, 190, 205, 224), 1.0F * scale);
     graphics.DrawLine(&separator, row.X, row.GetBottom(), row.GetRight(), row.GetBottom());
 
-    const Gdiplus::RectF label_rect(row.X + 8.0F * scale, row.Y,
-                                    70.0F * scale, row.Height);
+    // 84, not 70: "VRAM %" overran a 70 dip box and ellipsized to "VRA...".
+    const auto label_span = compact::LaneLabelSpan(row.X, scale);
+    const auto graph_span = compact::LaneGraphSpan(row.X, row.Width, scale);
+    const Gdiplus::RectF label_rect(label_span.x, row.Y, label_span.width,
+                                    row.Height);
     DrawText(graphics, label, label_rect, label_font, color,
              Gdiplus::StringAlignmentNear);
     if (!annotation.empty()) {
-        const Gdiplus::RectF annotation_rect(row.X + 78.0F * scale, row.Y,
-                                              row.Width - 226.0F * scale,
+        const Gdiplus::RectF annotation_rect(graph_span.x, row.Y,
+                                              row.Width - 240.0F * scale,
                                               22.0F * scale);
         DrawText(graphics, std::wstring(annotation), annotation_rect, label_font,
                  Gdiplus::Color(230, color.GetR(), color.GetG(), color.GetB()),
@@ -273,8 +342,8 @@ void DrawMetricLane(Gdiplus::Graphics& graphics,
                    : Gdiplus::Color(255, 245, 248, 252),
              Gdiplus::StringAlignmentFar);
 
-    const Gdiplus::RectF graph(row.X + 78.0F * scale, row.Y + 23.0F * scale,
-                               row.Width - 86.0F * scale, row.Height - 30.0F * scale);
+    const Gdiplus::RectF graph(graph_span.x, row.Y + 23.0F * scale,
+                               graph_span.width, row.Height - 30.0F * scale);
     Gdiplus::Pen grid(Gdiplus::Color(24, 215, 224, 237), 1.0F * scale);
     graphics.DrawLine(&grid, graph.X, graph.Y + graph.Height / 2.0F,
                       graph.GetRight(), graph.Y + graph.Height / 2.0F);
@@ -570,6 +639,17 @@ void OsdOverlay::SetCurrentPowerLimit(
 void OsdOverlay::SetStatus(const std::wstring_view status, const OsdVisual visual) {
     status_.assign(status);
     visual_ = visual;
+    RequestRefresh();
+}
+
+void OsdOverlay::SetRamEnabled(const bool enabled) noexcept {
+    if (ram_enabled_ == enabled) return;
+    ram_enabled_ = enabled;
+    if (m_hWnd == nullptr) return;
+    POINT next = Position();
+    const Layout layout = CurrentLayout();
+    (void)FitToWorkArea(next, layout);
+    ApplyPosition(next, layout);
     RequestRefresh();
 }
 
@@ -907,11 +987,11 @@ OsdOverlay::Layout OsdOverlay::CurrentLayout() const noexcept {
                                  static_cast<int>(dpi));
     }
     const auto footprint = compact::ChooseFootprint(
-        collapsed_, fps_enabled_, work_width_dip, work_height_dip);
+        collapsed_, ram_enabled_, fps_enabled_, work_width_dip, work_height_dip);
     return {MulDiv(footprint.width, static_cast<int>(dpi), 96),
             MulDiv(footprint.height, static_cast<int>(dpi), 96),
             MulDiv(kDragHeightDip, static_cast<int>(dpi), 96),
-            static_cast<float>(dpi) / 96.0F, footprint.columns};
+            static_cast<float>(dpi) / 96.0F, footprint.columns, footprint.rows};
 }
 
 bool OsdOverlay::FitToWorkArea(POINT& point, const Layout& layout) const noexcept {
@@ -1162,16 +1242,27 @@ bool OsdOverlay::Render() noexcept {
                 ? (static_cast<float>(layout.width) / s - 20.0F) / 3.0F
                 : 72.0F;
             const float cell_width = cell_width_dip * s;
+            // Cells wrap at layout.columns and the overlay grows downward, so
+            // a preference toggle never changes the overlay's width.
+            const int per_row = std::max(1, layout.columns);
+            const float column_stride_dip =
+                layout.columns == 3 ? cell_width_dip + 4.0F : 76.0F;
+            const auto cell_origin = [&](const int index) {
+                return std::pair<float, float>{
+                    (6.0F + (index % per_row) * column_stride_dip) * s,
+                    (30.0F + (index / per_row) *
+                                 static_cast<float>(compact::kCollapsedRowPitch)) * s};
+            };
             const auto cell = [&](int index, const std::wstring& label,
                                   const std::wstring& value, MetricMember member,
-                                  const Gdiplus::Color color, double minimum_span) {
-                const float x = (6.0F + (layout.columns == 3
-                    ? (index % 3) * (cell_width_dip + 4.0F)
-                    : index * 76.0F)) * s;
-                const float y = (30.0F + (layout.columns == 3
-                    ? (index / 3) * 55.0F : 0.0F)) * s;
-                const bool unavailable = member == nullptr
-                    ? fps_snapshot_.status != fps::Status::Ready : stale;
+                                  const Gdiplus::Color color, double minimum_span,
+                                  std::optional<bool> unavailable_override =
+                                      std::nullopt) {
+                const auto [x, y] = cell_origin(index);
+                const bool unavailable = unavailable_override
+                    ? *unavailable_override
+                    : (member == nullptr
+                           ? fps_snapshot_.status != fps::Status::Ready : stale);
                 Gdiplus::SolidBrush background(Gdiplus::Color(15, color.GetR(), color.GetG(), color.GetB()));
                 Gdiplus::Pen border(Gdiplus::Color(42, color.GetR(), color.GetG(), color.GetB()), s);
                 Gdiplus::GraphicsPath path;
@@ -1203,15 +1294,42 @@ bool OsdOverlay::Render() noexcept {
                 &telemetry::Sample::gpu_utilization_percent, Gdiplus::Color(255, 75, 214, 139), 20.0);
             cell(4, L"CPU", FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
                 &telemetry::Sample::cpu_utilization_percent, Gdiplus::Color(255, 183, 121, 255), 20.0);
+            // RAM is second from last; FPS is always the final populated cell.
+            const Gdiplus::Color ram_color(255, 255, 122, 196);
+            const Gdiplus::Color commit_color(255, 228, 196, 76);
+            if (ram_enabled_) {
+                const int index =
+                    compact::CellIndexOf(compact::Metric::Ram, true, fps_enabled_);
+                // One coherent live reading, as in the expanded lane.
+                const auto live_ram = sysmem::Query();
+                const std::wstring ram_value =
+                    live_ram.physical_percent
+                        ? std::format(L"{:.0f}%", *live_ram.physical_percent)
+                        : L"-";
+                cell(index, L"RAM", ram_value, nullptr, ram_color, 0.0,
+                     !live_ram.physical_percent);
+                if (ram_history_ != nullptr) {
+                    const auto [x, y] = cell_origin(index);
+                    DrawMemorySparkline(graphics, ram_history_->Samples(), start,
+                        end,
+                        {x + 5.0F * s, y + 37.0F * s,
+                         cell_width - 10.0F * s, 10.0F * s},
+                        Gdiplus::Color(235, ram_color.GetR(), ram_color.GetG(),
+                                       ram_color.GetB()),
+                        Gdiplus::Color(200, commit_color.GetR(),
+                                       commit_color.GetG(), commit_color.GetB()),
+                        s);
+                }
+            }
             if (fps_enabled_) {
+                const int index = compact::CellIndexOf(compact::Metric::Fps,
+                                                       ram_enabled_, true);
                 const std::wstring fps_value = fps_snapshot_.status == fps::Status::Ready
                     ? std::format(L"{:.0f}", fps_snapshot_.displayed_fps) : L"-";
-                cell(5, L"FPS", fps_value, nullptr,
+                cell(index, L"FPS", fps_value, nullptr,
                      Gdiplus::Color(255, 92, 220, 215), 0.0);
                 if (fps_history_ != nullptr) {
-                    const float x = (6.0F + (layout.columns == 3
-                        ? 2 * (cell_width_dip + 4.0F) : 5 * 76.0F)) * s;
-                    const float y = (30.0F + (layout.columns == 3 ? 55.0F : 0.0F)) * s;
+                    const auto [x, y] = cell_origin(index);
                     DrawFpsSparkline(graphics, fps_history_->Samples(), start, end,
                         {x + 5.0F * s, y + 37.0F * s,
                          cell_width - 10.0F * s, 10.0F * s},
@@ -1285,7 +1403,13 @@ bool OsdOverlay::Render() noexcept {
             }
         }
 
-        const float row_height = (fps_enabled_ ? 52.0F : 57.0F) * s;
+        // Derived, not hard-coded: this reproduces the previous 57 and 52 for
+        // five and six records and keeps a seventh inside the window.
+        const int expanded_lanes =
+            5 + (ram_enabled_ ? 1 : 0) + (fps_enabled_ ? 1 : 0);
+        const float row_height =
+            ((static_cast<float>(layout.height) / s - 31.0F) /
+                 static_cast<float>(expanded_lanes) - 2.0F) * s;
         const float row_width = 376.0F * s;
         const float row_x = 6.0F * s;
         const float row_start = 31.0F * s;
@@ -1350,27 +1474,78 @@ bool OsdOverlay::Render() noexcept {
             presentation_gaps, false,
             std::nullopt, {}, stale);
 
+        // RAM occupies the sixth lane when enabled; FPS always follows it.
+        int expanded_row = 5;
+        if (ram_enabled_) {
+            const Gdiplus::RectF ram_row(
+                row_x,
+                row_start + (row_height + 2.0F * s) *
+                                static_cast<float>(expanded_row++),
+                row_width, row_height);
+            const Gdiplus::Color ram_color(255, 255, 122, 196);
+            const Gdiplus::Color commit_color(255, 228, 196, 76);
+            // The readout is one coherent live reading; the history drives the
+            // curve only. Mixing a stored percentage with a live capacity can
+            // disagree, so both numbers come from the same query.
+            const auto live = sysmem::Query();
+            std::wstring ram_value = L"—";
+            if (live.physical_percent && live.physical_used_gib) {
+                ram_value = std::format(L"{:.0f}% ({:.1f} GiB)",
+                                        *live.physical_percent,
+                                        *live.physical_used_gib);
+            }
+            // Same derived scale as DrawMetricLane, not the raw DPI scale.
+            const float ram_scale = compact::LaneScale(ram_row.Height);
+            const auto ram_label = compact::LaneLabelSpan(ram_row.X, ram_scale);
+            const auto ram_graph =
+                compact::LaneGraphSpan(ram_row.X, ram_row.Width, ram_scale);
+            Gdiplus::SolidBrush background(Gdiplus::Color(12, 255, 255, 255));
+            graphics.FillRectangle(&background, ram_row);
+            DrawText(graphics, L"RAM",
+                {ram_label.x, ram_row.Y, ram_label.width, ram_row.Height},
+                label_font, ram_color, Gdiplus::StringAlignmentNear);
+            DrawText(graphics, ram_value,
+                {ram_row.GetRight() - 140.0F * ram_scale, ram_row.Y,
+                 132.0F * ram_scale, 22.0F * ram_scale},
+                value_font, Gdiplus::Color(255, 245, 248, 252),
+                Gdiplus::StringAlignmentFar);
+            if (ram_history_ != nullptr)
+                DrawMemorySparkline(graphics, ram_history_->Samples(), start, end,
+                    {ram_graph.x, ram_row.Y + 23.0F * ram_scale,
+                     ram_graph.width, ram_row.Height - 30.0F * ram_scale},
+                    Gdiplus::Color(235, ram_color.GetR(), ram_color.GetG(),
+                                   ram_color.GetB()),
+                    Gdiplus::Color(200, commit_color.GetR(), commit_color.GetG(),
+                                   commit_color.GetB()),
+                    ram_scale);
+        }
         if (fps_enabled_) {
             const Gdiplus::RectF fps_row(
-                row_x, row_start + (row_height + 2.0F * s) * 5.0F,
+                row_x,
+                row_start + (row_height + 2.0F * s) *
+                                static_cast<float>(expanded_row),
                 row_width, row_height);
+            // Same derived scale as DrawMetricLane, not the raw DPI scale.
+            const float fps_scale = compact::LaneScale(fps_row.Height);
+            const auto fps_label = compact::LaneLabelSpan(fps_row.X, fps_scale);
+            const auto fps_graph =
+                compact::LaneGraphSpan(fps_row.X, fps_row.Width, fps_scale);
             Gdiplus::SolidBrush background(Gdiplus::Color(12, 255, 255, 255));
             graphics.FillRectangle(&background, fps_row);
             DrawText(graphics, L"FPS",
-                {fps_row.X + 8.0F * s, fps_row.Y,
-                 70.0F * s, fps_row.Height},
+                {fps_label.x, fps_row.Y, fps_label.width, fps_row.Height},
                 label_font, Gdiplus::Color(255, 92, 220, 215),
                 Gdiplus::StringAlignmentNear);
             DrawText(graphics, fps_value,
-                {fps_row.GetRight() - 140.0F * s, fps_row.Y,
-                 132.0F * s, 22.0F * s},
+                {fps_row.GetRight() - 140.0F * fps_scale, fps_row.Y,
+                 132.0F * fps_scale, 22.0F * fps_scale},
                 value_font, Gdiplus::Color(255, 245, 248, 252),
                 Gdiplus::StringAlignmentFar);
             if (fps_history_ != nullptr)
                 DrawFpsSparkline(graphics, fps_history_->Samples(), start, end,
-                    {fps_row.X + 78.0F * s, fps_row.Y + 25.0F * s,
-                     fps_row.Width - 86.0F * s, fps_row.Height - 31.0F * s},
-                    Gdiplus::Color(235, 92, 220, 215), s);
+                    {fps_graph.x, fps_row.Y + 23.0F * fps_scale,
+                     fps_graph.width, fps_row.Height - 30.0F * fps_scale},
+                    Gdiplus::Color(235, 92, 220, 215), fps_scale);
         }
 
         }

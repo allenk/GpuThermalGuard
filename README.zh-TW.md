@@ -27,6 +27,14 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 此功能自 v0.9.0-beta.2 起提供。
 
+### 可選的主機 RAM
+
+自 v0.11.0-beta.1 起，「顯示 RAM」預設勾選，主視窗、展開 OSD 與精簡 OSD 都會加上主機記憶體項目。實體記憶體使用率為前景主角；虛擬 commit 以另一個輔色繪在其後方，兩者同時可讀而不互相搶眼。
+
+虛擬 commit 是以系統 commit limit 為分母，而該上限大於實體記憶體，因此 commit 曲線通常低於實體曲線。關閉後立即清除其紀錄。
+
+讀值來自現有顯示更新節拍上的單次 `GlobalMemoryStatusEx` 呼叫，不增加任何相依，不在 200 ms 保護路徑上讀取，也不寫入 log。
+
 ### 可選的遊戲 FPS
 
 自 v0.10.0-beta.1 起，「顯示 FPS」預設勾選，主視窗增加第六條獨立 FPS 歷史，OSD 增加一列／一張 FPS 卡。它跟隨目前前景程式；切換遊戲時，讀值會共用同一條時間軸。關閉後停止 FPS 觀測並清除其紀錄，原本五條溫度／硬體紀錄不變。FPS 收集器不參與獨立的 200 ms 保護迴圈。
@@ -75,6 +83,7 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 - VRAM 百分比與 GiB
 - GPU Loading
 - CPU Loading
+- 可選的主機 RAM 使用率，並在其後方顯示虛擬 commit
 - 保留一小時 telemetry、可拖曳的固定五分鐘主面板視野
 - 精簡、不搶 focus 的 30 秒 always-on-top OSD
 

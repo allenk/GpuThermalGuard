@@ -21,6 +21,7 @@
 #include "fps/dxgi_event.hpp"
 #include "fps/display_correlator.hpp"
 #include "settings/settings.hpp"
+#include "sysmem/host_memory.hpp"
 
 #include <windows.h>
 #include <objidl.h>
@@ -96,30 +97,35 @@ void TestOsdCompact() {
     Require(PulseAlpha(true, true, 0) != PulseAlpha(true, true, 1000), "alert pulses");
     for (unsigned i = 0; i < 10000; i += 100)
         Require(PulseAlpha(true, true, i) >= 150, "pulse never disappears");
-    const auto normal = ChooseFootprint(true, false, 1366, 768);
-    Require(normal.width == 388 && normal.height == 88 && normal.columns == 5,
-        "unchecked FPS retains the five-cell compact OSD");
-    const auto six = ChooseFootprint(true, true, 1366, 768);
-    Require(six.width == 464 && six.height == 88 && six.columns == 6,
-        "roomy 96 DPI compact OSD puts FPS in the last sixth cell");
-    const auto compact_grid = ChooseFootprint(true, true, 683, 384);
-    Require(compact_grid.width <= 320 && compact_grid.height <= 150 &&
-            compact_grid.columns == 3, "small high-DPI work area reflows compact OSD");
-    const auto expanded = ChooseFootprint(false, true, 1366, 768);
+    const auto normal = ChooseFootprint(true, false, false, 1366, 768);
+    Require(normal.width == 388 && normal.height == 88 && normal.columns == 5 &&
+            normal.rows == 1,
+        "five records stay one row in the compact OSD");
+    // A sixth record used to widen the overlay to 464. It now wraps to a
+    // second row so the width never changes.
+    const auto six = ChooseFootprint(true, false, true, 1366, 768);
+    Require(six.width == 388 && six.height == 142 && six.rows == 2,
+        "a sixth record wraps downward instead of widening the overlay");
+    const auto compact_grid = ChooseFootprint(true, false, true, 683, 384);
+    Require(compact_grid.width == 388 && compact_grid.height == 142,
+        "a high-DPI work area still fits the constant-width compact OSD");
+    const auto expanded = ChooseFootprint(false, false, true, 1366, 768);
     Require(expanded.height > 330 && expanded.height <= 384 &&
             expanded.columns == 1, "roomy expanded OSD adds FPS without exceeding half height");
-    const auto expanded_grid = ChooseFootprint(false, true, 683, 384);
+    const auto expanded_grid = ChooseFootprint(false, false, true, 683, 384);
     Require(expanded_grid.height <= 220 && expanded_grid.columns == 2,
         "small high-DPI expanded OSD reflows to two columns");
     for (int dpi : {96, 120, 144, 192}) {
         const int work_width_dip = 1366 * 96 / dpi;
         const int work_height_dip = 768 * 96 / dpi;
         for (bool collapsed : {false, true}) {
-            const auto choice = ChooseFootprint(
-                collapsed, true, work_width_dip, work_height_dip);
-            Require(choice.width <= work_width_dip &&
-                    choice.height <= work_height_dip,
-                "FPS layout fits 1366x768 work area at each tested DPI");
+            for (bool ram : {false, true}) {
+                const auto choice = ChooseFootprint(
+                    collapsed, ram, true, work_width_dip, work_height_dip);
+                Require(choice.width <= work_width_dip &&
+                        choice.height <= work_height_dip,
+                    "layout fits 1366x768 work area at each tested DPI");
+            }
         }
     }
 }
@@ -607,6 +613,124 @@ void TestWorkingPowerFailureAndContinuity() {
     Require(failed.status == gtg::ApplyStatus::WriteFailed && !failed.safe_verified,
         "unverified fallback must not claim protected");
     Require(fresh.safe_latched() && saves == 0, "failed writes latch without saving candidate");
+}
+
+constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+
+bool Near(const std::optional<double> value, const double expected) {
+    return value.has_value() && std::abs(*value - expected) < 0.01;
+}
+
+void TestHostMemoryComputeBoundaries() {
+    using gtg::sysmem::Compute;
+
+    // 128 GiB physical with a 32 GiB page file: the commit limit is the larger
+    // denominator, so commit % normally sits BELOW physical %.
+    const auto ordinary =
+        Compute(128 * kGiB, 98 * kGiB, 160 * kGiB, 125 * kGiB);
+    Require(Near(ordinary.physical_percent, 23.4375), "physical percent");
+    Require(Near(ordinary.physical_used_gib, 30.0), "physical GiB");
+    Require(Near(ordinary.commit_percent, 21.875), "commit percent");
+    Require(Near(ordinary.commit_used_gib, 35.0), "commit GiB");
+    Require(*ordinary.physical_percent > *ordinary.commit_percent,
+            "commit normally reads below physical");
+
+    // A zero total must not divide by zero and must not read as a measured 0 %.
+    const auto zero = Compute(0, 0, 0, 0);
+    Require(!zero.physical_percent && !zero.commit_percent,
+            "zero total is unavailable, never 0 %");
+    Require(!zero.physical_used_gib && !zero.commit_used_gib,
+            "zero total reports no capacity");
+
+    // Available above total is an inconsistent report, not a negative usage.
+    const auto inconsistent =
+        Compute(8 * kGiB, 9 * kGiB, 16 * kGiB, 20 * kGiB);
+    Require(!inconsistent.physical_percent && !inconsistent.commit_percent,
+            "inconsistent report is unavailable, never negative");
+
+    const auto saturated = Compute(8 * kGiB, 0, 16 * kGiB, 0);
+    Require(Near(saturated.physical_percent, 100.0), "fully used reads 100 %");
+    Require(Near(saturated.commit_percent, 100.0), "commit saturates at 100 %");
+
+    // A system-managed page file growing the limit lowers the percentage with
+    // no process releasing anything. The charge itself is unchanged.
+    const auto before = Compute(128 * kGiB, 98 * kGiB, 160 * kGiB, 125 * kGiB);
+    const auto after = Compute(128 * kGiB, 98 * kGiB, 192 * kGiB, 157 * kGiB);
+    Require(*after.commit_percent < *before.commit_percent,
+            "a grown commit limit lowers the percentage");
+    Require(Near(after.commit_used_gib, *before.commit_used_gib),
+            "the commit charge itself is unchanged");
+}
+
+void TestHostMemoryHistoryRetentionAndClear() {
+    gtg::sysmem::History history;
+    const auto usage = gtg::sysmem::Compute(128 * kGiB, 98 * kGiB,
+                                            160 * kGiB, 125 * kGiB);
+
+    // 2 Hz for rather more than one hour.
+    for (std::uint64_t i = 0; i <= 8'000; ++i) history.Record(i * 500, usage);
+    Require(history.Samples().size() <= gtg::sysmem::History::kMaxSamples,
+            "ring is bounded by sample count");
+    const auto span = history.Samples().back().monotonic_ms -
+                      history.Samples().front().monotonic_ms;
+    Require(span <= gtg::sysmem::History::kRetainedDurationMs,
+            "ring retains at most one hour");
+
+    // Out-of-order samples are rejected; an identical timestamp replaces.
+    const auto size_before = history.Samples().size();
+    history.Record(1'000, usage);
+    Require(history.Samples().size() == size_before,
+            "an older timestamp is rejected");
+    history.Record(history.Samples().back().monotonic_ms, usage);
+    Require(history.Samples().size() == size_before,
+            "an identical timestamp replaces rather than appends");
+
+    // Unavailable readings are stored as gaps, never as a measured zero.
+    history.Record(history.Samples().back().monotonic_ms + 500,
+                   gtg::sysmem::Compute(0, 0, 0, 0));
+    Require(!history.Samples().back().physical_percent &&
+                !history.Samples().back().commit_percent,
+            "unavailable reading is a gap, not 0 %");
+
+    history.Clear();
+    Require(history.Samples().empty(), "disable clears the ring immediately");
+}
+
+void TestRamPreferenceDefaultsOn() {
+    Require(gtg::settings::ResolveRamPreference(false, 0),
+            "absent preference enables the RAM record");
+    Require(gtg::settings::ResolveRamPreference(true, 1),
+            "an explicit non-zero enables it");
+    Require(!gtg::settings::ResolveRamPreference(true, 0),
+            "an explicit zero disables it");
+}
+
+void TestCompactFootprintKeepsWidthAndFpsLast() {
+    using namespace gtg::tray::compact;
+    // Five cells per row; the overlay grows downward, never sideways.
+    const auto five = ChooseFootprint(true, false, false, 2560, 1440);
+    const auto six_fps = ChooseFootprint(true, false, true, 2560, 1440);
+    const auto six_ram = ChooseFootprint(true, true, false, 2560, 1440);
+    const auto seven = ChooseFootprint(true, true, true, 2560, 1440);
+
+    Require(five.width == 388 && five.height == 88 && five.rows == 1,
+            "five cells stay one row");
+    Require(six_fps.width == 388 && six_fps.height == 142 && six_fps.rows == 2,
+            "six cells wrap to a second row");
+    Require(six_ram.width == six_fps.width && six_ram.height == six_fps.height,
+            "either sixth record gives the same footprint");
+    Require(seven.width == 388 && seven.height == 142 && seven.rows == 2,
+            "seven cells fit the same two rows");
+    Require(five.width == six_fps.width && five.width == seven.width,
+            "the compact overlay never changes width");
+
+    // Record order, and the invariant the default arrangement preserves.
+    Require(CellIndexOf(Metric::Fps, true, true) == 6, "FPS is the last cell");
+    Require(CellIndexOf(Metric::Ram, true, true) == 5, "RAM precedes FPS");
+    Require(CellIndexOf(Metric::Fps, false, true) == 5,
+            "FPS stays last without RAM");
+    Require(CellIndexOf(Metric::Ram, true, false) == 5,
+            "RAM is last when FPS is off");
 }
 
 void TestConfigValidation() {
@@ -1569,6 +1693,12 @@ int main(int argc, char** argv) {
          TestComposedFlipAmbiguousSurfacesFailClosed},
         {"FpsPreferenceDefaultsOnWithoutTouchingProtectionSettings",
          TestFpsPreferenceDefaultsOnWithoutTouchingProtectionSettings},
+        {"HostMemoryComputeBoundaries", TestHostMemoryComputeBoundaries},
+        {"HostMemoryHistoryRetentionAndClear",
+         TestHostMemoryHistoryRetentionAndClear},
+        {"RamPreferenceDefaultsOn", TestRamPreferenceDefaultsOn},
+        {"CompactFootprintKeepsWidthAndFpsLast",
+         TestCompactFootprintKeepsWidthAndFpsLast},
         {"ConfigValidation", TestConfigValidation},
         {"WorkingPowerApply", TestWorkingPowerApply},
         {"WorkingPowerFailureAndContinuity", TestWorkingPowerFailureAndContinuity},

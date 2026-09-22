@@ -45,6 +45,7 @@
 #define IDC_GPU_VBIOS                   1042
 #define IDC_RESET_TRIGGER_COUNT         1043
 #define IDC_SHOW_FPS                    1044
+#define IDC_SHOW_RAM                    1045
 #define IDM_TRAY_OPEN                   40001
 #define IDM_TRAY_REFRESH                40002
 #define IDM_TRAY_EXIT                   40003

@@ -169,6 +169,11 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     history_chart_.SetFpsHistory(show_fps_ ? &fps_history_ : nullptr);
     if (osd_ready_) osd_overlay_.SetFpsHistory(show_fps_ ? &fps_history_ : nullptr);
     if (osd_ready_) osd_overlay_.SetFpsEnabled(show_fps_);
+    show_ram_ = settings::LoadRamEnabled();
+    CheckDlgButton(IDC_SHOW_RAM, show_ram_ ? BST_CHECKED : BST_UNCHECKED);
+    history_chart_.SetRamHistory(show_ram_ ? &ram_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetRamHistory(show_ram_ ? &ram_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetRamEnabled(show_ram_);
     taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
     activate_message_ = RegisterWindowMessageW(L"GpuThermalGuard.Activate.v1");
     nvml_ready_ = nvml_.Initialize();
@@ -229,6 +234,16 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
             } else {
                 fps_observer_.SetTarget(std::nullopt);
             }
+        }
+        // Auxiliary work on the presentation thread only. Sampled on every
+        // 200 ms tick, matching the thermal telemetry rather than the 2 Hz FPS
+        // cadence, so the RAM curve spans the same window as the records it
+        // sits beside. One kernel32 call, no lock shared with protection.
+        // RefreshSnapshot() above already invalidated the chart on this tick,
+        // so this path records without asking for a second repaint.
+        if (show_ram_ && now != last_ram_sample_ms_) {
+            last_ram_sample_ms_ = now;
+            ram_history_.Record(now, sysmem::Query());
         }
     }
     return 0;
@@ -617,6 +632,24 @@ LRESULT MainDialog::OnCloseBehaviorChanged(WORD, WORD, HWND, BOOL&) {
 }
 LRESULT MainDialog::OnOsdToggle(WORD, WORD, HWND, BOOL&) {
     SetOsdVisible(IsDlgButtonChecked(IDC_OSD_ENABLED) == BST_CHECKED, true);
+    return 0;
+}
+
+LRESULT MainDialog::OnRamToggle(WORD, WORD, HWND, BOOL&) {
+    const bool enabled = IsDlgButtonChecked(IDC_SHOW_RAM) == BST_CHECKED;
+    std::wstring error;
+    if (!settings::SaveRamEnabled(enabled, error)) {
+        CheckDlgButton(IDC_SHOW_RAM, show_ram_ ? BST_CHECKED : BST_UNCHECKED);
+        logging::Warning(error);
+        return 0;
+    }
+    show_ram_ = enabled;
+    history_chart_.SetRamHistory(enabled ? &ram_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetRamHistory(enabled ? &ram_history_ : nullptr);
+    if (osd_ready_) osd_overlay_.SetRamEnabled(enabled);
+    // Disabling stops acquisition and clears the retained samples at once.
+    if (!enabled) ram_history_.Clear();
+    history_chart_.NotifyDataChanged();
     return 0;
 }
 
@@ -1401,6 +1434,7 @@ void MainDialog::ApplyLocalization() {
     SetControlText(IDC_CLOSE_TO_TRAY, text(L"[X] 隱藏到系統匣", L"[X] Hide to tray"));
     SetControlText(IDC_OSD_ENABLED, text(L"顯示 OSD", L"Show OSD"));
     SetControlText(IDC_SHOW_FPS, text(L"顯示 FPS", L"Show FPS"));
+    SetControlText(IDC_SHOW_RAM, text(L"顯示 RAM", L"Show RAM"));
     SetControlText(IDC_SAVE_SETTINGS,
                    apply_pending_ ? text(L"套用中…", L"Applying…")
                    : settings_dirty_ ? text(L"保存並套用 ●", L"Save & Apply ●")

@@ -38,6 +38,12 @@ struct TriggerTestRun {
     return !has_valid_value || value != 0;
 }
 
+// Same rule as FPS: an absent value enables the record.
+[[nodiscard]] constexpr bool ResolveRamPreference(
+    bool has_valid_value, std::uint32_t value) noexcept {
+    return !has_valid_value || value != 0;
+}
+
 [[nodiscard]] LoadResult Load();
 [[nodiscard]] bool Save(const ProtectionConfig& config, std::wstring& error);
 [[nodiscard]] bool LoadSafeLatch() noexcept;
@@ -55,6 +61,8 @@ struct TriggerTestRun {
 [[nodiscard]] bool SaveOsdPosition(int x, int y, std::wstring& error);
 [[nodiscard]] bool LoadFpsEnabled() noexcept;
 [[nodiscard]] bool SaveFpsEnabled(bool enabled, std::wstring& error);
+[[nodiscard]] bool LoadRamEnabled() noexcept;
+[[nodiscard]] bool SaveRamEnabled(bool enabled, std::wstring& error);
 [[nodiscard]] WindowPosition LoadMainWindowPosition() noexcept;
 [[nodiscard]] bool SaveMainWindowPosition(int x, int y, std::wstring& error);
 [[nodiscard]] localization::UiLanguage LoadUiLanguagePreference() noexcept;

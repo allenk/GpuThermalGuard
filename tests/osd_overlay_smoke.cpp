@@ -139,14 +139,16 @@ int main(int argc, char** argv) {
             const gtg::fps::Identity game{77, 1234};
             osd.SetFpsHistory(&fps_history);
             osd.SetFpsEnabled(true);
-            const auto check_fps_size = [&](const bool compact) {
+            const auto check_fps_size = [&](const bool compact,
+                                            const bool with_ram = false) {
                 RECT rect{};
                 GetWindowRect(osd, &rect);
                 MONITORINFO monitor_info{sizeof(monitor_info)};
                 Check(GetMonitorInfoW(MonitorFromWindow(osd, MONITOR_DEFAULTTONEAREST),
                     &monitor_info) != FALSE, "monitor work area");
                 const int dpi = static_cast<int>(GetDpiForWindow(osd));
-                const auto footprint = gtg::tray::compact::ChooseFootprint(compact, true,
+                const auto footprint = gtg::tray::compact::ChooseFootprint(
+                    compact, with_ram, true,
                     MulDiv(monitor_info.rcWork.right - monitor_info.rcWork.left, 96, dpi),
                     MulDiv(monitor_info.rcWork.bottom - monitor_info.rcWork.top, 96, dpi));
                 Check(rect.right - rect.left == MulDiv(footprint.width, dpi, 96) &&
@@ -158,6 +160,132 @@ int main(int argc, char** argv) {
             ClickToggle(osd);
             check_fps_size(true);
             screenshot("fps-compact-no-data.png");
+
+            // RAM joins as the second-from-last record. The overlay must grow
+            // downward only: its width may not change.
+            // Same 200 ms grid as the thermal telemetry above, because RAM is
+            // sampled on the same tick and must span the same window.
+            gtg::sysmem::History ram_history;
+            {
+                const auto ram_now = GetTickCount64();
+                for (unsigned i = 0; i <= 150; ++i)
+                    ram_history.Record(ram_now - 30'000 + i * 200,
+                        gtg::sysmem::Compute(
+                            128ULL << 30, (50ULL << 30) - (i << 20),
+                            160ULL << 30, (94ULL << 30) - (i << 20)));
+            }
+            RECT before_ram{};
+            GetWindowRect(osd, &before_ram);
+            osd.SetRamHistory(&ram_history);
+            osd.SetRamEnabled(true);
+            check_fps_size(true, true);
+            RECT after_ram{};
+            GetWindowRect(osd, &after_ram);
+            Check(after_ram.right - after_ram.left ==
+                      before_ram.right - before_ram.left,
+                  "enabling RAM must not change the overlay width");
+            // Six cells are 5 + 1 and seven are 5 + 2, so the seventh fills the
+            // second row that already exists and costs no extra height.
+            Check(after_ram.bottom - after_ram.top ==
+                      before_ram.bottom - before_ram.top,
+                  "the seventh cell fills the existing second row");
+            screenshot("ram-compact.png");
+            ClickToggle(osd);
+            check_fps_size(false, true);
+            screenshot("ram-expanded.png");
+
+            // Regression: a RAM history shorter than the visible window
+            // must still start where its data starts,
+            // and must never be shifted right relative to the five telemetry
+            // records that do span the window.
+            gtg::sysmem::History partial;
+            {
+                const auto ram_now = GetTickCount64();
+                for (unsigned i = 0; i < 40; ++i)
+                    partial.Record(ram_now - 20'000 + i * 500,
+                        gtg::sysmem::Compute(
+                            128ULL << 30, (50ULL << 30) - (i << 20),
+                            160ULL << 30, (94ULL << 30) - (i << 20)));
+            }
+            osd.SetRamHistory(&partial);
+            osd.RequestRefresh();
+            screenshot("ram-expanded-partial-history.png");
+            osd.SetRamHistory(&ram_history);
+
+            // Every expanded record must plot from the same left edge. The
+            // geometry used to be duplicated per call site and drifted; this
+            // measures the rendered pixels rather than trusting the constants.
+            osd.RequestRefresh();
+            screenshot("ram-expanded-aligned.png");
+            {
+                Gdiplus::Bitmap frame((output / "ram-expanded-aligned.png").c_str());
+                Check(frame.GetLastStatus() == Gdiplus::Ok, "alignment frame decodable");
+                // The axis label is painted in the record's own colour and a
+                // wide glyph such as the "%" of "CPU %" can reach the label
+                // box edge, so the scan starts at the plot area instead. No
+                // curve can legitimately begin left of that.
+                const float bitmap_scale =
+                    static_cast<float>(frame.GetWidth()) / 388.0F;
+                // Lane internals scale with the ROW HEIGHT, not the window DPI.
+                // An earlier version of this scan used the DPI scale, put its
+                // start to the right of where the telemetry curves actually
+                // begin, and reported a false pass while the lanes were
+                // visibly misaligned. Derive it the way the renderer does.
+                namespace ct = gtg::tray::compact;
+                const float height_dip =
+                    static_cast<float>(frame.GetHeight()) / bitmap_scale;
+                const float lanes =
+                    static_cast<float>(ct::CellCount(true, true));
+                const float row_height_dip =
+                    (height_dip - 31.0F) / lanes - 2.0F;
+                const float lane_scale = ct::LaneScale(row_height_dip);
+                const UINT scan_from = static_cast<UINT>(
+                    (ct::kLaneRowLeftDip +
+                     ct::kLaneGraphLeftDip * lane_scale) * bitmap_scale);
+                const auto leftmost = [&](const BYTE r, const BYTE g, const BYTE b) {
+                    int best = INT_MAX;
+                    for (UINT y = 0; y < frame.GetHeight(); ++y) {
+                        for (UINT x = scan_from; x < frame.GetWidth(); ++x) {
+                            Gdiplus::Color pixel;
+                            if (frame.GetPixel(static_cast<INT>(x),
+                                               static_cast<INT>(y), &pixel) != Gdiplus::Ok)
+                                continue;
+                            if (std::abs(static_cast<int>(pixel.GetR()) - r) < 34 &&
+                                std::abs(static_cast<int>(pixel.GetG()) - g) < 34 &&
+                                std::abs(static_cast<int>(pixel.GetB()) - b) < 34) {
+                                best = std::min(best, static_cast<int>(x));
+                                break;
+                            }
+                        }
+                    }
+                    return best;
+                };
+                const int ram_left = leftmost(255, 122, 196);
+                const int cpu_left = leftmost(183, 121, 255);
+                Check(ram_left != INT_MAX && cpu_left != INT_MAX,
+                      "the RAM and CPU curves are present");
+                std::cerr << "cpu_left=" << cpu_left
+                          << " ram_left=" << ram_left << '\n';
+                // The whole defect is this comparison: RAM must not begin
+                // further right than a telemetry record sampled on the same
+                // tick into the same window.
+                Check(ram_left - cpu_left <= 3,
+                      "RAM begins level with the telemetry records");
+                const int graph_left = static_cast<int>(scan_from);
+                // RAM used to start well right of the telemetry records.
+                // Both must reach the plot's left edge, allowing one
+                // 200 ms sampling interval of the 30 s window plus antialiasing.
+                const int tolerance =
+                    static_cast<int>(3.0F + 3.0F * bitmap_scale);
+                Check(cpu_left - graph_left <= tolerance,
+                      "a telemetry record reaches the left edge of its plot");
+                Check(ram_left - graph_left <= tolerance,
+                      "RAM reaches the left edge of its plot area");
+            }
+            ClickToggle(osd);
+            osd.SetRamEnabled(false);
+            osd.SetRamHistory(nullptr);
+            check_fps_size(true);
             const auto fps_now = GetTickCount64();
             for (unsigned i = 0; i < 60; ++i) {
                 const auto status = i >= 20 && i < 25

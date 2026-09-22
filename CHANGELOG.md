@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.0-beta.1] - 2026-09-22
+
+### Added
+
+- Optional, default-on host RAM record in the Main UI history and the expanded and compact OSD. Physical memory is the foreground reading; virtual commit is drawn behind it in a second accent so both are legible at a glance without competing. Turning the record off clears its history immediately.
+- A DPI legibility bench (`gtg_dpi_legibility_bench`) that renders the production history chart offscreen at a chosen DPI and reports base units, font sizes and lane heights.
+
+### Improved
+
+- History chart axis labels no longer truncate to an ellipsis at 100 % display scaling; the label gutter is measured rather than assumed.
+- The Main UI history area is enlarged within the existing dialog, so seven records do not read as cramped. The dialog size is unchanged.
+- RAM and FPS plots derive their geometry from the same lane definition as the thermal records, so every curve starts at the same left edge no matter how many records are shown.
+
+### Notes
+
+- Host memory is read with a single `GlobalMemoryStatusEx` call on the existing presentation tick. It adds no link-time dependency, is never read on the protection path, and is not written to the journal. Measured across 79,239 protection samples with the record enabled: no missed deadlines, no wake misses, no execution overruns.
+- Virtual commit is measured against the commit limit, which is larger than installed physical memory, so the commit reading normally sits below the physical one.
+
 ## [0.10.0-beta.1] - 2026-09-20
 
 ### Added

@@ -27,6 +27,14 @@ Protection alerts and telemetry warnings remain visible in the header. Switching
 
 Compact mode is included starting with v0.9.0-beta.2.
 
+### Optional host RAM
+
+Starting with v0.11.0-beta.1, **Show RAM** is checked by default and adds a host memory record to the dashboard, the expanded OSD and the compact OSD. Physical memory usage is the foreground reading; virtual commit is drawn behind it in a second accent, so you can see both without one competing with the other.
+
+Virtual commit is measured against the system commit limit, which is larger than installed physical memory, so the commit curve normally sits below the physical one. Turning the record off clears its history immediately.
+
+The reading comes from a single `GlobalMemoryStatusEx` call on the existing display tick. It adds no dependency, is never read on the 200 ms protection path, and is not written to the log.
+
 ### Optional game FPS
 
 Starting with v0.10.0-beta.1, **Show FPS** is checked by default and adds a separate sixth history lane to the dashboard and an FPS row/card to the OSD. It follows the current foreground app, so switching games mixes their readings on one time axis. Turning it off stops FPS observation, clears that FPS history, and leaves the five thermal histories unchanged. The FPS collector is outside the independent 200 ms protection loop.
@@ -75,6 +83,7 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 - VRAM usage percentage and GiB
 - GPU utilization
 - CPU utilization
+- optional host RAM usage, with virtual commit shown behind it
 - optional foreground-game Displayed FPS on validated DXGI paths; unavailable otherwise
 - one hour of retained telemetry with a draggable five-minute dashboard view
 - a compact, non-activating 30-second always-on-top OSD

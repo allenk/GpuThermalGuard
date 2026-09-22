@@ -247,28 +247,35 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
 
     const Gdiplus::REAL scale = graphics.GetDpiX() / 96.0F;
     const Gdiplus::REAL margin = 4.0F * scale;
-    const Gdiplus::REAL label_width = 40.0F * scale;
+    // 44, not 40: at 100 % scaling a 40 DLU gutter left a 34 px text box and
+    // truncated "GPU %" and "CPU %" to an ellipsis. Measured by the DPI bench.
+    const Gdiplus::REAL label_width = 44.0F * scale;
     const Gdiplus::REAL right_padding = 6.0F * scale;
     const Gdiplus::REAL footer_height = 25.0F * scale;
     const Gdiplus::REAL gap = 4.0F * scale;
-    const int plot_count = fps_history_ == nullptr ? 5 : 6;
+    const bool show_ram = ram_history_ != nullptr;
+    const bool show_fps = fps_history_ != nullptr;
+    const int plot_count = 5 + (show_ram ? 1 : 0) + (show_fps ? 1 : 0);
     const Gdiplus::REAL plots_height = static_cast<Gdiplus::REAL>(height) -
         margin * 2.0F - footer_height - gap * (plot_count - 1);
     const Gdiplus::REAL plot_height = std::max(16.0F, plots_height / plot_count);
     const Gdiplus::REAL plot_width = static_cast<Gdiplus::REAL>(width) -
         label_width - right_padding;
 
-    const Gdiplus::RectF temperature_plot{label_width, margin, plot_width, plot_height};
-    const Gdiplus::RectF power_plot{
-        label_width, temperature_plot.GetBottom() + gap, plot_width, plot_height};
-    const Gdiplus::RectF vram_plot{
-        label_width, power_plot.GetBottom() + gap, plot_width, plot_height};
-    const Gdiplus::RectF gpu_plot{
-        label_width, vram_plot.GetBottom() + gap, plot_width, plot_height};
-    const Gdiplus::RectF cpu_plot{
-        label_width, gpu_plot.GetBottom() + gap, plot_width, plot_height};
-    const Gdiplus::RectF fps_plot{
-        label_width, cpu_plot.GetBottom() + gap, plot_width, plot_height};
+    // Records are allocated in order. RAM is second from last and FPS last.
+    Gdiplus::REAL next_plot_y = margin;
+    const auto take_lane = [&]() {
+        const Gdiplus::RectF lane{label_width, next_plot_y, plot_width, plot_height};
+        next_plot_y = lane.GetBottom() + gap;
+        return lane;
+    };
+    const Gdiplus::RectF temperature_plot = take_lane();
+    const Gdiplus::RectF power_plot = take_lane();
+    const Gdiplus::RectF vram_plot = take_lane();
+    const Gdiplus::RectF gpu_plot = take_lane();
+    const Gdiplus::RectF cpu_plot = take_lane();
+    const Gdiplus::RectF ram_plot = show_ram ? take_lane() : Gdiplus::RectF{};
+    const Gdiplus::RectF fps_plot = show_fps ? take_lane() : Gdiplus::RectF{};
 
     Gdiplus::FontFamily font_family(L"Segoe UI");
     Gdiplus::Font label_font(&font_family, 7.7F, Gdiplus::FontStyleRegular,
@@ -285,11 +292,15 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     const Gdiplus::Color gpu_color(255, 36, 153, 95);
     const Gdiplus::Color cpu_color(255, 132, 82, 190);
     const Gdiplus::Color fps_color(255, 40, 165, 160);
+    // Physical RAM leads in magenta; Virtual Commit follows in dark yellow.
+    // The two are overlaid, never stacked: their denominators differ.
+    const Gdiplus::Color ram_color(255, 198, 58, 140);
+    const Gdiplus::Color commit_color(255, 186, 148, 0);
     Gdiplus::SolidBrush plot_brush(plot_background);
     Gdiplus::Pen border_pen(border_color, 1.0F);
     Gdiplus::Pen grid_pen(grid_color, 0.7F);
 
-    for (const auto& plot : {temperature_plot, power_plot, vram_plot, gpu_plot, cpu_plot}) {
+    const auto draw_lane_frame = [&](const Gdiplus::RectF& plot) {
         Gdiplus::GraphicsPath rounded;
         AddRoundedRectangle(rounded, plot, 3.5F * scale);
         graphics.FillPath(&plot_brush, &rounded);
@@ -300,23 +311,11 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         }
         graphics.DrawLine(&grid_pen, plot.X + 1.0F, plot.Y + plot.Height / 2.0F,
                           plot.GetRight() - 1.0F, plot.Y + plot.Height / 2.0F);
-    }
-    if (fps_history_ != nullptr) {
-        Gdiplus::GraphicsPath rounded;
-        AddRoundedRectangle(rounded, fps_plot, 3.5F * scale);
-        graphics.FillPath(&plot_brush, &rounded);
-        graphics.DrawPath(&border_pen, &rounded);
-        for (int i = 1; i < 4; ++i) {
-            const Gdiplus::REAL x = fps_plot.X +
-                fps_plot.Width * static_cast<Gdiplus::REAL>(i) / 4.0F;
-            graphics.DrawLine(&grid_pen, x, fps_plot.Y + 1.0F,
-                              x, fps_plot.GetBottom() - 1.0F);
-        }
-        graphics.DrawLine(&grid_pen, fps_plot.X + 1.0F,
-                          fps_plot.Y + fps_plot.Height / 2.0F,
-                          fps_plot.GetRight() - 1.0F,
-                          fps_plot.Y + fps_plot.Height / 2.0F);
-    }
+    };
+    for (const auto& plot : {temperature_plot, power_plot, vram_plot, gpu_plot, cpu_plot})
+        draw_lane_frame(plot);
+    if (show_ram) draw_lane_frame(ram_plot);
+    if (show_fps) draw_lane_frame(fps_plot);
 
     const auto draw_axis_label = [&](const std::wstring& label,
                                      const Gdiplus::RectF& plot,
@@ -332,7 +331,8 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     draw_axis_label(L"VRAM", vram_plot, vram_color);
     draw_axis_label(L"GPU %", gpu_plot, gpu_color);
     draw_axis_label(L"CPU %", cpu_plot, cpu_color);
-    if (fps_history_ != nullptr) draw_axis_label(L"FPS", fps_plot, fps_color);
+    if (show_ram) draw_axis_label(L"RAM", ram_plot, ram_color);
+    if (show_fps) draw_axis_label(L"FPS", fps_plot, fps_color);
 
     const std::uint64_t live_now = GetTickCount64();
     const std::uint64_t view_end = EffectiveViewEnd(live_now);
@@ -454,6 +454,32 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     draw_series(vram_plot, collect_segments(Series::Vram), vram_color);
     draw_series(gpu_plot, collect_segments(Series::Gpu), gpu_color);
     draw_series(cpu_plot, collect_segments(Series::Cpu), cpu_color);
+    if (show_ram) {
+        // Two overlaid series on the shared 0-100 % axis. Commit is drawn
+        // first so physical RAM always reads as the record's subject; an
+        // unavailable reading breaks the segment rather than dropping to 0 %.
+        const auto collect_memory = [&](const bool commit) {
+            std::vector<std::vector<Gdiplus::PointF>> segments;
+            std::vector<Gdiplus::PointF> current;
+            for (const auto& sample : ram_history_->Samples()) {
+                if (sample.monotonic_ms < visible_start ||
+                    sample.monotonic_ms > view_end) continue;
+                const auto value = commit ? sample.commit_percent
+                                          : sample.physical_percent;
+                if (!value) {
+                    if (!current.empty()) segments.push_back(std::move(current));
+                    current.clear();
+                    continue;
+                }
+                current.push_back({x_for(sample.monotonic_ms),
+                                   y_for(ram_plot, *value, 0.0, 100.0)});
+            }
+            if (!current.empty()) segments.push_back(std::move(current));
+            return segments;
+        };
+        draw_series(ram_plot, collect_memory(true), commit_color);
+        draw_series(ram_plot, collect_memory(false), ram_color);
+    }
     if (fps_history_ != nullptr) {
         double fps_max = 60.0;
         for (const auto& sample : fps_history_->Samples()) {
