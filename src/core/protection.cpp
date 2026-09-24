@@ -7,8 +7,18 @@
 namespace gtg {
 
 bool ProtectionController::UpdateWorkingConfig(const ProtectionConfig& config) {
-    if (safe_latched_ || state_ != ProtectionState::Armed || ValidateConfig(config)) return false;
+    // MonitorOnly joins Armed as a state a reader can reconfigure from: it is
+    // where a fresh install begins, so refusing it would make the first
+    // configuration the one setting that cannot be applied.
+    if (safe_latched_ ||
+        (state_ != ProtectionState::Armed &&
+         state_ != ProtectionState::MonitorOnly) ||
+        ValidateConfig(config)) {
+        return false;
+    }
     config_ = config;
+    state_ = IsMonitorOnly(config_) ? ProtectionState::MonitorOnly
+                                    : ProtectionState::Armed;
     return true;
 }
 
@@ -19,8 +29,11 @@ std::optional<std::string> ValidateConfig(const ProtectionConfig& config) {
     if (config.safe_power_w <= 0) {
         return "safe power must be positive";
     }
-    if (config.safe_power_w >= config.normal_power_w) {
-        return "safe power must be lower than normal power";
+    // Equal is legal and means monitor-only: nothing to give up, so nothing is
+    // ever written. Higher is not, because a "safe" power above the working
+    // limit could only ever raise the card on a trip.
+    if (config.safe_power_w > config.normal_power_w) {
+        return "safe power must not exceed normal power";
     }
     if (config.trigger_temperature_c < 40 || config.trigger_temperature_c > 100) {
         return "trigger temperature must be between 40 and 100 C";
@@ -54,6 +67,8 @@ ProtectionController::ProtectionController(ProtectionConfig config)
     : config_(std::move(config)) {
     if (const auto error = ValidateConfig(config_); error.has_value()) {
         state_ = ProtectionState::Fault;
+    } else if (IsMonitorOnly(config_)) {
+        state_ = ProtectionState::MonitorOnly;
     }
 }
 
@@ -141,7 +156,11 @@ ProtectionDecision ProtectionController::ObserveTemperature(
     const std::int64_t monotonic_ms,
     const int temperature_c,
     const std::int64_t scheduler_delay_ms) {
-    if (state_ == ProtectionState::Fault) {
+    // MonitorOnly leaves by the same door as Fault, for the opposite reason:
+    // not that the guard cannot act, but that there is nothing for it to do.
+    // Every path below this line ends in a power write.
+    if (state_ == ProtectionState::Fault ||
+        state_ == ProtectionState::MonitorOnly) {
         return CurrentDecision();
     }
 
@@ -218,7 +237,11 @@ ProtectionDecision ProtectionController::ObserveTemperature(
 
 ProtectionDecision ProtectionController::SensorUnavailable(
     const std::int64_t monotonic_ms) {
-    if (state_ == ProtectionState::Fault) {
+    // MonitorOnly leaves by the same door as Fault, for the opposite reason:
+    // not that the guard cannot act, but that there is nothing for it to do.
+    // Every path below this line ends in a power write.
+    if (state_ == ProtectionState::Fault ||
+        state_ == ProtectionState::MonitorOnly) {
         return CurrentDecision();
     }
 
@@ -249,6 +272,14 @@ ProtectionDecision ProtectionController::SensorRecovered() {
     ResetPredictor();
     recovery_since_ms_.reset();
 
+    // A recovered sensor normally means "put the working limit back". With no
+    // headroom there is no limit of ours to put back, and writing the number
+    // the card already holds would be a power action taken by a guard that
+    // was configured not to take any.
+    if (state_ == ProtectionState::MonitorOnly) {
+        return CurrentDecision();
+    }
+
     auto decision = CurrentDecision();
     if (safe_latched_) {
         state_ = ProtectionState::SafeLatched;
@@ -263,6 +294,15 @@ ProtectionDecision ProtectionController::SensorRecovered() {
 }
 
 ProtectionDecision ProtectionController::RestorePersistedSafeLatch() {
+    // A latch persisted by an earlier configuration that had a safe power, read
+    // back under one that does not. Its subject no longer exists: there is no
+    // reduced limit to hold, and re-applying `safe == normal` would report the
+    // card as protected while writing nothing. The latch is dropped rather
+    // than honoured, and the reader is told by the status line, which cannot
+    // say `armed` in this state.
+    if (state_ == ProtectionState::MonitorOnly) {
+        return CurrentDecision();
+    }
     safe_latched_ = true;
     state_ = ProtectionState::SafeLatched;
     recovery_since_ms_.reset();
@@ -302,6 +342,7 @@ ProtectionDecision ProtectionController::RequestRestore(
 const char* ToString(const ProtectionState state) noexcept {
     switch (state) {
         case ProtectionState::Armed: return "Armed";
+        case ProtectionState::MonitorOnly: return "MonitorOnly";
         case ProtectionState::PreTrip: return "PreTrip";
         case ProtectionState::SafeLatched: return "SafeLatched";
         case ProtectionState::ReadyToRestore: return "ReadyToRestore";

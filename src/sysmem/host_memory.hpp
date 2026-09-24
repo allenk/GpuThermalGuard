@@ -79,6 +79,41 @@ constexpr std::optional<double> UsedGib(const std::uint64_t total,
                    status.ullTotalPageFile, status.ullAvailPageFile);
 }
 
+// Windows' own opinion of whether physical memory is running low.
+//
+// This is the signal, not a threshold of ours: the kernel raises it using
+// rules that account for far more than a percentage, and a tool inventing its
+// own cutoff would disagree with the operating system in front of the reader.
+// Querying is documented as non-blocking, so it costs nothing to sample it on
+// the presentation tick that is already running.
+//
+// The handle is owned for the life of the object. A failure to create one
+// leaves the signal permanently false, which is the correct degradation: no
+// warning is better than a warning that cannot be trusted.
+class LowMemorySignal final {
+public:
+    LowMemorySignal() noexcept
+        : handle_(CreateMemoryResourceNotification(LowMemoryResourceNotification)) {}
+    ~LowMemorySignal() { if (handle_ != nullptr) CloseHandle(handle_); }
+
+    LowMemorySignal(const LowMemorySignal&) = delete;
+    LowMemorySignal& operator=(const LowMemorySignal&) = delete;
+    LowMemorySignal(LowMemorySignal&&) = delete;
+    LowMemorySignal& operator=(LowMemorySignal&&) = delete;
+
+    [[nodiscard]] bool Available() const noexcept { return handle_ != nullptr; }
+
+    [[nodiscard]] bool Low() const noexcept {
+        if (handle_ == nullptr) return false;
+        BOOL state = FALSE;
+        if (QueryMemoryResourceNotification(handle_, &state) == FALSE) return false;
+        return state != FALSE;
+    }
+
+private:
+    HANDLE handle_{};
+};
+
 struct HistorySample {
     std::uint64_t monotonic_ms{};
     // Percentages only. The GiB figures are a live readout and are not stored.

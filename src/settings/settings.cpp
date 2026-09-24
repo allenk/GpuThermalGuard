@@ -287,10 +287,13 @@ OsdPreference LoadOsdPreference() noexcept {
     DWORD type = 0;
     DWORD enabled = 0;
     DWORD size = sizeof(enabled);
-    if (RegQueryValueExW(key, L"OsdEnabled", nullptr, &type,
-            reinterpret_cast<BYTE*>(&enabled), &size) == ERROR_SUCCESS && type == REG_DWORD) {
-        result.enabled = enabled != 0;
-    }
+    const bool has_value =
+        RegQueryValueExW(key, L"OsdEnabled", nullptr, &type,
+            reinterpret_cast<BYTE*>(&enabled), &size) == ERROR_SUCCESS &&
+        type == REG_DWORD;
+    result.enabled = ResolveOsdPreference(has_value, enabled);
+    int collapsed = 0;
+    result.collapsed = ReadDword(key, L"OsdCollapsed", collapsed) && collapsed != 0;
     result.has_position = ReadSignedDword(key, L"OsdX", result.x) &&
                           ReadSignedDword(key, L"OsdY", result.y);
     RegCloseKey(key);
@@ -301,6 +304,14 @@ bool SaveOsdEnabled(const bool enabled, std::wstring& error) {
     HKEY key = nullptr;
     if (!OpenUserSettingsForWrite(key, error)) return false;
     const bool success = WriteDword(key, L"OsdEnabled", enabled ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
+bool SaveOsdCollapsed(const bool collapsed, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"OsdCollapsed", collapsed ? 1 : 0, error);
     RegCloseKey(key);
     return success;
 }
@@ -354,6 +365,31 @@ bool SaveRamEnabled(const bool enabled, std::wstring& error) {
     HKEY key = nullptr;
     if (!OpenUserSettingsForWrite(key, error)) return false;
     const bool success = WriteDword(key, L"ShowRam", enabled ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
+bool LoadNetEnabled() noexcept {
+    HKEY key = nullptr;
+    // Absent means on, so an unreadable key is on too: the same answer RAM and
+    // FPS give, and for the same reason -- a reader who has never touched the
+    // setting should see the record, not have to find it.
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return true;
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const bool valid = RegQueryValueExW(key, L"ShowNet", nullptr, &type,
+        reinterpret_cast<BYTE*>(&value), &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value);
+    RegCloseKey(key);
+    return valid ? value != 0 : true;
+}
+
+bool SaveNetEnabled(const bool enabled, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"ShowNet", enabled ? 1 : 0, error);
     RegCloseKey(key);
     return success;
 }

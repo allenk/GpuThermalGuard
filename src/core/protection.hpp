@@ -24,8 +24,20 @@ struct ProtectionConfig {
 
 [[nodiscard]] std::optional<std::string> ValidateConfig(const ProtectionConfig& config);
 
+// A valid configuration with no headroom. Asked of a config; `HasHeadroom` in
+// core/power_envelope.hpp asks the same question of a card.
+[[nodiscard]] constexpr bool IsMonitorOnly(const ProtectionConfig& config) noexcept {
+    return config.safe_power_w == config.normal_power_w;
+}
+
 enum class ProtectionState {
     Armed,
+    // Configured with no power to give up: safe == normal. The guard watches
+    // and records, and never writes. This is a destination, not a fault --
+    // a reader who installed this for the compact dashboard and nothing else
+    // is in it deliberately -- but it must never be reported as `Armed`,
+    // because what it does when the card gets hot is nothing.
+    MonitorOnly,
     PreTrip,
     SafeLatched,
     ReadyToRestore,

@@ -11,21 +11,28 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 ## Screenshots
 
-| Main dashboard, seven history records | Expanded OSD, arranged by the reader |
+| Main dashboard, eight history records | Expanded OSD, arranged by the reader |
 | --- | --- |
-| ![GpuThermalGuard dashboard with temperature, power, VRAM, GPU, CPU, RAM and FPS history](docs/images/dashboard.png) | ![Expanded OSD showing seven metric rows in a custom order](docs/images/osd.png) |
+| ![GpuThermalGuard dashboard with temperature, power, VRAM, GPU, CPU, RAM, network and FPS history](docs/images/dashboard.png) | ![Expanded OSD showing eight metric rows: temperature, power, VRAM, GPU, CPU, RAM, network and FPS](docs/images/osd.png) |
 
 Screenshots show one workstation's settings, not recommended limits for every GPU.
 
+A one-minute walkthrough of this release -- rearranging the compact dashboard between one row, two rows and a single column, releasing host memory, and reading the network -- is on
+[YouTube](https://www.youtube.com/watch?v=qqzzCrphDic).
+
 ### Compact OSD
 
-![Compact OSD, one row of seven live metrics with 30-second miniature trends](docs/images/osd-compact.png)
+![Compact OSD, one row of eight live metrics with 30-second miniature trends](docs/images/osd-compact.png)
 
 Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode shows each record as a small card with a live value and a 30-second miniature trend. **Show RAM** and **Show FPS** each add a card; unchecking one returns the layout to the records that remain.
 
 By default every enabled record sits on one row, so the OSD grows sideways with the record count rather than getting taller. You can also arrange it into two rows:
 
-![The same compact OSD arranged into two rows, five cards above and two below](docs/images/osd-compact-two-rows.png)
+![The same compact OSD arranged into two rows of four cards](docs/images/osd-compact-two-rows.png)
+
+Or into a single column, which suits a screen edge:
+
+<img src="docs/images/osd-compact-column.png" alt="The same eight records as one vertical column of cards" width="164">
 
 Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Drag the header outside the buttons to move the OSD; restart returns to the expanded view.
 
@@ -43,7 +50,7 @@ Unlocked, press a card and release it where you want it:
 - release it below the row to move it into a second row,
 - release it on the first row to bring it back up.
 
-The first row keeps at least five cards, so five records are always a single row. The expanded OSD follows the same order. The arrangement is remembered between runs, and **Reset OSD layout** in the tray menu restores the default.
+Any row can hold a single card, so the whole dashboard can be one column. The expanded OSD follows the same order. The arrangement is remembered between runs, and **Reset OSD layout** in the tray menu restores the default.
 
 The lock governs the cards only. The OSD itself still moves by its top bar whether locked or not.
 
@@ -54,6 +61,45 @@ Starting with v0.11.0-beta.1, **Show RAM** is checked by default and adds a host
 Virtual commit is measured against the system commit limit, which is larger than installed physical memory, so the commit curve normally sits below the physical one. Turning the record off clears its history immediately.
 
 The reading comes from a single `GlobalMemoryStatusEx` call on the existing display tick. It adds no dependency, is never read on the 200 ms protection path, and is not written to the log.
+
+### Releasing host memory
+
+![Double-clicking the RAM card: the card fills with falling blocks while the work runs, then reports the memory released](docs/images/osd-ram-reclaim.gif)
+
+Starting with v0.12.0, double-clicking the RAM card on a locked compact dashboard asks Windows to trim working sets and release the standby list, then reports how much host memory came back. The card animates while the work runs on its own thread -- the animation is not a progress bar, because how long a trim takes is set by the processes being trimmed, and it is there to show that the message loop is not blocked.
+
+Nothing pops up and nothing takes focus, so it is safe to use with a game in front. If the machine moved less than the noise floor, the card says so rather than claiming a gain. The action requires the dashboard to be locked: unlocked is arrange mode, and a drag and an action must not compete for the same gesture.
+
+This is a user-initiated action on other processes, so each run is written to the log.
+
+### Optional network throughput
+
+Starting with v0.12.0, **Show Net** is checked by default and adds a network record. One card carries both directions as two curves with a translucent fill: receive above, transmit below.
+
+The interface is the one the default route uses, re-checked every three seconds, so a VPN coming up or a cable being unplugged follows the traffic rather than a name chosen at startup. Counters come from `GetIfEntry2` on the existing display tick, and a reading is refused rather than guessed whenever it cannot be trusted: a counter that went backwards, a gap longer than five seconds, an interface that changed underneath, or a rate above what the link can carry.
+
+Both directions are shown in **MB/s** at every magnitude. A unit that changes with the value is unreadable at this size -- the eye reads the number, not the suffix, and 800 KB/s beside 12 MB/s looks larger than it is.
+
+### A verdict on the network path
+
+![Double-clicking the NET card: the card fills with falling blocks while the measurement runs, then reports what it found](docs/images/osd-net-verdict.gif)
+
+Double-clicking the NET card measures the foreground program's TCP connections and reports a verdict: a latency in milliseconds, a colour, and a three-bar mark.
+
+The recording above is a real run against a game, and it ends in `--` -- connections were watched, but none of them carried enough traffic during the window to measure. That is the honest outcome for a game that plays over UDP, and it is shown here rather than a flattering one, because the gesture is worth knowing about and the result is not guaranteed to be useful.
+
+Every figure comes from counters the Windows TCP stack already keeps for those connections -- round-trip time, its variance, retransmissions, duplicate acknowledgements, timeouts. Nothing is sent, opened or resolved in order to time it, and the connections measured are only those belonging to the program in front of you.
+
+**What it does not claim.** The action also discards the cached path state and re-resolves the next hop. That was measured against a control and found to be below the noise, so it is offered as an attempt and never reported as an improvement. The verdict is the part that is promised: when nothing improves, you still learn something true about your connection.
+
+Two limits worth knowing before you read a verdict:
+
+- **TCP only.** Windows keeps no per-connection statistics for UDP, and many games use UDP for gameplay. Such a game will report `no TCP` rather than a verdict.
+- **IPv4 only** in this release.
+
+When there is no verdict the card says which reason: `no TCP` when the program holds no established IPv4 TCP connection, `no app` when there is nothing in the foreground to ask about, `denied` when the statistics were refused, `--` when connections were watched but none carried enough traffic to measure.
+
+The verdict is the worst of the connections measured, never the average -- a game with one healthy connection and one that is timing out is not half fine. That rule is right for a game, which holds a few connections all to its server, and pessimistic for a browser holding a crowd of unrelated ones.
 
 ### Optional game FPS
 
@@ -104,6 +150,7 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 - GPU utilization
 - CPU utilization
 - optional host RAM usage, with virtual commit shown behind it
+- optional network throughput on the default-route interface, both directions in one card
 - optional foreground-game Displayed FPS on validated DXGI paths; unavailable otherwise
 - one hour of retained telemetry with a draggable five-minute dashboard view
 - a compact, non-activating 30-second always-on-top OSD
@@ -121,6 +168,18 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 The lifetime trip total persists across restarts, manual/automatic restore, and **Save & Apply**. Use **Reset** beside **Run trips** to begin a new test session without interrupting protection or changing the lifetime total.
 
 **Working Limit (W)** is the operating power ceiling. **Save & Apply** requests that limit through the protection worker only when its safety checks permit it; a latched or hot GPU is not forced back to working power. Starting the application does not submit an Apply request. Unapplied edits are highlighted; inspect the displayed current limit and status for the verified result.
+
+### First run: monitoring only, until you choose otherwise
+
+Starting with v0.12.0 the initial power settings are read from the card instead of being constants. A 350 W default is unwritable on a 320 W board and is a 42% cut on a 600 W one, so on first run:
+
+- **Working Limit** is the limit already in force. Deriving it from the card's default would *raise* the limit of anyone who had deliberately lowered it, without being asked.
+- **Safe Power** is the lower of the card's default limit and its current one.
+- **Trigger Temp** is one degree below the GPU's own slowdown threshold, as the driver reports it.
+
+On a card nobody has touched, working and safe come out equal -- and equal limits mean there is nothing to drop to, so GpuThermalGuard **monitors and does not protect**. That is deliberate: the alternative is a tool that silently starts cutting power on a machine whose owner never chose a safe limit. A message on first run says so, and the status line reads *Monitoring at 200 ms; set a Safe Power to enable protection* until you set a safe power below your working limit and apply it.
+
+Both values are clamped into the range the card itself reports, so a limit the hardware would reject cannot be entered.
 
 Restore failures retain the latch and attempt a verified safe-power fallback. Automatic recovery is bounded to three attempts per latch, at least five seconds apart and still subject to fresh cooling checks; permanent errors stop retries early. The log records write/readback evidence. Manual restore remains available.
 

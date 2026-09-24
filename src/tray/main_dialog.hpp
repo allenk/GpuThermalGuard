@@ -6,12 +6,15 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <atomic>
+#include <thread>
 
 #include <atlbase.h>
 #include <atlapp.h>
 #include <atlwin.h>
 #include <atldlgs.h>
 
+#include "core/power_envelope.hpp"
 #include "core/protection.hpp"
 #include "core/restore_prompt_gate.hpp"
 #include "core/restore_policy.hpp"
@@ -25,7 +28,10 @@
 #include "protection/local_protection_worker.hpp"
 #include "fps/dxgi_observer.hpp"
 #include "fps/fps_history.hpp"
+#include "net/history.hpp"
+#include "net/throughput_win32.hpp"
 #include "sysmem/host_memory.hpp"
+#include "sysmem/reclaim_nt.hpp"
 
 namespace gtg::tray {
 
@@ -39,6 +45,7 @@ public:
         MESSAGE_HANDLER(WM_TIMER, OnTimer)
         MESSAGE_HANDLER(WM_CLOSE, OnClose)
         MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+        MESSAGE_HANDLER(kDeepCleanDoneMessage, OnDeepCleanDone)
         MESSAGE_HANDLER(WM_THEMECHANGED, OnThemeChanged)
         MESSAGE_HANDLER(WM_DPICHANGED, OnDpiChanged)
         MESSAGE_HANDLER(WM_DISPLAYCHANGE, OnDisplayConfigurationChanged)
@@ -59,6 +66,7 @@ public:
         COMMAND_HANDLER(IDC_OSD_ENABLED, BN_CLICKED, OnOsdToggle)
         COMMAND_HANDLER(IDC_SHOW_FPS, BN_CLICKED, OnFpsToggle)
         COMMAND_HANDLER(IDC_SHOW_RAM, BN_CLICKED, OnRamToggle)
+        COMMAND_HANDLER(IDC_SHOW_NET, BN_CLICKED, OnNetToggle)
         COMMAND_HANDLER(IDC_LANGUAGE, CBN_SELCHANGE, OnLanguageChanged)
         COMMAND_HANDLER(IDC_NORMAL_POWER, EN_CHANGE, OnProtectionSettingChanged)
         COMMAND_HANDLER(IDC_SAFE_POWER, EN_CHANGE, OnProtectionSettingChanged)
@@ -72,6 +80,7 @@ public:
         COMMAND_ID_HANDLER(IDM_TRAY_TOGGLE_OSD, OnTrayToggleOsd)
         COMMAND_ID_HANDLER(IDM_TRAY_CAPTURE_SNAPSHOT, OnManualSnapshot)
         COMMAND_ID_HANDLER(IDM_TRAY_RESET_OSD_LAYOUT, OnResetOsdLayout)
+        COMMAND_ID_HANDLER(IDM_TRAY_DEEP_MEMORY_CLEAN, OnDeepMemoryClean)
         COMMAND_ID_HANDLER(IDM_TRAY_EXIT, OnTrayExit)
     END_MSG_MAP()
 
@@ -90,6 +99,39 @@ private:
     static constexpr UINT kCaptureSnapshotMessage = WM_APP + 45;
     static constexpr UINT kReloadSnapshotIconMessage = WM_APP + 46;
     static constexpr UINT kRepairMainPlacementMessage = WM_APP + 47;
+    static constexpr UINT kDeepCleanDoneMessage = WM_APP + 48;
+
+    // Every message this window posts to itself, checked for collisions at
+    // compile time.
+    //
+    // This is not hypothetical tidiness. `kDeepCleanDoneMessage` was added at
+    // WM_APP + 47, which `kRepairMainPlacementMessage` already held, and ATL's
+    // message map takes the first matching entry -- so every display or DPI
+    // change was delivered to `OnDeepCleanDone`, which read a value-initialised
+    // status (the first enumerator, `Succeeded`) and announced that the system
+    // had been asked to do a deep clean. The reader had asked for nothing; a
+    // monitor had woken up. The placement repair the message was for never ran
+    // at all, which is why the main window stopped re-fitting itself after a
+    // layout change.
+    //
+    // A duplicate number is invisible to the compiler and produces a dialog
+    // claiming a system-wide operation nobody requested, which is the worst
+    // shape of wrong this program has. So it is now impossible to add one.
+public:
+    static constexpr UINT kSelfMessages[]{
+        kTrayMessage,       kInitializeTrayMessage, kVerifyTrayMessage,
+        kCaptureSnapshotMessage, kReloadSnapshotIconMessage,
+        kRepairMainPlacementMessage, kDeepCleanDoneMessage,
+    };
+    [[nodiscard]] static constexpr bool MessagesAreDistinct() noexcept {
+        for (std::size_t i = 0; i < std::size(kSelfMessages); ++i)
+            for (std::size_t j = i + 1; j < std::size(kSelfMessages); ++j)
+                if (kSelfMessages[i] == kSelfMessages[j]) return false;
+        return true;
+    }
+    // The assertion itself lives in main_dialog.cpp: inside the class body the
+    // class is still incomplete and the array cannot be read as a constant.
+private:
     static constexpr UINT_PTR kRefreshTimer = 1;
     static constexpr UINT kRefreshIntervalMs = 200;
 
@@ -116,7 +158,10 @@ private:
     LRESULT OnOsdToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnFpsToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnRamToggle(WORD, WORD, HWND, BOOL&);
+    LRESULT OnNetToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnResetOsdLayout(WORD, WORD, HWND, BOOL&);
+    LRESULT OnDeepMemoryClean(WORD, WORD, HWND, BOOL&);
+    LRESULT OnDeepCleanDone(UINT, WPARAM, LPARAM, BOOL&);
     void PersistCompactArrangement();
     LRESULT OnLanguageChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnProtectionSettingChanged(WORD, WORD, HWND, BOOL&);
@@ -137,6 +182,7 @@ private:
     void RefreshSnapshot();
     void RenderUnavailable(const std::wstring& status);
     void RenderSnapshot(const nvml::DeviceSnapshot& snapshot);
+    void ApplyFirstRunDefaults(const nvml::DeviceSnapshot& snapshot);
     void HandleLocalProtection();
     void PollApplyCompletion();
     void JournalSnapshot(const nvml::DeviceSnapshot& snapshot,
@@ -163,6 +209,21 @@ private:
     telemetry::History telemetry_history_;
     fps::History fps_history_;
     sysmem::History ram_history_;
+    net::History net_history_;
+    // Opened only while the record is shown: an adapter nobody is
+    // looking at is a module handle and a route lookup for nothing.
+    net::Sampler net_sampler_;
+    // Created once and queried on the presentation tick; the query is
+    // documented as non-blocking.
+    sysmem::LowMemorySignal low_memory_signal_;
+    // Deep Memory Clean runs off the message loop. Doing it inline froze the
+    // UI for as long as the call took, which the owner saw immediately.
+    std::thread deep_clean_worker_;
+    std::atomic<bool> deep_clean_running_{false};
+    sysmem::reclaim::nt::Status deep_clean_status_{};
+    // How long the request took. Not how long the reclaim takes: the call
+    // only asks the memory manager to start.
+    std::uint64_t deep_clean_elapsed_ms_{};
     std::uint32_t saved_compact_layout_{};
     bool saved_compact_locked_{true};
     HistoryChart history_chart_;
@@ -178,6 +239,9 @@ private:
     bool show_fps_{true};
     bool show_ram_{true};
     std::uint64_t last_ram_sample_ms_{};
+    // Off unless asked for; see settings::LoadNetEnabled.
+    bool show_net_{false};
+    std::uint64_t last_net_sample_ms_{};
     std::uint64_t last_fps_refresh_ms_{};
     std::uint64_t last_tray_add_attempt_ms_{0};
     UINT current_tray_icon_id_{0};
@@ -199,9 +263,15 @@ private:
     bool settings_dirty_{false};
     bool apply_pending_{false};
     bool settings_unsaved_{false};
+    // First run means "no stored settings", which until now was
+    // indistinguishable from a configured install because LoadResult::loaded
+    // was read and then discarded.
+    bool first_run_{false};
+    bool first_run_defaults_applied_{false};
     std::optional<unsigned int> minimum_power_limit_mw_;
     std::optional<unsigned int> maximum_power_limit_mw_;
     std::optional<unsigned int> gpu_max_temperature_c_;
+    std::optional<unsigned int> gpu_slowdown_temperature_c_;
     std::optional<std::uint64_t> previous_cpu_idle_;
     std::optional<std::uint64_t> previous_cpu_kernel_;
     std::optional<std::uint64_t> previous_cpu_user_;

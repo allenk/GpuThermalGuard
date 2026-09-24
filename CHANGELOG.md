@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-25
+
+### Added
+
+- Optional, default-on network record. One card carries both directions as two curves with a translucent fill, on the interface the default route actually uses, re-checked every three seconds so a VPN or an unplugged cable follows the traffic rather than a name chosen at startup. Counters come from `GetIfEntry2` on the existing presentation tick.
+- A verdict on the network path, on demand. Double-clicking the NET card measures the foreground program's TCP connections and reports a latency, a colour and a three-bar mark, built entirely from counters the Windows TCP stack already keeps -- round-trip time, its variance, retransmissions, duplicate acknowledgements, timeouts. Nothing is sent, opened or resolved in order to time it.
+- Releasing host memory, on demand. Double-clicking the RAM card on a locked compact dashboard trims working sets and releases the standby list, then reports how much came back. It runs on its own thread, takes no focus and pops nothing up, so it is usable with a game in front.
+- Device-derived initial power settings. Working Limit starts at the limit already in force, Safe Power at the lower of the card's default and current limits, and Trigger Temp one degree below the GPU's own slowdown threshold. Both power values are clamped into the range the card reports.
+- Monitor-only state. Equal working and safe limits mean there is nothing to drop to, so the tool monitors without protecting and says so, rather than starting to cut power on a machine whose owner never chose a safe limit. A message on first run explains the setting that is needed.
+- Single-column compact dashboard. Any row may hold one card, so the whole dashboard can be a vertical strip against a screen edge. At one column the logo gives way and the status dot moves left.
+- The compact/expanded choice is remembered between runs.
+
+### Improved
+
+- Dropping a card between two vertically adjacent cards inserts a new row there, instead of only at the bottom.
+- Dropping a card almost exactly onto another swaps the two, instead of inserting to its right.
+- A lane's value box is no longer a constant scaled by a vertical ratio, so adding a record cannot narrow it. `349.5 W (350 W)` on a 350 W card used to be cut to `349.5 W (350...`; a figure that has been cut is a different figure.
+- Both network directions are shown in a single fixed unit at every magnitude. A unit that changes with the value is unreadable in a card this size.
+- The lock and chevron in the compact header sit closer together, and the drag strip is centred under them.
+- A dragged NET card carries its label; it was blank.
+
+### Notes
+
+- The README shows the network action running against a real game and ending in `--`: connections were watched, none carried enough traffic in the window to measure. That is the honest outcome for a game that plays over UDP, and it is the one published, because the gesture is worth knowing about and the result is not guaranteed to be useful.
+- **The verdict does not claim the attempt helped.** The action also discards the cached path state and re-resolves the next hop; that was measured against a control and found to be below the noise, so it is offered as an attempt and never reported as an improvement. What is promised is the reading.
+- The path measurement is **TCP only** -- Windows keeps no per-connection statistics for UDP, so a game whose gameplay is UDP reports `no TCP` rather than a verdict -- and **IPv4 only** in this release. Extended TCP statistics require Administrator, which this application already runs as.
+- Extended statistics are enabled only on the foreground program's own connections, only while a verdict is being taken, and are never disabled again, per Microsoft's guidance that disabling them would disrupt any other monitor watching the same connection.
+- The verdict is the worst of the connections measured, never the average. That is right for a game, which holds a few connections all to its server, and pessimistic for a browser holding a crowd of unrelated ones.
+- A network reading is refused rather than guessed whenever it cannot be trusted: a counter that went backwards, a gap longer than five seconds, an interface that changed underneath, or a rate above what the link can carry.
+- `iphlpapi.dll` is resolved at run time like `nvml.dll`, so the single `/MT` EXE gains no sidecar dependency and no link-line change.
+
 ## [0.11.0-beta.1] - 2026-09-22
 
 ### Added

@@ -5,7 +5,11 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include "net/history.hpp"
 #include "tray/osd_overlay.hpp"
+#include "logging/logger.hpp"
+
+#include <fstream>
 #include "localization/localization.hpp"
 
 WTL::CAppModule _Module;
@@ -65,6 +69,14 @@ int main(int argc, char** argv) {
     ULONG_PTR token{};
     if (Gdiplus::GdiplusStartup(&token, &startup, nullptr) != Gdiplus::Ok) return 2;
     _Module.Init(nullptr, GetModuleHandleW(nullptr));
+    // Without this the journal silently swallows everything, and a record
+    // this test is meant to prove exists would never be written. It owns a
+    // deferred writer, so it must be shut down as deliberately as the app
+    // does it -- leaving it running past main crashed this test.
+    (void)gtg::logging::Initialize(gtg::logging::Role::Tray);
+    struct JournalLifetime {
+        ~JournalLifetime() { gtg::logging::Shutdown(); }
+    } journal_lifetime;
     int result = 0;
     {
         gtg::tray::OsdOverlay osd;
@@ -78,7 +90,6 @@ int main(int argc, char** argv) {
                     100.0 + i % 20, 32.0, 30.6, 60.0, 20.0});
             }
             bool repaired{};
-            HWND foreground = GetForegroundWindow();
             Check(osd.Initialize(nullptr, &history, true, {60, 60}, repaired), "initialize");
             osd.SetStatus(L"Monitoring", gtg::tray::OsdVisual::Armed);
             osd.SetVisible(true);
@@ -94,7 +105,20 @@ int main(int argc, char** argv) {
                 Check(helper.left == r.left && helper.top == r.top && helper.right == r.right &&
                     helper.bottom - helper.top == MulDiv(25, dpi, 96), "helper bounds");
 #endif
-                Check(GetForegroundWindow() == foreground, "no foreground activation");
+                // What this actually has to prove is that *we* never steal
+                // focus. Comparing against a window captured at startup also
+                // fails whenever anything else on the desktop takes focus,
+                // which on a live machine is often: measured at two failures
+                // in five runs before any of this existed. A test that red-
+                // lights a third of the time teaches people to re-run until
+                // green, which is how a real regression gets waved through.
+                const HWND active = GetForegroundWindow();
+                DWORD active_pid = 0;
+                if (active != nullptr) {
+                    (void)GetWindowThreadProcessId(active, &active_pid);
+                }
+                Check(active == nullptr || active_pid != GetCurrentProcessId(),
+                      "no window of ours ever takes the foreground");
             };
             check_size(false);
             ClickToggle(osd, true);
@@ -135,6 +159,18 @@ int main(int argc, char** argv) {
             ClickToggle(osd);
             check_size(false);
             screenshot("expanded.png");
+            // The reading that was cut: a 350 W card idling just under its
+            // limit writes the widest pair this dashboard produces. Rendered
+            // so the fix is looked at, not only measured.
+            {
+                osd.SetCurrentPowerLimit(350.0);
+                history.AddSample({GetTickCount64(), 88.0, 349.5, 15.0, 14.6, 96.0, 31.0});
+                frame_saved = false;
+                frame_path = output / "power-lane-at-limit.png";
+                SendMessageW(osd, WM_TIMER, 1, 0);
+                Check(frame_saved, "power lane frame saved");
+                osd.SetCurrentPowerLimit(std::nullopt);
+            }
             gtg::fps::History fps_history;
             const gtg::fps::Identity game{77, 1234};
             osd.SetFpsHistory(&fps_history);
@@ -311,8 +347,9 @@ int main(int argc, char** argv) {
                 RECT r{};
                 GetWindowRect(osd, &r);
                 const auto grid = gtg::tray::compact::MakeCellGrid(
-                    placed.row1, r.right - r.left, scale);
-                const auto origin = gtg::tray::compact::CellOriginAt(grid, slot);
+                    gtg::tray::compact::WidestRow(placed), r.right - r.left, scale);
+                const auto origin =
+                    gtg::tray::compact::CellOriginAt(grid, placed, slot);
                 return POINT{
                     static_cast<LONG>(origin.x + grid.cell_width_dip * scale / 2),
                     static_cast<LONG>(origin.y +
@@ -363,6 +400,596 @@ int main(int argc, char** argv) {
             osd.SetCompactLocked(true);
             osd.RequestRefresh();
             screenshot("locked.png");
+
+            // Windows' low-memory signal raises the RAM cell's own accent
+            // rather than recolouring it, so the record stays recognisable.
+            osd.SetHostMemoryLow(true);
+            screenshot("ram-low-memory.png");
+            osd.SetHostMemoryLow(false);
+            osd.RequestRefresh();
+
+            // Every shape the new model allows, so a change to the geometry
+            // moves a picture rather than only a number.
+            {
+                struct Shape { std::initializer_list<int> rows; const char* name; };
+                const Shape shapes[] = {
+                    {{7},          "rows-1x7.png"},
+                    {{5, 2},       "rows-5-2.png"},
+                    {{4, 3},       "rows-4-3.png"},
+                    {{3, 2, 2},    "rows-3-2-2.png"},
+                    {{2, 2, 2, 1}, "rows-2-2-2-1.png"},
+                    {{5, 1, 1},    "rows-5-1-1.png"},
+                    {{2, 1, 1, 1, 1, 1}, "rows-2-1x5.png"},
+                    // The single column: the shape the old floor forbade, and
+                    // the one the owner wants for docking against an edge.
+                    {{1, 1, 1, 1, 1, 1, 1}, "rows-7x1.png"},
+                };
+                for (const auto& shape : shapes) {
+                    std::array<int, gtg::tray::compact::kRecordCount> lengths{};
+                    int n = 0;
+                    for (const int length : shape.rows)
+                        lengths[static_cast<std::size_t>(n++)] = length;
+                    gtg::tray::compact::Layout arranged;
+                    arranged.breaks = gtg::tray::compact::BreaksFromRows(lengths, n);
+                    osd.SetCompactLayout(arranged);
+                    osd.RequestRefresh();
+                    screenshot(shape.name);
+                }
+                osd.SetCompactLayout(gtg::tray::compact::Layout{});
+                osd.RequestRefresh();
+            }
+
+            // --- host memory reclaim: the busy indicator's lifecycle -------
+            //
+            // Dry run throughout: this exercises the window, not the trim, so
+            // running the test never modifies the machine it runs on.
+            {
+                gtg::sysmem::reclaim::Policy dry;
+                dry.dry_run = true;
+                osd.SetReclaimPolicy(dry);
+                osd.SetRamEnabled(true);
+                osd.SetRamHistory(&ram_history);
+                osd.SetCompactLayout(gtg::tray::compact::Layout{});
+                osd.SetCompactLocked(true);
+                osd.RequestRefresh();
+                SendMessageW(osd, WM_TIMER, 1, 0);
+
+                const auto find_indicator = [&]() {
+                    return FindWindowExW(nullptr, nullptr,
+                                         L"GpuThermalGuard.OsdBusyIndicator.v1",
+                                         nullptr);
+                };
+                Check(find_indicator() == nullptr, "no indicator before activation");
+
+                // Locate the RAM cell the same way the production code does.
+                RECT osd_rect{};
+                GetWindowRect(osd, &osd_rect);
+                const int dpi = static_cast<int>(GetDpiForWindow(osd));
+                const float scale = static_cast<float>(dpi) / 96.0F;
+                const auto placed = gtg::tray::compact::Resolve(
+                    gtg::tray::compact::Layout{}, true, true);
+                const auto grid = gtg::tray::compact::MakeCellGrid(
+                    gtg::tray::compact::WidestRow(placed),
+                    osd_rect.right - osd_rect.left, scale);
+                int ram_slot = -1;
+                for (int i = 0; i < placed.count; ++i) {
+                    if (placed.cells[static_cast<std::size_t>(i)] ==
+                        gtg::tray::compact::Metric::Ram) {
+                        ram_slot = i;
+                        break;
+                    }
+                }
+                Check(ram_slot >= 0, "the RAM cell is placed");
+                const auto ram_origin =
+                    gtg::tray::compact::CellOriginAt(grid, placed, ram_slot);
+                const LPARAM ram_point = MAKELPARAM(
+                    static_cast<int>(ram_origin.x) +
+                        static_cast<int>(grid.cell_width_dip * scale) / 2,
+                    static_cast<int>(ram_origin.y) +
+                        static_cast<int>(gtg::tray::compact::kCellHeightDip * scale) / 2);
+
+                // Unlocked is arrange mode; activation must not fire there, or
+                // a drag and an action would compete for one gesture.
+                osd.SetCompactLocked(false);
+                SendMessageW(osd, WM_LBUTTONDBLCLK, 0, ram_point);
+                Check(find_indicator() == nullptr,
+                      "unlocked double-click starts no reclaim");
+
+                osd.SetCompactLocked(true);
+                SendMessageW(osd, WM_LBUTTONDBLCLK, 0, ram_point);
+                const HWND indicator = find_indicator();
+                Check(indicator != nullptr, "locked double-click raises the indicator");
+                Check(GetWindow(indicator, GW_OWNER) == osd,
+                      "the indicator is owned by the overlay");
+                Check((GetWindowLongPtrW(indicator, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0,
+                      "the indicator is topmost");
+                // It must NOT be transparent to the mouse: swallowing further
+                // clicks over the busy cell is half its purpose.
+                Check((GetWindowLongPtrW(indicator, GWL_EXSTYLE) & WS_EX_TRANSPARENT) == 0,
+                      "the indicator is not click-through");
+                Check(SendMessageW(indicator, WM_NCHITTEST, 0, 0) == HTCLIENT,
+                      "the indicator swallows the pointer");
+
+                // A second activation while one is in flight must do nothing:
+                // the window's existence is the guard.
+                SendMessageW(osd, WM_LBUTTONDBLCLK, 0, ram_point);
+                Check(find_indicator() == indicator,
+                      "a second double-click does not start a second reclaim");
+
+                // The floor keeps it up even though a dry run finishes at once.
+                Sleep(120);
+                SendMessageW(osd, WM_TIMER, 3, 0);
+                Check(find_indicator() != nullptr,
+                      "the indicator honours its minimum visible interval");
+
+                screenshot("ram-reclaim-busy.png");
+
+                // Past the floor it comes down on the next poll.
+                Sleep(gtg::sysmem::reclaim::kMinimumVisibleMs);
+                SendMessageW(osd, WM_TIMER, 3, 0);
+                Check(find_indicator() == nullptr,
+                      "the indicator is destroyed once the floor has elapsed");
+
+                // Every abandonment path must take it down too: a topmost
+                // window that swallows input is the worst thing to leak.
+                SendMessageW(osd, WM_LBUTTONDBLCLK, 0, ram_point);
+                Check(find_indicator() != nullptr, "raised again");
+                // Through the real chevron, not a private method: the
+                // production path is the one that has to tear it down.
+                ClickToggle(osd);
+                Check(find_indicator() == nullptr,
+                      "switching to the expanded view tears the indicator down");
+                ClickToggle(osd);
+
+                SendMessageW(osd, WM_LBUTTONDBLCLK, 0, ram_point);
+                Check(find_indicator() != nullptr, "raised again");
+                osd.SetVisible(false);
+                Check(find_indicator() == nullptr,
+                      "hiding the overlay tears the indicator down");
+                osd.SetVisible(true);
+
+                // The result phase directly. A dry run never reaches it, so
+                // without this the most dangerous teardown path -- the one
+                // that would leave a topmost, input-swallowing window on the
+                // reader's screen -- would ship untested.
+                gtg::tray::OsdBusyIndicator standalone;
+                const RECT probe{osd_rect.left + 20, osd_rect.top + 40,
+                                 osd_rect.left + 120, osd_rect.top + 90};
+                Check(standalone.Begin(osd, probe, 0xFFFF7AC4U, scale, L"RAM"),
+                      "the indicator can be raised");
+                Check(standalone.Active() && find_indicator() != nullptr,
+                      "it is a real window and says so");
+                standalone.ShowResult(L"+4.3 GB", 0xFF4BD68BU);
+                Check(standalone.Active(), "showing a result keeps it up");
+                // The widest figure a very large machine can produce. It must
+                // render whole: truncating a number turns it into a different
+                // number, which is worse than showing it small.
+                standalone.ShowResult(L"+128 GB", 0xFF4BD68BU);
+                Check(standalone.Active(), "a three-digit figure still renders");
+                standalone.ShowResult(L"-128 GB", 0xFFFF5B5EU);
+                Check(standalone.Active(), "so does a three-digit loss");
+                Check(SendMessageW(find_indicator(), WM_NCHITTEST, 0, 0) == HTCLIENT,
+                      "it still swallows the pointer while showing a result");
+                standalone.End();
+                Check(!standalone.Active() && find_indicator() == nullptr,
+                      "nothing survives the result phase");
+
+                // The network record, drawn with a history shaped like real
+                // traffic: an asymmetric link, a burst, and a hole where the
+                // adapter stopped reporting. A picture is the only way to
+                // judge whether two curves on one span read at 10 dip tall.
+                {
+                    // Hundreds of megabytes, which is where the cell first
+                    // ran out of room: the owner saw a real download push the
+                    // value past the box and end in an ellipsis.
+                    const auto fill = [](gtg::net::History& into,
+                                         const double received_mb,
+                                         const double sent_mb,
+                                         const bool with_gap,
+                                         const bool sustained = false) {
+                        const std::uint64_t base = GetTickCount64() - 80'000;
+                        std::uint64_t received = 0;
+                        std::uint64_t sent = 0;
+                        for (int step = 0; step < 400; ++step) {
+                            const std::uint64_t at =
+                                base + static_cast<std::uint64_t>(step) * 200;
+                            // Sustained means the last sample is the full
+                            // rate, which is the one the cell prints. An
+                            // earlier draft put the burst in the middle, so
+                            // the widest case never reached the value row and
+                            // the test proved nothing about the font.
+                            const double burst =
+                                sustained ? 1.0
+                                          : (step > 180 && step < 260 ? 1.0 : 0.35);
+                            received += static_cast<std::uint64_t>(
+                                received_mb * 1024.0 * 1024.0 * 0.2 * burst);
+                            sent += static_cast<std::uint64_t>(
+                                sent_mb * 1024.0 * 1024.0 * 0.2 * burst);
+                            if (with_gap && step == 300) {
+                                // The adapter goes away: the next difference
+                                // would span two interfaces, so the curve must
+                                // break rather than join across the hole.
+                                into.Interrupt();
+                                continue;
+                            }
+                            into.Record(at, {received, sent, at});
+                        }
+                    };
+
+                    // An asymmetric link under a large download, which is the
+                    // ordinary shape of the thing.
+                    gtg::net::History traffic;
+                    fill(traffic, 850.0, 90.0, true);
+                    // Added on top of whatever is already shown rather than
+                    // replacing it: every later block in this test depends on
+                    // the records it set up, and an earlier draft of this one
+                    // switched RAM off and never switched it back.
+                    osd.SetNetHistory(&traffic);
+                    osd.SetNetEnabled(true);
+                    screenshot("net-cell.png");
+                    // The expanded lane too. It was missing entirely from the
+                    // first pass -- the cell worked and the lane did not, and
+                    // nothing caught it because nothing rendered it.
+                    ClickToggle(osd);
+                    screenshot("net-lane.png");
+                    ClickToggle(osd);
+
+                    // The widest pair the unit ladder can produce: both
+                    // directions just below the next unit, so the value is
+                    // four digits either side of the separator. Measured at
+                    // 74 dip against a 64 dip row, so this is the frame that
+                    // proves the font steps down instead of truncating.
+                    gtg::net::History saturated;
+                    // Ten gigabit, saturated both ways: the widest pair the
+                    // link-speed guard will let through on hardware that
+                    // exists, and the frame that proves the row neither
+                    // truncates nor shrinks past legibility.
+                    fill(saturated, 1192.0, 1190.0, false, true);
+                    osd.SetNetHistory(&saturated);
+                    screenshot("net-cell-wide.png");
+
+                    osd.SetNetEnabled(false);
+                    osd.SetNetHistory(nullptr);
+                }
+
+                // A filmstrip of the animation itself, at 96 dip metrics and
+                // through the real paint path. The frames are spaced by wall
+                // clock rather than by frame count, because the effect is a
+                // function of elapsed time and not of how often it was drawn.
+                {
+                    const RECT at{osd_rect.left + 40, osd_rect.top + 60,
+                                  osd_rect.left + 40 + 72, osd_rect.top + 60 + 51};
+                    gtg::tray::OsdBusyIndicator film;
+                    Check(film.Begin(osd, at, 0xFFFF7AC4U, 1.0F, L"RAM",
+                                     gtg::tray::animation::Effect::Rain),
+                          "filmstrip indicator raised");
+                    for (int frame = 0; frame < 24; ++frame) {
+                        Sleep(80);
+                        // Its animation runs on a timer, so the frames only
+                        // advance if this thread pumps for it.
+                        MSG message{};
+                        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                            TranslateMessage(&message);
+                            DispatchMessageW(&message);
+                        }
+                        const HDC desk = ::GetDC(nullptr);
+                        const HDC mem = CreateCompatibleDC(desk);
+                        const HBITMAP bits = CreateCompatibleBitmap(desk, 72, 51);
+                        const HGDIOBJ old = SelectObject(mem, bits);
+                        BitBlt(mem, 0, 0, 72, 51, desk, at.left, at.top,
+                               SRCCOPY | CAPTUREBLT);
+                        {
+                            Gdiplus::Bitmap captured(bits, nullptr);
+                            const CLSID png{0x557cf406, 0x1a04, 0x11d3,
+                                            {0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e}};
+                            wchar_t name[32]{};
+                            swprintf_s(name, L"rain-%02d.png", frame);
+                            const auto path = output / name;
+                            Check(captured.Save(path.c_str(), &png) == Gdiplus::Ok,
+                                  "filmstrip frame saved");
+                        }
+                        SelectObject(mem, old);
+                        DeleteObject(bits);
+                        DeleteDC(mem);
+                        ::ReleaseDC(nullptr, desk);
+                    }
+                    film.End();
+                }
+
+                // What the figure looks like at 96 DPI, through the real paint
+                // path rather than a replica of it: Begin() takes the scale, so
+                // forcing 1.0 renders 100 % metrics whatever this desktop is
+                // set to. Captured off the screen because the indicator is its
+                // own layered window and the overlay's screenshot() cannot see
+                // it.
+                // The reading that was cut, at the scale it was actually cut
+                // at. A lane's horizontal metrics are multiplied by
+                // LaneScale(row.Height) -- a VERTICAL ratio, which shrinks as
+                // records are added, because the lanes divide a fixed window
+                // height between them. Eight lanes put it at 0.59, so the
+                // value's old 132 dip box was really 78 dip, and
+                // "349.5 W (350 W)" does not fit in 78 dip. Adding the NET
+                // record is what pushed it over: at seven lanes the same box
+                // was 89 dip.
+                //
+                // Measured with GDI+ rather than reasoned about, and derived
+                // from the same constants the painter uses, so this keeps
+                // holding when a ninth record arrives.
+                {
+                    namespace compact = gtg::tray::compact;
+                    const HDC probe_dc = ::GetDC(nullptr);
+                    Gdiplus::Graphics ruler(probe_dc);
+                    Gdiplus::FontFamily family(L"Segoe UI");
+                    Gdiplus::StringFormat measure;
+                    measure.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+                    // The widest ordinary readings this dashboard produces:
+                    // the power pair that failed, and the two behind it.
+                    const wchar_t* readings[] = {
+                        L"349.5 W (350 W)",
+                        L"1234.5 W (1250 W)",
+                        L"100% (1024.0 GiB)",
+                    };
+                    // Every record enabled is the worst case, and the one the
+                    // owner was looking at.
+                    const int lanes = compact::Resolve(compact::Layout{}, true,
+                                                       true, true).count;
+                    for (const float lane_dpi : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
+                        // The painter's own arithmetic: the expanded window
+                        // is 330 dip tall, 31 of it header, and the lanes
+                        // divide the rest with a 2 dip gap each.
+                        const float row_height =
+                            ((330.0F - 31.0F) /
+                                 static_cast<float>(lanes) - 2.0F) * lane_dpi;
+                        const float lane_scale = compact::LaneScale(row_height);
+                        const float row_width = 376.0F * lane_dpi;
+                        Gdiplus::Font value_font(&family, 12.5F * lane_dpi,
+                                                 Gdiplus::FontStyleBold,
+                                                 Gdiplus::UnitPixel);
+                        const auto span = compact::LaneValueSpan(
+                            0.0F, row_width, 0.0F, lane_scale);
+                        for (const wchar_t* reading : readings) {
+                            Gdiplus::RectF measured;
+                            ruler.MeasureString(reading, -1, &value_font,
+                                                Gdiplus::PointF(0.0F, 0.0F),
+                                                &measure, &measured);
+                            Check(measured.Width <= span.width,
+                                  "a lane reading fits its box without being cut");
+                        }
+                    }
+                    ::ReleaseDC(nullptr, probe_dc);
+                }
+
+                // The same gesture on the NET cell. The probe is stubbed:
+                // exercising it for real would mean enabling extended
+                // statistics on whatever program happens to be in front of
+                // this test, on this machine. The probe is verified against a
+                // real process by hand, elevated; what is verified here is
+                // that the gesture reaches it and that the window always comes
+                // down again.
+                {
+                    namespace compact = gtg::tray::compact;
+                    osd.SetNetEnabled(true);
+                    osd.SetCompactLocked(true);
+                    // Enabling a record resizes the dashboard, so every
+                    // coordinate above this line is stale. Recomputed rather
+                    // than reused -- the cell that moved is the one being
+                    // clicked.
+                    RECT net_rect{};
+                    GetWindowRect(osd, &net_rect);
+                    const auto net_placed = osd.CurrentPlacement();
+                    const auto net_grid = compact::MakeCellGrid(
+                        compact::WidestRow(net_placed),
+                        net_rect.right - net_rect.left, scale);
+                    const auto point_at = [&](const compact::Metric metric) {
+                        int slot = -1;
+                        for (int i = 0; i < net_placed.count; ++i) {
+                            if (net_placed.cells[static_cast<std::size_t>(i)] == metric) {
+                                slot = i;
+                                break;
+                            }
+                        }
+                        Check(slot >= 0, "the cell is placed");
+                        const auto origin =
+                            compact::CellOriginAt(net_grid, net_placed, slot);
+                        return MAKELPARAM(
+                            static_cast<int>(origin.x) +
+                                static_cast<int>(net_grid.cell_width_dip * scale) / 2,
+                            static_cast<int>(origin.y) +
+                                static_cast<int>(compact::kCellHeightDip * scale) / 2);
+                    };
+                    const LPARAM net_point = point_at(compact::Metric::Network);
+                    const LPARAM ram_again = point_at(compact::Metric::Ram);
+
+                    osd.StubNetworkProbe({gtg::net::Grade::Fair, 90, 5},
+                                         gtg::net::ProbeStatus::Ready);
+
+                    osd.SetCompactLocked(false);
+                    SendMessageW(osd, WM_LBUTTONDBLCLK, 0, net_point);
+                    Check(find_indicator() == nullptr,
+                          "unlocked double-click starts no probe either");
+
+                    osd.SetCompactLocked(true);
+                    SendMessageW(osd, WM_LBUTTONDBLCLK, 0, net_point);
+                    const HWND probing = find_indicator();
+                    Check(probing != nullptr,
+                          "locked double-click on NET raises the indicator");
+                    SendMessageW(osd, WM_LBUTTONDBLCLK, 0, net_point);
+                    Check(find_indicator() == probing,
+                          "a second double-click does not start a second probe");
+                    // Two actions, one indicator: the other record's gesture
+                    // must not raise a second window over the dashboard.
+                    SendMessageW(osd, WM_LBUTTONDBLCLK, 0, ram_again);
+                    Check(find_indicator() == probing,
+                          "a RAM activation during a probe raises nothing new");
+
+                    // The result, through the real timer. A stub finishes at
+                    // once, so the floor is what holds the rain up.
+                    Sleep(gtg::net::action::kMinimumVisibleMs + 60);
+                    SendMessageW(osd, WM_TIMER, 3, 0);
+                    Check(find_indicator() != nullptr,
+                          "a network verdict is always shown, never skipped");
+                    screenshot("net-verdict-busy.png");
+                    SendMessageW(osd, WM_TIMER, 3, 0);
+                    Check(find_indicator() != nullptr,
+                          "and it holds while the reader reads it");
+                    Sleep(gtg::net::action::kResultHoldMs);
+                    SendMessageW(osd, WM_TIMER, 3, 0);
+                    Check(find_indicator() == nullptr,
+                          "then the cell goes back to being a cell");
+
+                    // Every abandonment path, as for the reclaim: a topmost
+                    // window that swallows input is the worst thing to leak.
+                    SendMessageW(osd, WM_LBUTTONDBLCLK, 0, net_point);
+                    Check(find_indicator() != nullptr, "raised again");
+                    osd.SetVisible(false);
+                    Check(find_indicator() == nullptr,
+                          "hiding the overlay tears a probe down too");
+                    osd.SetVisible(true);
+                    osd.SetNetEnabled(false);
+                }
+
+                // Captured off the screen: the indicator is its own layered
+                // window and the overlay's screenshot() cannot see it.
+                const auto capture_cell = [&](const RECT& at, const char* name) {
+                    const HWND live = find_indicator();
+                    Check(live != nullptr, "sample is on screen");
+                    const int w = at.right - at.left;
+                    const int h = at.bottom - at.top;
+                    const HDC desk = ::GetDC(nullptr);
+                    const HDC mem = CreateCompatibleDC(desk);
+                    const HBITMAP shot_bitmap = CreateCompatibleBitmap(desk, w, h);
+                    const HGDIOBJ old = SelectObject(mem, shot_bitmap);
+                    // CAPTUREBLT, or a layered window is simply absent.
+                    BitBlt(mem, 0, 0, w, h, desk, at.left, at.top,
+                           SRCCOPY | CAPTUREBLT);
+                    {
+                        Gdiplus::Bitmap captured(shot_bitmap, nullptr);
+                        const CLSID png{0x557cf406, 0x1a04, 0x11d3,
+                                        {0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e}};
+                        Check(captured.Save((output / name).c_str(), &png) == Gdiplus::Ok,
+                              "sample saved");
+                    }
+                    SelectObject(mem, old);
+                    DeleteObject(shot_bitmap);
+                    DeleteDC(mem);
+                    ::ReleaseDC(nullptr, desk);
+                };
+
+                const struct { const wchar_t* text; std::uint32_t tint; const char* name; }
+                    widths[] = {
+                        {L"+3.9 GB",  0xFF4BD68BU, "fit-96dpi-1-small.png"},
+                        {L"+20 GB",   0xFF4BD68BU, "fit-96dpi-2-tens.png"},
+                        {L"+128 GB",  0xFF4BD68BU, "fit-96dpi-3-hundreds.png"},
+                        {L"+1024 GB", 0xFF4BD68BU, "fit-96dpi-4-terabyte.png"},
+                        {L"-128 GB",  0xFFFF5B5EU, "fit-96dpi-5-loss.png"},
+                        {L"--",       0xB4CDD6E2U, "fit-96dpi-6-noise.png"},
+                    };
+                for (const auto& sample : widths) {
+                    const RECT at{osd_rect.left + 40, osd_rect.top + 60,
+                                  osd_rect.left + 40 + 72, osd_rect.top + 60 + 51};
+                    gtg::tray::OsdBusyIndicator shot;
+                    Check(shot.Begin(osd, at, 0xFFFF7AC4U, 1.0F, L"RAM"),
+                          "96 dpi sample raised");
+                    shot.ShowResult(sample.text, sample.tint);
+                    capture_cell(at, sample.name);
+                    shot.End();
+                    Check(find_indicator() == nullptr, "96 dpi sample torn down");
+                }
+
+                // The network verdict at 96 DPI, through the same real paint
+                // path. Two shapes were rendered side by side and the owner
+                // chose this one -- the grade as a three-bar mark beside the
+                // latency -- over spelling the grade out as a word, which cost
+                // the width that the figure and its unit needed. Every failure
+                // the probe can report is rendered too: those are the reading
+                // when there is no verdict, and they have to fit the same cell.
+                {
+                    using gtg::net::Grade;
+                    using gtg::net::ProbeStatus;
+                    using gtg::net::Verdict;
+                    namespace action = gtg::net::action;
+                    const struct {
+                        Verdict verdict;
+                        ProbeStatus status;
+                        const char* name;
+                    } verdicts[] = {
+                        {{Grade::Good, 18, 4},   ProbeStatus::Ready,
+                         "net-verdict-1-good.png"},
+                        {{Grade::Fair, 90, 6},   ProbeStatus::Ready,
+                         "net-verdict-2-fair.png"},
+                        {{Grade::Poor, 210, 3},  ProbeStatus::Ready,
+                         "net-verdict-3-poor.png"},
+                        // The widest figure the stack can hand back, to prove
+                        // the step-down ladder still has room beside the mark.
+                        {{Grade::Poor, 1234, 1}, ProbeStatus::Ready,
+                         "net-verdict-4-wide.png"},
+                        {{}, ProbeStatus::NoConnections,
+                         "net-verdict-5-no-tcp.png"},
+                        {{}, ProbeStatus::NoForeground,
+                         "net-verdict-6-no-app.png"},
+                        {{}, ProbeStatus::NotPermitted,
+                         "net-verdict-7-denied.png"},
+                    };
+                    const RECT at{osd_rect.left + 40, osd_rect.top + 60,
+                                  osd_rect.left + 40 + 72, osd_rect.top + 60 + 51};
+                    for (const auto& sample : verdicts) {
+                        const std::uint32_t tint = action::TintFor(sample.verdict.grade);
+                        const std::wstring figure =
+                            action::ResultText(sample.verdict, sample.status);
+
+                        gtg::tray::OsdBusyIndicator mark;
+                        Check(mark.Begin(osd, at, 0xFFC8E85CU, 1.0F, L"NET"),
+                              "verdict sample raised");
+                        mark.ShowResult(figure, tint,
+                                        action::BarsFor(sample.verdict.grade));
+                        capture_cell(at, sample.name);
+                        mark.End();
+                        Check(find_indicator() == nullptr, "verdict sample torn down");
+                    }
+                }
+
+                // A reclaim is a user-initiated action on other processes, so
+                // it must leave a trace. Asserted against the journal on disk
+                // rather than against the fact that a log call was written.
+                //
+                // Still dry. An earlier draft restored the live policy before
+                // this block and the test then trimmed the machine running it
+                // -- exactly what dry_run exists to prevent.
+                SendMessageW(osd, WM_LBUTTONDBLCLK, 0, ram_point);
+                Check(find_indicator() != nullptr, "raised for the journal check");
+                Sleep(gtg::sysmem::reclaim::kMinimumVisibleMs + 120);
+                for (int tick = 0; tick < 4 && find_indicator() != nullptr; ++tick) {
+                    SendMessageW(osd, WM_TIMER, 3, 0);
+                    Sleep(60);
+                }
+                Check(find_indicator() == nullptr, "and came down again");
+
+                // Read the journal back off disk. Asserting that a log call
+                // exists in the source proves nothing: the logger can be
+                // uninitialised, the queue can be full, the write can fail.
+                {
+                    gtg::logging::Shutdown();   // flush before reading
+                    bool found = false;
+                    for (const auto& entry :
+                         std::filesystem::directory_iterator(
+                             std::filesystem::path(argv[0]).parent_path())) {
+                        if (entry.path().extension() != ".log") continue;
+                        std::wifstream journal(entry.path());
+                        std::wstring line;
+                        while (std::getline(journal, line)) {
+                            if (line.find(L"host memory reclaim:") !=
+                                std::wstring::npos) {
+                                found = true;
+                            }
+                        }
+                    }
+                    Check(found, "the reclaim left a record in the journal");
+                    (void)gtg::logging::Initialize(gtg::logging::Role::Tray);
+                }
+                standalone.End();
+                Check(find_indicator() == nullptr, "a repeated teardown is safe");
+            }
+
             osd.SetRamEnabled(false);
             osd.SetRamHistory(nullptr);
             check_fps_size(true);

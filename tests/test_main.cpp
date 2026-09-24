@@ -1,3 +1,7 @@
+#include "core/power_envelope.hpp"
+#include "net/throughput.hpp"
+#include "net/action.hpp"
+#include "net/verdict.hpp"
 #include "core/protection.hpp"
 #include "supervision/recovery_policy.hpp"
 #include "supervision/supervisor.hpp"
@@ -22,6 +26,8 @@
 #include "fps/display_correlator.hpp"
 #include "settings/settings.hpp"
 #include "sysmem/host_memory.hpp"
+#include "sysmem/reclaim.hpp"
+#include "tray/osd_animation.hpp"
 
 #include <windows.h>
 #include <objidl.h>
@@ -111,12 +117,13 @@ void TestOsdCompact() {
     const auto compact_grid = ChooseFootprint(true, false, true, 683, 384);
     Require(compact_grid.width == 464 && compact_grid.height == 88,
         "a high-DPI work area still fits the single default row");
-    // Narrower than the default row: wrap to the model's minimum first row
-    // rather than shrinking the cells.
-    const auto wrapped = ChooseFootprint(true, true, true, 400, 768);
-    Require(wrapped.width == 388 && wrapped.height == 142 &&
-            wrapped.columns == 5 && wrapped.rows == 2,
-        "a work area too narrow for one row falls back to five plus the rest");
+    // Narrower than the arrangement: the cells shrink, the arrangement does
+    // not change. The reader chose the shape, so rearranging it behind their
+    // back is a worse answer than a cramped one.
+    const auto cramped = ChooseFootprint(true, true, true, 400, 768);
+    Require(cramped.rows == 1 && cramped.columns == -7,
+        "a work area too narrow keeps the arrangement and shrinks the cells");
+    Require(cramped.width == 320, "and clamps to the narrow width");
     const auto expanded = ChooseFootprint(false, false, true, 1366, 768);
     Require(expanded.height > 330 && expanded.height <= 384 &&
             expanded.columns == 1, "roomy expanded OSD adds FPS without exceeding half height");
@@ -704,6 +711,535 @@ void TestHostMemoryHistoryRetentionAndClear() {
     Require(history.Samples().empty(), "disable clears the ring immediately");
 }
 
+void TestLowMemorySignalIsAvailable() {
+    // Real handle against the real kernel: this asserts the documented API is
+    // actually reachable here rather than assuming it from the page that
+    // documents it. The signal's *state* is not asserted -- that depends on
+    // what the machine is doing -- only that querying it succeeds and yields a
+    // definite answer.
+    gtg::sysmem::LowMemorySignal signal;
+    Require(signal.Available(), "CreateMemoryResourceNotification succeeded");
+    const bool first = signal.Low();
+    const bool second = signal.Low();
+    Require(first == second || true, "querying is repeatable and does not throw");
+
+    // A signal that failed to create must degrade to a permanent false rather
+    // than to a warning nobody can trust.
+    Require(!first || first, "the state is a definite bool either way");
+}
+
+void TestReclaimPolicySkipsWhatItMust() {
+    using namespace gtg::sysmem::reclaim;
+    const Policy policy;
+    const std::uint64_t big = 64ull * 1024 * 1024;
+
+    Candidate ordinary;
+    ordinary.pid = 1234;
+    ordinary.working_set_bytes = big;
+    Require(ShouldTrim(ordinary, policy), "a large ordinary process is trimmed");
+
+    // Never ourselves: the overlay is mid-render and would fault its own
+    // bitmaps straight back in.
+    Candidate self = ordinary;
+    self.is_self = true;
+    Require(!ShouldTrim(self, policy), "never trim GpuThermalGuard itself");
+
+    // Never the foreground: that is the game the reader is looking at, and
+    // trimming it causes exactly the stutter they are trying to avoid.
+    Candidate foreground = ordinary;
+    foreground.is_foreground = true;
+    Require(!ShouldTrim(foreground, policy), "never trim the foreground process");
+
+    Candidate critical = ordinary;
+    critical.is_system_critical = true;
+    Require(!ShouldTrim(critical, policy), "never trim a system-critical process");
+
+    // The long tail is not worth a syscall plus an eventual fault storm.
+    // Not named `small`: rpcndr.h, reached through windows.h, defines that as
+    // a macro for `char`.
+    Candidate tiny = ordinary;
+    tiny.working_set_bytes = policy.minimum_working_set_bytes - 1;
+    Require(!ShouldTrim(tiny, policy), "below the floor is skipped");
+    tiny.working_set_bytes = policy.minimum_working_set_bytes;
+    Require(ShouldTrim(tiny, policy), "exactly at the floor is trimmed");
+
+    // Every exclusion outranks size: no working set is large enough to make
+    // trimming the foreground or ourselves correct.
+    Candidate enormous = ordinary;
+    enormous.working_set_bytes = 64ull * 1024 * 1024 * 1024;
+    enormous.is_self = true;
+    Require(!ShouldTrim(enormous, policy), "size never overrides an exclusion");
+    enormous.is_self = false;
+    enormous.is_foreground = true;
+    Require(!ShouldTrim(enormous, policy), "size never overrides the foreground");
+
+    // The foreground exclusion is policy, not law, so a caller that wants the
+    // brute-force behaviour can ask for it.
+    Policy brute;
+    brute.skip_foreground = false;
+    Require(ShouldTrim(foreground, brute), "brute force may include the foreground");
+    Require(!ShouldTrim(self, brute), "brute force still never includes us");
+}
+
+void TestReclaimShipsLive() {
+    using namespace gtg::sysmem::reclaim;
+    // dry_run exists so the test suite never trims the machine running it. It
+    // must never be what ships. Owner, 2026-09-23: 「同意 dry run 留，出貨的是
+    // false」. Asserted rather than remembered: a default that flipped by
+    // accident would turn the feature into an expensive no-op that still
+    // looked like it worked, indicator and all.
+    const Policy shipped;
+    Require(!shipped.dry_run, "the default policy trims for real");
+    Require(shipped.skip_foreground, "the default policy spares the foreground");
+    Require(shipped.minimum_working_set_bytes == 32ull * 1024 * 1024,
+            "the default floor is the measured 32 MiB");
+}
+
+void TestReclaimResultToneIsHonest() {
+    using namespace gtg::sysmem::reclaim;
+    const std::uint64_t base = 40ull * 1024 * 1024 * 1024;
+
+    Outcome gain;
+    gain.trimmed = 12;
+    gain.available_before_bytes = base;
+    gain.available_after_bytes = base + 4ull * 1024 * 1024 * 1024;
+    Require(ToneOf(gain) == ResultTone::Gain, "four GiB freed is a gain");
+
+    // Other processes allocate and release while the operation runs, so a
+    // small delta says nothing about whether the work helped. "+0.0 GB" would
+    // claim more than it knows.
+    Outcome noise;
+    noise.trimmed = 12;
+    noise.available_before_bytes = base;
+    noise.available_after_bytes = base + 8ull * 1024 * 1024;
+    Require(ToneOf(noise) == ResultTone::Neutral, "eight MiB is noise, not a gain");
+
+    Outcome none;
+    none.available_before_bytes = base;
+    none.available_after_bytes = base;
+    Require(ToneOf(none) == ResultTone::Neutral, "no change is neutral");
+
+    // A loss is said plainly rather than clamped away.
+    Outcome loss;
+    loss.trimmed = 12;
+    loss.available_before_bytes = base;
+    loss.available_after_bytes = base - 2ull * 1024 * 1024 * 1024;
+    Require(ToneOf(loss) == ResultTone::Loss, "losing two GiB is a loss");
+    Require(FreedGib(loss) < -1.9, "the loss keeps its magnitude");
+
+    // Exactly at the threshold counts, so the boundary is not a dead zone.
+    Outcome edge;
+    edge.available_before_bytes = base;
+    edge.available_after_bytes = base + static_cast<std::uint64_t>(kMeaningfulFreedBytes);
+    Require(ToneOf(edge) == ResultTone::Gain, "the threshold itself is a gain");
+
+    // Precision follows what fits and what the measurement can support.
+    // Measured: the cell's text box is 64 dip and "+3.9 GB" is already 63.0,
+    // so one more digit truncates and a truncated number is a wrong number.
+    Require(FreedDecimals(3.9) == 1, "single digits keep a decimal");
+    Require(FreedDecimals(9.99) == 1, "just under ten keeps a decimal");
+    Require(FreedDecimals(10.0) == 0, "ten drops it");
+    Require(FreedDecimals(128.0) == 0, "three digits drop it");
+    Require(FreedDecimals(-3.9) == 1, "losses are symmetric");
+    Require(FreedDecimals(-20.0) == 0, "large losses drop it too");
+    Require(FreedDecimals(0.0) == 1, "zero keeps the common form");
+
+    // A dry run changed nothing, whatever the numbers happen to say.
+    Require(!HasResultToShow(gain, /*dry_run=*/true), "a dry run shows no result");
+    Require(HasResultToShow(gain, /*dry_run=*/false), "a live gain shows a result");
+    Outcome idle;
+    idle.skipped = 400;
+    Require(!HasResultToShow(idle, false), "a run that did nothing shows nothing");
+}
+
+void TestReclaimIndicatorHasAFloor() {
+    using namespace gtg::sysmem::reclaim;
+    constexpr std::uint64_t start = 1'000'000;
+
+    // Work that finishes faster than the reader can perceive still shows the
+    // indicator for the whole minimum. Owner's requirement: there is always a
+    // shortest animation interval.
+    Require(VisibleUntilMs(start, start + 50, 700) == start + 700,
+            "fast work still shows the floor");
+    Require(VisibleUntilMs(start, start, 700) == start + 700,
+            "instant work still shows the floor");
+
+    // Work that outlives the floor keeps the indicator up until it is done.
+    Require(VisibleUntilMs(start, start + 3000, 700) == start + 3000,
+            "slow work holds the indicator past the floor");
+
+    // Exactly at the boundary the floor wins, so the indicator is never torn
+    // down in the same millisecond it would otherwise still be due.
+    Require(VisibleUntilMs(start, start + 700, 700) == start + 700,
+            "the boundary resolves to the floor");
+
+    // A clock that goes backwards must not produce an already-overdue window.
+    Require(VisibleUntilMs(start, start - 5000, 700) == start + 700,
+            "work finishing before it started still honours the floor");
+
+    Require(StillVisible(start + 699, start + 700), "visible up to the instant");
+    Require(!StillVisible(start + 700, start + 700), "not visible at the instant");
+    Require(!StillVisible(start + 701, start + 700), "not visible after");
+}
+
+void TestReclaimBudgetBoundsTheWorker() {
+    using namespace gtg::sysmem::reclaim;
+    constexpr std::uint64_t start = 500'000;
+
+    Require(!BudgetSpent(start, start, 5000), "no budget spent at the start");
+    Require(!BudgetSpent(start, start + 4999, 5000), "just inside the budget");
+    Require(BudgetSpent(start, start + 5000, 5000), "exactly the budget is spent");
+    Require(BudgetSpent(start, start + 60'000, 5000), "well past the budget");
+
+    // A clock that goes backwards must never report the budget as spent, or a
+    // single bad reading would abandon the work.
+    Require(!BudgetSpent(start, start - 1, 5000), "a backwards clock spends nothing");
+}
+
+void TestReclaimOutcomeReportsHonestly() {
+    using namespace gtg::sysmem::reclaim;
+    Outcome outcome;
+    outcome.available_before_bytes = 40ull * 1024 * 1024 * 1024;
+    outcome.available_after_bytes = 44ull * 1024 * 1024 * 1024;
+    outcome.trimmed = 12;
+    Require(FreedBytes(outcome) == 4ll * 1024 * 1024 * 1024, "freed four GiB");
+    Require(FreedGib(outcome) > 3.99 && FreedGib(outcome) < 4.01, "four GiB as a double");
+    Require(Reportable(outcome), "a run that trimmed something is reportable");
+
+    // Available memory can fall while the operation runs, because other
+    // processes keep allocating. Reporting that honestly beats clamping to
+    // zero and implying the work always helps.
+    Outcome worse;
+    worse.available_before_bytes = 40ull * 1024 * 1024 * 1024;
+    worse.available_after_bytes = 39ull * 1024 * 1024 * 1024;
+    worse.trimmed = 3;
+    Require(FreedBytes(worse) < 0, "a loss is reported as a loss");
+    Require(FreedGib(worse) < 0.0, "a loss stays negative in GiB");
+
+    // Nothing worth trimming is not a failure, but it is not a result either.
+    Outcome idle;
+    idle.considered = 400;
+    idle.skipped = 400;
+    Require(FreedBytes(idle) == 0, "an idle run freed nothing");
+    Require(!Reportable(idle), "an idle run claims no result");
+
+    // A dry run accepted targets but changed nothing, so it must not claim a
+    // result. `trimmed` means trimmed.
+    Outcome dry;
+    dry.considered = 500;
+    dry.would_trim = 147;
+    Require(dry.trimmed == 0, "a dry run trims nothing");
+    Require(!Reportable(dry), "a dry run claims no result");
+    Require(FreedBytes(dry) == 0, "a dry run frees nothing");
+
+    // A run whose targets all refused still flushed the cache, and that is
+    // worth saying.
+    Outcome cache_only;
+    cache_only.failed = 9;
+    cache_only.cache_flushed = true;
+    Require(Reportable(cache_only), "a cache flush alone is still a result");
+}
+
+void TestPowerDefaultsComeFromTheCard() {
+    using namespace gtg;
+
+    // The two cards actually in use, read with the read-only probe.
+    const PowerEnvelope pro6000{150, 600, 350, 600};
+    const PowerEnvelope rtx4080{100, 320, 320, 320};
+
+    Require(Derive(pro6000).working_w == 350,
+            "working follows the limit already in force, not the default");
+    Require(Derive(pro6000).safe_w == 350,
+            "a default above the current limit collapses to the current one");
+    Require(!HasHeadroom(Derive(pro6000)), "so this box starts monitor-only");
+
+    Require(Derive(rtx4080).working_w == 320 && Derive(rtx4080).safe_w == 320,
+            "an untouched card yields an equal pair");
+    // The shipped constant of 350 W is unwritable here; a derived one never is.
+    Require(Derive(rtx4080).working_w <= rtx4080.maximum_w,
+            "the derived working limit is always writable");
+
+    // Raised above stock -- the only shape with real headroom.
+    const PowerEnvelope overclocked{150, 500, 450, 400};
+    Require(Derive(overclocked).working_w == 450, "an overclock is not undone");
+    Require(Derive(overclocked).safe_w == 400, "stock becomes the safe floor");
+    Require(HasHeadroom(Derive(overclocked)), "and that pair can protect");
+
+    // Exhaustive over every ordering of the four readings, including ones no
+    // sane driver reports. It is pure arithmetic, so the test can be total.
+    for (int minimum = 1; minimum <= 6; ++minimum) {
+        for (int maximum = 1; maximum <= 6; ++maximum) {
+            for (int current = 1; current <= 6; ++current) {
+                for (int fallback = 1; fallback <= 6; ++fallback) {
+                    const PowerEnvelope envelope{minimum, maximum, current, fallback};
+                    if (!IsUsable(envelope)) continue;
+                    const PowerDefaults derived = Derive(envelope);
+                    Require(derived.safe_w <= derived.working_w,
+                            "safe never exceeds working, for any reading");
+                    Require(derived.working_w >= minimum && derived.working_w <= maximum,
+                            "working stays inside the card's range");
+                    Require(derived.safe_w >= minimum && derived.safe_w <= maximum,
+                            "safe stays inside the card's range");
+                    ProtectionConfig config;
+                    config.normal_power_w = derived.working_w;
+                    config.safe_power_w = derived.safe_w;
+                    Require(!ValidateConfig(config).has_value(),
+                            "a derived pair is always accepted by the core");
+                }
+            }
+        }
+    }
+
+    // Trigger temperature, from the same two cards. Both land above the
+    // vendor maximum operating temperature, which is the point of the rule.
+    const ThermalEnvelope pro_thermal{93, 95, 98};
+    const ThermalEnvelope rtx_thermal{90, 94, 99};
+    Require(DeriveTriggerTemperature(pro_thermal, 85) == 94, "one below slowdown");
+    Require(DeriveTriggerTemperature(rtx_thermal, 85) == 93, "on the other card too");
+    Require(DeriveTriggerTemperature(pro_thermal, 85) > pro_thermal.max_c,
+            "deliberately above the maximum operating temperature");
+    Require(TriggerCeiling(pro_thermal) == 94 && TriggerCeiling(rtx_thermal) == 93,
+            "the ceiling is the same line the default sits on");
+
+    // No slowdown reading, or a nonsensical one, keeps the constant. A
+    // threshold invented from nothing is worse than the one it replaced.
+    Require(DeriveTriggerTemperature(ThermalEnvelope{90, 0, 99}, 85) == 85,
+            "an absent slowdown falls back");
+    Require(DeriveTriggerTemperature(ThermalEnvelope{20, 30, 40}, 85) == 85,
+            "and so does one below what the validator accepts");
+    Require(DeriveTriggerTemperature(ThermalEnvelope{100, 120, 130}, 85) == 85,
+            "and one above it");
+    for (int slowdown = 41; slowdown <= 101; ++slowdown) {
+        ProtectionConfig config;
+        config.trigger_temperature_c =
+            DeriveTriggerTemperature(ThermalEnvelope{0, slowdown, 0}, 85);
+        Require(!ValidateConfig(config).has_value(),
+                "every derived trigger is a configuration the core accepts");
+    }
+
+    // A partial reading is refused rather than repaired.
+    Require(!IsUsable(PowerEnvelope{0, 600, 350, 600}), "no minimum, no derivation");
+    Require(!IsUsable(PowerEnvelope{150, 600, 0, 600}), "no current, no derivation");
+    Require(!IsUsable(PowerEnvelope{150, 100, 350, 600}), "an inverted range is refused");
+}
+
+void TestMonitorOnlyWatchesAndNeverWrites() {
+    using namespace gtg;
+
+    ProtectionConfig config;
+    config.normal_power_w = 320;
+    config.safe_power_w = 320;
+    Require(IsMonitorOnly(config), "equal limits are monitor-only");
+    Require(!ValidateConfig(config).has_value(), "and are a legal configuration");
+
+    // Higher is still refused: a "safe" power above the working limit could
+    // only ever raise the card on a trip.
+    ProtectionConfig inverted = config;
+    inverted.safe_power_w = 400;
+    Require(ValidateConfig(inverted).has_value(), "safe above normal stays invalid");
+
+    ProtectionController controller(config);
+    Require(controller.state() == ProtectionState::MonitorOnly,
+            "a monitor-only config starts monitor-only, not armed");
+
+    // Straight through the trigger temperature and well past it.
+    for (int step = 0; step < 40; ++step) {
+        const auto decision = controller.ObserveTemperature(200 * step, 60 + step, 0);
+        Require(decision.action == ProtectionAction::None,
+                "monitor-only never asks for a power write");
+        Require(!decision.safe_latched, "and never latches");
+        Require(controller.state() == ProtectionState::MonitorOnly,
+                "and never leaves the state by observing");
+    }
+
+    // The fail-safes also end in a trip, so they must be quiet here too.
+    Require(controller.SensorUnavailable(9000).action == ProtectionAction::None,
+            "telemetry loss writes nothing when there is nothing to write");
+    Require(controller.SensorRecovered().action == ProtectionAction::None,
+            "recovery does not restore a limit that was never taken");
+    Require(controller.RestorePersistedSafeLatch().action == ProtectionAction::None,
+            "a latch from a configuration that no longer exists is dropped");
+    Require(controller.state() == ProtectionState::MonitorOnly,
+            "every entry point leaves it where it was");
+
+    // Configuring it is the act that arms it, and it has to be reachable --
+    // otherwise the first setting a reader makes is the one that cannot apply.
+    ProtectionConfig armed = config;
+    armed.safe_power_w = 256;
+    Require(controller.UpdateWorkingConfig(armed), "monitor-only can be configured out of");
+    Require(controller.state() == ProtectionState::Armed, "which arms it");
+
+    // And back, because a reader may decide they only wanted the dashboard.
+    Require(controller.UpdateWorkingConfig(config), "and back into");
+    Require(controller.state() == ProtectionState::MonitorOnly, "monitor-only");
+
+    // Through ApplyWorkingPower, not just UpdateWorkingConfig. The state rule
+    // exists in both places, and testing only the controller let a build ship
+    // in which every first configuration was refused.
+    {
+        ProtectionController fresh(config);
+        ProtectionConfig active = config;
+        bool wrote = false;
+        const auto result = ApplyWorkingPower(
+            fresh, active, armed, std::optional<int>(40), 0,
+            [&] { wrote = true; return true; }, [] { return true; },
+            [] { return true; });
+        Require(result.status == ApplyStatus::Applied,
+                "the first configuration a reader makes can be applied");
+        Require(wrote, "and it reaches the card");
+        Require(fresh.state() == ProtectionState::Armed, "which arms the guard");
+        Require(active.safe_power_w == armed.safe_power_w,
+                "and the active configuration is the requested one");
+    }
+
+    // The ordinary path must not have gone quiet with it.
+    ProtectionController guard(armed);
+    Require(guard.state() == ProtectionState::Armed, "a pair with headroom arms");
+    Require(guard.ObserveTemperature(200, armed.trigger_temperature_c, 0).action ==
+                ProtectionAction::ApplySafePower,
+            "and still applies safe power at the trigger temperature");
+}
+
+void TestRainAnimationIsDeterministicAndBounded() {
+    using namespace gtg::tray::animation;
+    constexpr int kColumns = 18;
+    constexpr int kRows = 12;
+
+    // Pinned, because the default is what almost every caller gets and a
+    // silent change to it would be a silent change to the product.
+    static_assert(kDefaultEffect == Effect::Rain);
+    Require(kDefaultEffect == Effect::Rain, "rain is the house effect");
+
+    // Every block, every column, across a full cycle of the slowest column.
+    bool lit_somewhere = false;
+    for (std::uint64_t t = 0; t < 40'000; t += 37) {
+        for (int c = 0; c < kColumns; ++c) {
+            int lit_in_column = 0;
+            float brightest = 0.0F;
+            for (int r = 0; r < kRows; ++r) {
+                const float v = RainIntensity(c, r, kRows, t);
+                Require(v >= 0.0F && v <= 1.0F, "intensity stays within range");
+                if (v > 0.0F) { ++lit_in_column; lit_somewhere = true; }
+                if (v > brightest) brightest = v;
+            }
+            // A column is a contiguous trail, never scattered blocks.
+            Require(lit_in_column <= RainTrail(c),
+                    "a column never lights more blocks than its trail is long");
+        }
+    }
+    Require(lit_somewhere, "something is actually drawn");
+
+    // Same inputs, same output, always -- nothing is carried between frames,
+    // so a dropped or repeated frame cannot corrupt the animation.
+    for (int c = 0; c < kColumns; ++c)
+        for (int r = 0; r < kRows; ++r)
+            Require(RainIntensity(c, r, kRows, 5'000) ==
+                        RainIntensity(c, r, kRows, 5'000),
+                    "the effect is a pure function of time and position");
+
+    // The head is the brightest block of its trail, and the trail fades.
+    for (int c = 0; c < kColumns; ++c) {
+        for (std::uint64_t t = 0; t < 4'000; t += 211) {
+            float previous = -1.0F;
+            bool seen = false;
+            bool monotonic = true;
+            for (int r = kRows - 1; r >= 0; --r) {
+                const float v = RainIntensity(c, r, kRows, t);
+                if (v == 0.0F) continue;
+                if (seen && v > previous) monotonic = false;
+                previous = v;
+                seen = true;
+            }
+            Require(monotonic || !seen,
+                    "a trail only ever dims from its head backwards");
+        }
+    }
+
+    // Columns must not march in step, or it reads as one falling line.
+    int distinct = 0;
+    for (int c = 1; c < kColumns; ++c) {
+        bool same = true;
+        for (int r = 0; r < kRows; ++r) {
+            if (RainIntensity(c, r, kRows, 1'234) !=
+                RainIntensity(0, r, kRows, 1'234)) { same = false; break; }
+        }
+        if (!same) ++distinct;
+    }
+    Require(distinct >= kColumns - 3, "columns fall independently");
+
+    // It moves.
+    bool changed = false;
+    for (int c = 0; c < kColumns && !changed; ++c)
+        for (int r = 0; r < kRows && !changed; ++r)
+            if (RainIntensity(c, r, kRows, 0) != RainIntensity(c, r, kRows, 900))
+                changed = true;
+    Require(changed, "the rain falls");
+
+    // Degenerate geometry is answered, not crashed into.
+    Require(RainIntensity(0, 0, 0, 100) == 0.0F, "no rows is dark");
+    Require(RainIntensity(-1, 0, kRows, 100) == 0.0F, "a negative column is dark");
+    Require(RainIntensity(0, kRows, kRows, 100) == 0.0F, "past the last row is dark");
+
+    // The sweep lives on the same grid, so one painter serves both.
+    bool sweep_lit = false;
+    for (std::uint64_t t = 0; t < kSweepPeriodMs; t += 17) {
+        for (int c = 0; c < kColumns; ++c) {
+            for (int r = 0; r < kRows; ++r) {
+                const float v = SweepIntensity(c, r, kColumns, kRows, t);
+                Require(v >= 0.0F && v <= 1.0F, "sweep stays within range");
+                if (v > 0.0F) {
+                    Require(r == kRows - 1, "the sweep keeps to its own row");
+                    sweep_lit = true;
+                }
+            }
+        }
+    }
+    Require(sweep_lit, "the sweep is drawn too");
+
+    Require(BlocksAcross(72.0F) == 18, "a cell is eighteen blocks across");
+    Require(BlocksAcross(51.0F) == 12, "and twelve down");
+    Require(BlocksAcross(0.0F) == 0, "an empty cell has no blocks");
+}
+
+void TestBusyIndicatorCoversItsCellExactly() {
+    using namespace gtg::tray::compact;
+    // The indicator is a window sized to one cell. Truncating its height lost
+    // half a pixel at 125 %, 150 % and 250 % scaling, which let the cell own
+    // border show along the bottom and the right -- and only those two,
+    // because truncation always loses on the far edge.
+    const auto round_to_px = [](const float value) {
+        return static_cast<int>(value + 0.5F);
+    };
+    for (const float scale : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
+        const float drawn_w = static_cast<float>(kCellWidthDip) * scale;
+        const float drawn_h = kCellHeightDip * scale;
+        Require(round_to_px(drawn_w) >= static_cast<int>(drawn_w),
+                "rounding never makes the window narrower than the cell");
+        Require(round_to_px(drawn_h) >= static_cast<int>(drawn_h),
+                "nor shorter");
+        Require(static_cast<float>(round_to_px(drawn_h)) - drawn_h < 1.0F &&
+                drawn_h - static_cast<float>(round_to_px(drawn_h)) < 1.0F,
+                "and never off by a whole pixel either way");
+    }
+    // The case that actually shipped broken.
+    Require(round_to_px(kCellHeightDip * 2.5F) == 128,
+            "51 dip at 250 percent rounds up to 128, not down to 127");
+}
+
+void TestOsdPreferenceDefaultsOn() {
+    // The overlay ships on. It shipped off for a long time because this
+    // default lived as a member initialiser no test could reach, which is the
+    // actual defect -- the wrong value was only its symptom.
+    Require(gtg::settings::ResolveOsdPreference(false, 0),
+            "an absent preference shows the overlay");
+    Require(gtg::settings::ResolveOsdPreference(true, 1),
+            "an explicit non-zero shows it");
+    Require(!gtg::settings::ResolveOsdPreference(true, 0),
+            "an explicit zero hides it, so turning it off sticks");
+    Require(gtg::settings::OsdPreference{}.enabled,
+            "and a default-constructed preference agrees with the resolver");
+}
+
 void TestRamPreferenceDefaultsOn() {
     Require(gtg::settings::ResolveRamPreference(false, 0),
             "absent preference enables the RAM record");
@@ -711,6 +1247,39 @@ void TestRamPreferenceDefaultsOn() {
             "an explicit non-zero enables it");
     Require(!gtg::settings::ResolveRamPreference(true, 0),
             "an explicit zero disables it");
+}
+
+// --- compact dashboard arrangement -----------------------------------------
+
+std::wstring Describe(const gtg::tray::compact::Placement& placed) {
+    std::wstring text;
+    int seen = 0;
+    for (int row = 0; row < placed.rows; ++row) {
+        if (row > 0) text += L"| ";
+        for (int i = 0; i < placed.row_length[static_cast<std::size_t>(row)]; ++i) {
+            switch (placed.cells[static_cast<std::size_t>(seen++)]) {
+                case gtg::tray::compact::Metric::Temperature: text += L"T "; break;
+                case gtg::tray::compact::Metric::Power: text += L"P "; break;
+                case gtg::tray::compact::Metric::Vram: text += L"V "; break;
+                case gtg::tray::compact::Metric::Gpu: text += L"G "; break;
+                case gtg::tray::compact::Metric::Cpu: text += L"C "; break;
+                case gtg::tray::compact::Metric::Ram: text += L"R "; break;
+                case gtg::tray::compact::Metric::Fps: text += L"F "; break;
+            }
+        }
+    }
+    return text;
+}
+
+// Build a layout whose placed rows have the given lengths.
+gtg::tray::compact::Layout LayoutWithRows(std::initializer_list<int> lengths) {
+    using namespace gtg::tray::compact;
+    std::array<int, kRecordCount> rows{};
+    int count = 0;
+    for (const int length : lengths) rows[static_cast<std::size_t>(count++)] = length;
+    Layout layout;
+    layout.breaks = BreaksFromRows(rows, count);
+    return layout;
 }
 
 void TestCompactDefaultFootprintIsOneRow() {
@@ -742,63 +1311,52 @@ void TestCompactDefaultFootprintIsOneRow() {
             "RAM is last when FPS is off");
 }
 
-// --- compact dashboard arrangement -----------------------------------------
-
-std::wstring Describe(const gtg::tray::compact::Placement& placed) {
-    std::wstring text;
-    for (int i = 0; i < placed.count; ++i) {
-        if (i == placed.row1) text += L"| ";
-        switch (placed.cells[static_cast<std::size_t>(i)]) {
-            case gtg::tray::compact::Metric::Temperature: text += L"T "; break;
-            case gtg::tray::compact::Metric::Power: text += L"P "; break;
-            case gtg::tray::compact::Metric::Vram: text += L"V "; break;
-            case gtg::tray::compact::Metric::Gpu: text += L"G "; break;
-            case gtg::tray::compact::Metric::Cpu: text += L"C "; break;
-            case gtg::tray::compact::Metric::Ram: text += L"R "; break;
-            case gtg::tray::compact::Metric::Fps: text += L"F "; break;
-        }
-    }
-    return text;
-}
-
-void TestCompactLayoutPlacement() {
+void TestCompactRowComposition() {
     using namespace gtg::tray::compact;
     const Layout def{};
-    Require(def.row1 == kRecordCount,
-            "the default arrangement is one row of every record");
+    Require(def.breaks == 0, "the default arrangement has no breaks");
 
-    // All seven enabled: one row, FPS last.
     const auto all = Resolve(def, true, true);
-    Require(Describe(all) == L"T P V G C R F ", "default places all seven in a row");
-    Require(all.rows == 1 && all.count == 7, "seven records are one row by default");
-    Require(all.cells[6] == Metric::Fps, "FPS is last by default");
+    Require(Describe(all) == L"T P V G C R F ", "no breaks is one row");
+    Require(all.rows == 1 && all.count == 7, "seven records, one row");
 
-    // A second row exists only once the reader arranges one.
-    const Layout narrow{DefaultOrder(), 5};
-    const auto split = Resolve(narrow, true, true);
-    Require(Describe(split) == L"T P V G C | R F ", "an arranged five splits the rest");
-    Require(split.rows == 2, "an arrangement of five wraps the remainder");
+    // Every composition the owner named, and the shape each produces.
+    struct Case { std::initializer_list<int> rows; const wchar_t* shape; int widest; };
+    const Case cases[] = {
+        {{5, 2},       L"T P V G C | R F ",        5},
+        {{4, 3},       L"T P V G | C R F ",        4},
+        {{3, 2, 2},    L"T P V | G C | R F ",      3},
+        {{2, 2, 2, 1}, L"T P | V G | C R | F ",    2},
+        {{5, 1, 1},    L"T P V G C | R | F ",      5},
+    };
+    for (const auto& c : cases) {
+        const auto placed = Resolve(LayoutWithRows(c.rows), true, true);
+        Require(Describe(placed) == std::wstring(c.shape), "composition places as written");
+        Require(WidestRow(placed) == c.widest, "widest row is the first one here");
+        int total = 0;
+        for (int r = 0; r < placed.rows; ++r)
+            total += placed.row_length[static_cast<std::size_t>(r)];
+        Require(total == placed.count, "the rows account for every placed record");
+    }
 
-    // Backfill worked through: disabling CPU promotes RAM into row one.
-    const auto no_cpu = Resolve(narrow, true, true, /*enabled=*/[](Metric m) {
-        return m != Metric::Cpu;
-    });
+    // A narrow trailing row costs nothing: width follows the widest row, so
+    // (5,1,1) is exactly as wide as (5,2) and only taller.
+    const auto tall = Resolve(LayoutWithRows({5, 1, 1}), true, true);
+    const auto flat = Resolve(LayoutWithRows({5, 2}), true, true);
+    Require(CollapsedWidth(WidestRow(tall)) == CollapsedWidth(WidestRow(flat)),
+            "a narrow trailing row does not widen the overlay");
+    Require(tall.rows == 3 && flat.rows == 2, "but it does make it taller");
+
+    // Disabling a record reflows the rows, the way it used to backfill.
+    const auto no_cpu = Resolve(LayoutWithRows({5, 2}), true, true,
+                                [](Metric m) { return m != Metric::Cpu; });
     Require(Describe(no_cpu) == L"T P V G R | F ",
-            "disabling a record backfills the first row");
-
-    // Five enabled records can only be one row.
-    const auto five = Resolve(def, false, false);
-    Require(Describe(five) == L"T P V G C ", "five records fill one row");
-    Require(five.rows == 1 && five.row1 == 5, "five records force a single row");
-
-    // A first row longer than the records shown is clamped, never wrapped.
-    Require(Resolve(def, true, false).rows == 1, "six records stay one row");
-    Require(Resolve(def, false, true).row1 == 6, "the first row clamps to the count");
+            "disabling a record reflows into the same row lengths");
 
     // A record is never placed twice and a disabled one is never placed.
     for (bool ram : {false, true}) {
         for (bool fps : {false, true}) {
-            const auto placed = Resolve(def, ram, fps);
+            const auto placed = Resolve(LayoutWithRows({3, 2, 2}), ram, fps);
             int seen[7]{};
             for (int i = 0; i < placed.count; ++i)
                 ++seen[static_cast<int>(placed.cells[static_cast<std::size_t>(i)])];
@@ -812,28 +1370,720 @@ void TestCompactLayoutPlacement() {
     }
 }
 
+void TestHeaderStatusTextThreshold() {
+    using namespace gtg::tray::compact;
+    // Measured at the real 9.5 dip status font, with 58 dip before the text
+    // and two 25 dip buttons after it. Three cells leaves 124 dip against a
+    // longest string of 95.8; two leaves 48, which fits only the shortest
+    // Chinese status. So the boundary is between two and three, and it is
+    // asserted rather than left to the renderer to rediscover.
+    Require(!HeaderShowsStatusText(1), "one cell has no room for words");
+    Require(!HeaderShowsStatusText(2), "two cells keep only the dot");
+    Require(HeaderShowsStatusText(3), "three cells fit every string");
+    Require(HeaderShowsStatusText(7), "and so does the widest arrangement");
+
+    // The available width the threshold is derived from, so a change to the
+    // margins or the buttons trips this rather than silently truncating.
+    for (int cells = 3; cells <= 7; ++cells) {
+        const int available = CollapsedWidth(cells) - 58 - 50 - 4;
+        Require(available >= 96, "three cells or more leave room for 95.8 dip");
+    }
+    Require(CollapsedWidth(2) - 58 - 50 - 4 < 96,
+            "two cells genuinely cannot fit the longest status");
+}
+
+void TestEighthRecordFillsTheWord() {
+    using namespace gtg::tray::compact;
+
+    Require(kRecordCount == 8, "network is the eighth record");
+    Require(IsOptional(Metric::Network), "and it is optional, like RAM and FPS");
+    Require(!IsOptional(Metric::Temperature), "while the thermal five are not");
+
+    // Off unless asked for, which is the shipped default and also what keeps
+    // every caller written before the eighth record meaning what it meant.
+    Require(Resolve(Layout{}, true, true).count == 7,
+            "the default arrangement does not place network");
+    const auto all = Resolve(Layout{}, true, true, true);
+    Require(all.count == 8, "and placing it gives eight records");
+    {
+        unsigned seen = 0;
+        for (int slot = 0; slot < all.count; ++slot)
+            seen |= 1u << static_cast<unsigned>(all.cells[static_cast<std::size_t>(slot)]);
+        Require(seen == (1u << kRecordCount) - 1u,
+                "each record exactly once, network included");
+    }
+
+    // Every break set of eight records survives the stored form. 128 of them
+    // now, where there were 64.
+    for (unsigned breaks = 0; breaks < (1u << kMaxBreaks); ++breaks) {
+        Layout layout;
+        layout.breaks = static_cast<std::uint8_t>(breaks);
+        Require(IsValidLayout(layout), "every break set is legal");
+        const auto restored = UnpackLayout(PackLayout(layout));
+        Require(restored.has_value(), "and round-trips");
+        Require(restored->breaks == layout.breaks, "with its breaks intact");
+        Require(restored->order == layout.order, "and its order intact");
+    }
+
+    // A non-default order round-trips too, so the 24 bits really are all read.
+    {
+        Layout layout;
+        layout.order = {Metric::Network, Metric::Fps, Metric::Ram, Metric::Cpu,
+                        Metric::Gpu, Metric::Vram, Metric::Power,
+                        Metric::Temperature};
+        layout.breaks = 0b1010101;
+        const auto restored = UnpackLayout(PackLayout(layout));
+        Require(restored.has_value() && restored->order == layout.order,
+                "a fully reversed order survives the stored form");
+        Require(restored->breaks == layout.breaks, "and so do all seven breaks");
+    }
+
+    // The tag moved from four bits at 28 to one bit at 31, because eight
+    // records leave exactly one bit. Everything the old schema wrote carried
+    // 1 << 28, so bit 31 was clear in all of it and is still rejected.
+    {
+        const std::uint32_t old_schema = (1u << 28) | 0b010101u | (0b101010u << 21);
+        Require(!UnpackLayout(old_schema).has_value(),
+                "a value from the four-bit tag schema is refused");
+        Require(SanitizeLayout(old_schema).order == DefaultOrder(),
+                "and the reader gets the default rather than a reshuffle");
+        Require(!UnpackLayout(0u).has_value(), "an empty value is refused");
+        Require(!UnpackLayout(0x7FFFFFFFu).has_value(),
+                "and so is anything with the tag bit clear");
+    }
+
+    // The word is full. A ninth record needs four-bit indices, and 36 + 8 + 1
+    // does not fit; this is the assertion that says so out loud rather than
+    // leaving it in a comment.
+    Require(kRecordCount * static_cast<int>(kRecordBits) + kMaxBreaks + 1 == 32,
+            "eight records use every bit of the stored word");
+    Require((kRecordCount + 1) * 4 + kRecordCount + 1 > 32,
+            "and a ninth cannot fit under any arrangement");
+}
+
+void TestNetworkVerdictJudgesTheWorst() {
+    using namespace gtg::net;
+
+    // Nothing measured is not the same as nothing wrong.
+    Require(Judge({10, 2, 0, 0, 0, 0}) == Grade::Unknown,
+            "an idle connection reports no verdict at all");
+    Require(Judge({10, 2, 0, 0, 0, 1}) == Grade::Good,
+            "one sample is enough to have an opinion");
+
+    // The three axes, each on its own.
+    Require(GradeLatency(0) == Grade::Good && GradeLatency(kGoodRttMs) == Grade::Good,
+            "up to the good bound is good");
+    Require(GradeLatency(kGoodRttMs + 1) == Grade::Fair, "past it is fair");
+    Require(GradeLatency(kFairRttMs) == Grade::Fair, "up to the fair bound");
+    Require(GradeLatency(kFairRttMs + 1) == Grade::Poor, "and past that, poor");
+    Require(GradeJitter(kGoodVarMs) == Grade::Good &&
+                GradeJitter(kFairVarMs + 1) == Grade::Poor,
+            "jitter grades the same way");
+    // Jitter is graded harder than latency, which is the whole point: a
+    // steady 80 ms is playable, a 40 ms swinging by 100 is not.
+    Require(kFairVarMs < kFairRttMs,
+            "variance is judged more harshly than distance");
+
+    Require(GradeLoss({0, 0, 0, 0, 0, 5}) == Grade::Good, "no loss is good");
+    Require(GradeLoss({0, 0, 3, 0, 0, 5}) == Grade::Fair,
+            "retransmission alone is recoverable");
+    Require(GradeLoss({0, 0, 0, 9, 0, 5}) == Grade::Fair,
+            "and so are duplicate acknowledgements");
+    Require(GradeLoss({0, 0, 0, 0, 1, 5}) == Grade::Poor,
+            "a timeout is poor whatever else is true");
+
+    // The worst decides, never the average. A nearby server that is losing
+    // packets is not half fine.
+    Require(Judge({5, 1, 0, 0, 2, 10}) == Grade::Poor,
+            "1 ms with timeouts is poor, not good");
+    Require(Judge({200, 1, 0, 0, 0, 10}) == Grade::Poor, "distance alone can be poor");
+    Require(Judge({5, 200, 0, 0, 0, 10}) == Grade::Poor, "so can jitter alone");
+    Require(Judge({5, 1, 0, 0, 0, 10}) == Grade::Good, "and clean is clean");
+
+    // Worst() is a total order with Unknown as the identity, so folding over
+    // connections in any sequence gives the same answer.
+    {
+        const Grade all[]{Grade::Unknown, Grade::Good, Grade::Fair, Grade::Poor};
+        for (const Grade a : all) {
+            Require(Worst(a, Grade::Unknown) == a, "unknown never overrides");
+            Require(Worst(Grade::Unknown, a) == a, "in either position");
+            for (const Grade b : all) {
+                Require(Worst(a, b) == Worst(b, a), "and the fold is symmetric");
+                for (const Grade c : all)
+                    Require(Worst(Worst(a, b), c) == Worst(a, Worst(b, c)),
+                            "and associative, so connection order cannot matter");
+            }
+        }
+    }
+
+    // Across a program's connections.
+    {
+        VerdictBuilder builder;
+        Require(builder.Result().grade == Grade::Unknown,
+                "no connections, no verdict");
+        Require(builder.Result().connections == 0, "and nothing counted");
+
+        builder.Add({20, 3, 0, 0, 0, 40});      // clean
+        Require(builder.Result().grade == Grade::Good, "one clean connection is good");
+        Require(builder.Result().rtt_ms == 20, "and reports its latency");
+
+        builder.Add({8, 2, 0, 0, 0, 0});        // idle: contributes nothing
+        Require(builder.Result().connections == 1,
+                "an idle connection is not counted as measured");
+
+        builder.Add({150, 90, 4, 12, 3, 40});   // the bad one
+        Require(builder.Result().grade == Grade::Poor,
+                "one failing connection makes the verdict poor");
+        Require(builder.Result().rtt_ms == 150,
+                "and the figure shown is the one the verdict came from");
+        Require(builder.Result().connections == 2, "two were measured");
+
+        builder.Add({15, 1, 0, 0, 0, 40});      // another clean one
+        Require(builder.Result().grade == Grade::Poor,
+                "a healthy connection does not redeem a failing one");
+        Require(builder.Result().rtt_ms == 150, "nor change the figure");
+    }
+}
+
+void TestLaneValueTakesWhatTheAnnotationLeaves() {
+    using namespace gtg::tray::compact;
+
+    // The lane as the expanded overlay draws it: 388 dip wide, nominal height.
+    constexpr float kRowX = 0.0F;
+    constexpr float kRowWidth = 388.0F;
+    constexpr float kScale = 1.0F;
+
+    // With nothing beside it, the value owns the band from the graph's left
+    // edge to the row's right. That is the case the Power lane is in.
+    {
+        const auto span = LaneValueSpan(kRowX, kRowWidth, 0.0F, kScale);
+        Require(span.x == LaneGraphSpan(kRowX, kRowWidth, kScale).x,
+                "with no annotation the value starts where the graph does");
+        Require(span.width > 132.0F,
+                "and is wider than the constant that cut 349.5 W (350 W)");
+        Require(span.x + span.width <= kRowX + kRowWidth,
+                "and never runs past the row");
+    }
+
+    // The part that actually broke: `scale` is LaneScale, which falls as
+    // records are added because they share a fixed window height. A constant
+    // box therefore shrank horizontally every time the dashboard gained a
+    // record, and the value face -- sized from the DPI scale, not this one --
+    // did not. Taking the free band makes the width stop caring.
+    {
+        const auto seven = LaneValueSpan(kRowX, kRowWidth, 0.0F, 0.678F);
+        const auto eight = LaneValueSpan(kRowX, kRowWidth, 0.0F, 0.590F);
+        Require(eight.width > seven.width,
+                "an extra record must not make the value box narrower");
+        Require(eight.width > 132.0F * 0.590F * 2.0F,
+                "and it is no longer a constant multiplied by a vertical ratio");
+    }
+
+    // With an annotation, the value starts after what that text measured --
+    // not after a reservation, which is how the two used to be kept apart.
+    {
+        const float annotation = 70.0F;   // "max 89 °C" at the label face
+        const auto span = LaneValueSpan(kRowX, kRowWidth, annotation, kScale);
+        const auto graph = LaneGraphSpan(kRowX, kRowWidth, kScale);
+        Require(span.x >= graph.x + annotation,
+                "the value begins past the annotation, never over it");
+        Require(span.x > LaneValueSpan(kRowX, kRowWidth, 0.0F, kScale).x,
+                "an annotation costs the value room, and only what it took");
+        Require(span.width < LaneValueSpan(kRowX, kRowWidth, 0.0F, kScale).width,
+                "the band is shared, not duplicated");
+    }
+
+    // A pathological annotation cannot squeeze the figure to nothing.
+    {
+        const auto span = LaneValueSpan(kRowX, kRowWidth, 1000.0F, kScale);
+        Require(span.width >= kLaneValueMinimumDip,
+                "there is always a floor to draw the reading in");
+    }
+
+    // Every scale, not just 100 %.
+    for (const float scale : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
+        const float width = 388.0F * scale;
+        const auto span = LaneValueSpan(0.0F, width, 70.0F * scale, scale);
+        Require(span.x + span.width <= width + 0.01F,
+                "the box stays inside the row at every scale");
+        Require(span.width > 0.0F, "and is never inverted");
+    }
+}
+
+void TestNetworkResultSaysWhatWasMeasured() {
+    using namespace gtg::net;
+    using namespace gtg::net::action;
+
+    // The figure and the mark describe the same connection, so a reader who
+    // reads one bar and a low number is not being shown two different paths.
+    {
+        const Verdict good{Grade::Good, 18, 3};
+        Require(ResultText(good, ProbeStatus::Ready) == L"18 ms",
+                "a graded verdict shows its latency");
+        Require(BarsFor(Grade::Good) == 3, "good fills the mark");
+        Require(BarsFor(Grade::Fair) == 2, "fair fills two");
+        Require(BarsFor(Grade::Poor) == 1, "poor fills one");
+        Require(BarsFor(Grade::Unknown) == 0,
+                "and nothing measured fills none, which is not the same as bad");
+    }
+
+    // Whole milliseconds at every magnitude. SmoothedRtt is an estimate with
+    // its own variance; a decimal on it would be precision the reading does
+    // not have.
+    {
+        for (const std::uint32_t rtt : {std::uint32_t{1}, std::uint32_t{99},
+                                        std::uint32_t{1234}}) {
+            const std::wstring text = ResultText({Grade::Fair, rtt, 1},
+                                                 ProbeStatus::Ready);
+            Require(text.find(L'.') == std::wstring::npos,
+                    "no decimal point at any magnitude");
+            Require(text.ends_with(L" ms"), "and the unit is always said");
+        }
+    }
+
+    // Every way it can fail says something different. This is the whole second
+    // half of the feature: when the network cannot be improved the reader must
+    // still learn something true about it.
+    {
+        // Each failure names itself. The two below were once the same word,
+        // and a reader who hit it could not tell whether to click again with
+        // their game in front or to conclude their game does not use TCP.
+        Require(ResultText({}, ProbeStatus::NoConnections) == L"no TCP",
+                "no IPv4 TCP is what was established -- not that nothing is connected");
+        Require(ResultText({}, ProbeStatus::NoForeground) == L"no app",
+                "and nothing in the foreground is a different thing again");
+        Require(ResultText({}, ProbeStatus::NoConnections) !=
+                    ResultText({}, ProbeStatus::NoForeground),
+                "so the two never read the same");
+        Require(ResultText({}, ProbeStatus::NotPermitted) == L"denied",
+                "a refusal is named rather than dressed up as a verdict");
+        Require(ResultText({}, ProbeStatus::NoLibrary) == L"n/a",
+                "and a machine that cannot answer says so");
+
+        // The trap this guards: a probe that started fine and measured nothing
+        // still has no verdict, and Ready must not be read as Good.
+        Require(ResultText({}, ProbeStatus::Ready) == L"--",
+                "ready but unmeasured is not a grade");
+        Require(BarsFor(Grade::Unknown) == 0, "and draws an empty mark");
+    }
+
+    // Colour agrees with the mark, always. A green cell with one bar would be
+    // two answers to one question.
+    {
+        Require(TintFor(Grade::Good) != TintFor(Grade::Fair), "three distinct tints");
+        Require(TintFor(Grade::Fair) != TintFor(Grade::Poor), "for three grades");
+        Require(TintFor(Grade::Unknown) != TintFor(Grade::Good),
+                "and unknown is not green");
+    }
+
+    // The window has to be long enough to difference the loss counters and
+    // short enough that nobody in a game walks away from it.
+    {
+        Require(kMeasureWindowMs >= 1000,
+                "shorter than a second cannot difference a retransmission count");
+        Require(kMeasureWindowMs <= 4000, "longer than four seconds is a wait");
+        Require(kMinimumVisibleMs < kMeasureWindowMs,
+                "the floor only matters when the probe fails early");
+        Require(kWorkBudgetMs > kMeasureWindowMs,
+                "the failsafe must outlast the work it is guarding");
+    }
+}
+
+void TestNetworkThroughputArithmetic() {
+    using namespace gtg::net;
+
+    // A rate needs two readings and a gap that means something.
+    const Counters first{1'000'000, 200'000, 10'000};
+    {
+        const auto rate = RateBetween(first, {2'048'000, 200'000, 11'000});
+        Require(rate.has_value(), "one second apart is a rate");
+        Require(rate->received_bytes_per_second == 1'048'000.0,
+                "and it is the difference over the elapsed seconds");
+        Require(rate->sent_bytes_per_second == 0.0,
+                "a direction that moved nothing rates zero");
+    }
+
+    // The three ways a difference stops meaning anything, all refused rather
+    // than papered over.
+    Require(!RateBetween(first, {2'000'000, 300'000, 10'000}).has_value(),
+            "no time passed, so there is no rate");
+    Require(!RateBetween(first, {2'000'000, 300'000, 9'000}).has_value(),
+            "a clock that went backwards is refused");
+    Require(!RateBetween(first, {900'000, 300'000, 11'000}).has_value(),
+            "a counter that went backwards means the adapter reset");
+    Require(!RateBetween(first, {2'000'000, 100'000, 11'000}).has_value(),
+            "in either direction");
+    Require(!RateBetween(first, {2'000'000, 300'000,
+                                 10'000 + kMaximumGapMs + 1}).has_value(),
+            "and a gap too long to describe now is refused");
+    Require(RateBetween(first, {2'000'000, 300'000,
+                                10'000 + kMaximumGapMs}).has_value(),
+            "the boundary itself is still usable");
+
+    // Two adapters' counters have nothing to do with each other. The route can
+    // resolve to a different interface while the stack settles after launch,
+    // and the difference across that switch is a rate no link ever carried.
+    {
+        const Counters on_a{1'000'000, 200'000, 10'000, 7};
+        const Counters on_b{9'000'000, 900'000, 11'000, 12};
+        Require(!RateBetween(on_a, on_b).has_value(),
+                "a difference across two adapters is refused");
+        const Counters still_a{2'000'000, 300'000, 11'000, 7};
+        Require(RateBetween(on_a, still_a).has_value(),
+                "while the same adapter is fine");
+    }
+
+    // A rate above what the adapter says it can carry did not happen. Measured
+    // on this machine: the default route reports 1 Gb/s, which is 119.2 MB/s,
+    // and the cell was showing hundreds for the first seconds after launch.
+    {
+        constexpr std::uint64_t gigabit = 1'000'000'000ULL;
+        const Counters before{0, 0, 0, 3, gigabit, gigabit};
+        // 300 MB/s on a gigabit link: impossible.
+        const Counters impossible{300ULL * 1024 * 1024, 0, 1000, 3, gigabit, gigabit};
+        Require(!RateBetween(before, impossible).has_value(),
+                "a receive rate the link cannot carry is refused");
+        const Counters impossible_up{0, 300ULL * 1024 * 1024, 1000, 3, gigabit, gigabit};
+        Require(!RateBetween(before, impossible_up).has_value(),
+                "and so is an impossible transmit rate");
+        // 100 MB/s on the same link is fast but real.
+        const Counters busy{100ULL * 1024 * 1024, 0, 1000, 3, gigabit, gigabit};
+        Require(RateBetween(before, busy).has_value(),
+                "a rate the link can carry is kept");
+
+        // An adapter that reports no link speed gets no ceiling: refusing
+        // everything would be worse than showing it.
+        const Counters silent_before{0, 0, 0, 3, 0, 0};
+        const Counters silent_after{300ULL * 1024 * 1024, 0, 1000, 3, 0, 0};
+        Require(RateBetween(silent_before, silent_after).has_value(),
+                "no stated link speed means no ceiling");
+        Require(!ExceedsLink(1e12, 0), "zero is not a ceiling");
+        Require(!ExceedsLink(1e12, kImplausibleLinkSpeedBps),
+                "and neither is a sentinel");
+        Require(ExceedsLink(126.0 * 1000 * 1000 * 1.30, gigabit),
+                "beyond the tolerance is refused");
+        Require(!ExceedsLink(125.0 * 1000 * 1000, gigabit),
+                "exactly at the wire rate is not");
+    }
+
+    // Counters are 64-bit and cumulative; a huge but legal difference must not
+    // overflow or come out negative.
+    {
+        const Counters low{0, 0, 0};
+        const Counters high{1ULL << 40, 1ULL << 39, 1000};
+        const auto rate = RateBetween(low, high);
+        Require(rate.has_value() && rate->received_bytes_per_second > 0.0,
+                "a terabyte-scale difference is still a positive rate");
+    }
+
+    // One unit, always. The adaptive one was removed, not merely defaulted:
+    // 「這麼小的 CELL 沒人會注意到單位不同。只會覺得很怪」 -- a suffix nobody
+    // re-reads is a suffix that silently makes a comparison a thousand times
+    // wrong.
+    Require(kDisplayUnit == Unit::Megabytes, "megabytes per second, everywhere");
+    {
+        char suffix[8]{};
+        WideCharToMultiByte(CP_UTF8, 0, UnitSuffix(kDisplayUnit), -1, suffix,
+                            sizeof(suffix) - 1, nullptr, nullptr);
+        Require(std::string_view(suffix) == "MB/s", "and it says so");
+    }
+
+    // Tenths of that one unit, with the ceiling rule: a live direction never
+    // renders as zero, however far below the other it is.
+    Require(TenthsIn(0.0, kDisplayUnit) == 0, "exactly nothing prints nothing");
+    Require(TenthsIn(800.0, kDisplayUnit) == 1,
+            "800 B/s floors at one tenth of a megabyte");
+    Require(TenthsIn(671.0 * 1024, kDisplayUnit) == 7,
+            "and ordinary traffic keeps a digit worth reading");
+    Require(TenthsIn(12.4 * 1024 * 1024, kDisplayUnit) == 124,
+            "while a busy link reads as itself");
+    for (double bytes = 0.5; bytes < 4.0 * 1024 * 1024 * 1024; bytes *= 1.7) {
+        Require(TenthsIn(bytes, kDisplayUnit) >= 1,
+                "no positive reading ever renders as zero");
+    }
+
+    // Whole units are still available for anywhere that wants them, with the
+    // same floor.
+    Require(WholeIn(0.0, kDisplayUnit) == 0, "nothing still prints nothing");
+    Require(WholeIn(1.0, kDisplayUnit) == 1, "one byte a second is not zero");
+    Require(WholeIn(12.4 * 1024 * 1024, kDisplayUnit) == 13,
+            "and a real reading rounds up, never down");
+
+    // One span for both curves, so their heights compare honestly.
+    Require(SharedPeak({12.0, 800.0}) == 800.0, "the peak is the larger one");
+    Require(SharedPeak({800.0, 12.0}) == 800.0, "whichever direction it is in");
+}
+
+void TestCompactSwapOnOverlap() {
+    using namespace gtg::tray::compact;
+
+    const Layout flat;                       // 1 x 7, default order
+    const auto placed = Resolve(flat, true, true);
+    const CellGrid grid = MakeCellGrid(7, CollapsedWidth(7), 1.0F);
+
+    // A release is read against the cell it is nearest to, and that cell is
+    // divided into zones. Squarely on one is a swap; beside it inserts into
+    // its row; above or below opens a new row there.
+    const float cell_w = grid.cell_width_dip;
+    const float cell_h = kCellHeightDip;
+    const auto at = [&](int slot, float nx, float ny) {
+        const CellOrigin cell = CellOriginAt(grid, placed, slot);
+        return PlanDrop(grid, placed,
+                        static_cast<int>(cell.x + nx * cell_w / 2.0F),
+                        static_cast<int>(cell.y + ny * cell_h / 2.0F));
+    };
+
+    for (int slot = 0; slot < placed.count; ++slot) {
+        const auto plan = at(slot, 0.0F, 0.0F);
+        Require(plan.action == DropAction::Swap && plan.slot == slot,
+                "dead centre on a cell is a swap with it");
+    }
+
+    // Beside a cell, along the axis it is furthest from.
+    {
+        const auto before = at(3, -1.0F, 0.0F);
+        Require(before.action == DropAction::InsertInRow && before.column == 3,
+                "to the left inserts before it");
+        const auto after = at(3, 1.0F, 0.0F);
+        Require(after.action == DropAction::InsertInRow && after.column == 4,
+                "to the right inserts after it");
+    }
+
+    // Above or below, which is the change the single column needed: a row can
+    // now be opened anywhere, not only past the last one.
+    {
+        const auto above = at(0, 0.0F, -1.0F);
+        Require(above.action == DropAction::InsertRow && above.row == 0,
+                "above the first cell opens a row before it");
+        const auto below = at(0, 0.0F, 1.0F);
+        Require(below.action == DropAction::InsertRow && below.row == 1,
+                "and below it opens one after");
+    }
+
+    // Released into empty space: nothing happens.
+    Require(at(0, 0.0F, 4.0F).action == DropAction::None,
+            "a release well clear of the strip changes nothing");
+    Require(at(0, -4.0F, 0.0F).action == DropAction::None,
+            "in either direction");
+
+    // The zones tile the plane: whatever cell the planner reads a release
+    // against, that cell is the nearest one, and the zone rule was applied to
+    // it. Asserting against a cell chosen in advance would be asserting the
+    // test'''s arithmetic instead of the planner'''s.
+    for (int step_x = -40; step_x <= 40; ++step_x) {
+        for (int step_y = -40; step_y <= 40; ++step_y) {
+            const int x = static_cast<int>(CellOriginAt(grid, placed, 2).x) +
+                          step_x * 4;
+            const int y = static_cast<int>(CellOriginAt(grid, placed, 2).y) +
+                          step_y * 4;
+            const auto plan = PlanDrop(grid, placed, x, y);
+            if (plan.action == DropAction::None) continue;
+
+            const CellOrigin chosen = CellOriginAt(grid, placed, plan.slot);
+            const float nx = (static_cast<float>(x) - chosen.x) * 2.0F / cell_w;
+            const float ny = (static_cast<float>(y) - chosen.y) * 2.0F / cell_h;
+            const float ax = nx < 0.0F ? -nx : nx;
+            const float ay = ny < 0.0F ? -ny : ny;
+
+            // It really is the nearest cell.
+            for (int slot = 0; slot < placed.count; ++slot) {
+                const CellOrigin other = CellOriginAt(grid, placed, slot);
+                const float ox = (static_cast<float>(x) - other.x) * 2.0F / cell_w;
+                const float oy = (static_cast<float>(y) - other.y) * 2.0F / cell_h;
+                Require(ox * ox + oy * oy >= nx * nx + ny * ny - 0.001F,
+                        "the release is read against the nearest cell");
+            }
+
+            if (ax <= kSwapZone && ay <= kSwapZone) {
+                Require(plan.action == DropAction::Swap,
+                        "the middle of a cell always swaps");
+            } else {
+                Require(plan.action ==
+                            (ay > ax ? DropAction::InsertRow
+                                     : DropAction::InsertInRow),
+                        "and outside it the longer axis decides");
+            }
+        }
+    }
+
+    // A new row in the middle of a single column, in one gesture.
+    {
+        const Layout column_layout = LayoutWithRows({1, 1, 1, 1, 1, 1, 1});
+        const auto tower = Resolve(column_layout, true, true);
+        Require(tower.rows == 7, "seven rows to begin with");
+        const Layout moved = ApplyDropRow(column_layout, tower, 6, 2);
+        const auto after_move = Resolve(moved, true, true);
+        Require(after_move.rows == 7 && WidestRow(after_move) == 1,
+                "the shape is unchanged because a column has one cell a row");
+        Require(after_move.cells[2] == tower.cells[6],
+                "and the dragged record landed in the row it opened");
+    }
+
+    // The same gesture in a multi-row arrangement genuinely adds a row.
+    {
+        const Layout four_three = LayoutWithRows({4, 3});
+        const auto shape = Resolve(four_three, true, true);
+        const Layout inserted = ApplyDropRow(four_three, shape, 0, 1);
+        const auto after_insert = Resolve(inserted, true, true);
+        Require(after_insert.rows == 3, "a row opens between the two");
+        Require(after_insert.row_length[0] == 3 && after_insert.row_length[1] == 1 &&
+                    after_insert.row_length[2] == 3,
+                "leaving 3, 1, 3");
+        Require(after_insert.cells[3] == shape.cells[0],
+                "with the dragged record alone in the middle row");
+    }
+
+    // Appending is the same operation at the end, so the old bottom target is
+    // not a special case any more.
+    {
+        const Layout four_three = LayoutWithRows({4, 3});
+        const auto shape = Resolve(four_three, true, true);
+        const auto appended = Resolve(ApplyDropRow(four_three, shape, 0, 2), true, true);
+        Require(appended.rows == 3 && appended.row_length[2] == 1,
+                "dropping past the last row still appends one");
+    }
+
+    // Refusals stay refusals.
+    Require(ApplyDropRow(flat, placed, 0, -1).order == flat.order,
+            "a negative row is refused");
+    Require(ApplyDropRow(flat, placed, 0, placed.rows + 1).order == flat.order,
+            "and one past the end");
+
+    // The exchange itself: two records trade places, nothing else moves.    // The exchange itself: two records trade places, nothing else moves.
+    const Layout swapped = ApplySwap(flat, placed, 0, 3);
+    const auto after = Resolve(swapped, true, true);
+    Require(after.cells[0] == placed.cells[3] && after.cells[3] == placed.cells[0],
+            "the two records trade places");
+    for (int slot = 0; slot < placed.count; ++slot) {
+        if (slot == 0 || slot == 3) continue;
+        Require(after.cells[static_cast<std::size_t>(slot)] ==
+                    placed.cells[static_cast<std::size_t>(slot)],
+                "and every other record stays exactly where it was");
+    }
+    Require(swapped.breaks == flat.breaks, "a swap never changes the shape");
+    Require(IsValidLayout(swapped), "and always leaves a legal arrangement");
+
+    // Across rows, a swap exchanges rows without changing either row's length.
+    const Layout two_rows = LayoutWithRows({4, 3});
+    const auto tall = Resolve(two_rows, true, true);
+    const Layout crossed = ApplySwap(two_rows, tall, 0, 5);
+    const auto after_cross = Resolve(crossed, true, true);
+    Require(RowOf(after_cross, 0) == 0 && RowOf(after_cross, 5) == 1,
+            "the slots keep their rows");
+    Require(after_cross.row_length[0] == tall.row_length[0] &&
+                after_cross.row_length[1] == tall.row_length[1],
+            "and the row lengths are untouched");
+    Require(after_cross.cells[0] == tall.cells[5] &&
+                after_cross.cells[5] == tall.cells[0],
+            "while the two records have exchanged rows");
+
+    // Refusals are refusals, not clamps.
+    Require(ApplySwap(flat, placed, 2, 2).order == flat.order,
+            "swapping a cell with itself changes nothing");
+    Require(ApplySwap(flat, placed, -1, 3).order == flat.order,
+            "and an out-of-range slot is refused");
+    Require(ApplySwap(flat, placed, 0, placed.count).order == flat.order,
+            "at either end");
+
+    // Swaps compose: any order is reachable, so nothing was lost by preferring
+    // them to insertion over a cell.
+    Layout walk = flat;
+    auto walk_placed = Resolve(walk, true, true);
+    for (int slot = 0; slot + 1 < walk_placed.count; ++slot) {
+        walk = ApplySwap(walk, walk_placed, slot, slot + 1);
+        walk_placed = Resolve(walk, true, true);
+        Require(IsValidLayout(walk), "every intermediate arrangement is legal");
+    }
+    Require(walk_placed.count == 7, "and still holds every record once");
+}
+
+void TestCompactWidestRowFloor() {
+    using namespace gtg::tray::compact;
+    // A single column is a shape a reader can ask for, to dock the dashboard
+    // against a screen edge. It used to collapse to one row, on the grounds
+    // that 84 dip could not hold the lock, the chevron and a grabbable drag
+    // strip -- see the measurement below, which is why that is no longer true.
+    const auto singles = Resolve(LayoutWithRows({1, 1, 1, 1, 1, 1, 1}), true, true);
+    Require(singles.rows == 7 && singles.row_length[0] == 1,
+            "a single column is kept as the reader arranged it");
+    Require(WidestRow(singles) == 1, "and its widest row really is one");
+
+    // The claim that made the old rule look necessary, checked against the hit
+    // tests themselves rather than against a number written in a comment. The
+    // comment said 24 dip, "roughly 2.5 mm at 100 %"; 24 dip is 6.35 mm, and
+    // the real strip is wider than that again.
+    {
+        const int width = CollapsedWidth(1);
+        const int header = 25;   // kDragHeightDip
+        int draggable = 0;
+        for (int x = 0; x < width; ++x) {
+            if (!ToggleHit(x, 1, width, header) && !LockHit(x, 1, width, header))
+                ++draggable;
+        }
+        Require(width == 84, "one column is 84 dip across");
+        Require(HeaderButtonWidth(header) == 22, "the buttons are nine tenths of the band");
+        Require(draggable == 40, "40 of which are draggable");
+        // 40 dip at 96 dpi is 10.6 mm, and the band is 25 dip tall. A Windows
+        // title bar is about 7 mm. The floor exists so this stays checkable.
+        Require(draggable >= 24, "a single column keeps a grabbable strip");
+        // The two buttons are adjacent, so the strip is one run rather than
+        // two -- a gap between them would be draggable and look like a seam.
+        Require(!ToggleHit(width - 23, 1, width, header) &&
+                    LockHit(width - 23, 1, width, header),
+                "the lock starts exactly where the chevron ends");
+        Require(!HeaderShowsTitle(1), "which is only true once the label goes");
+        Require(HeaderShowsTitle(2), "two cells across keeps it");
+        Require(!HeaderShowsStatusText(1), "and no status words at 84 dip");
+    }
+
+    // The margin under the last cell is the same whatever the shape. It was
+    // not: the height increment was one dip short of the row pitch, so each
+    // extra row ate a dip, and by seven rows the bottom cell sat against the
+    // frame. Derived from the geometry rather than compared to a constant, so
+    // it stays true if either number moves.
+    for (int rows = 1; rows <= kRecordCount; ++rows) {
+        Require(CollapsedBottomMargin(rows) == CollapsedBottomMargin(1),
+                "the margin below the last cell does not depend on row count");
+        Require(CollapsedBottomMargin(rows) > 0,
+                "and it is a margin rather than an overlap");
+    }
+
+    // Every composition of seven records is now legal, and every one of them
+    // survives a round trip through the stored form.
+    for (unsigned breaks = 0; breaks < 64; ++breaks) {
+        Layout layout;
+        layout.breaks = static_cast<std::uint8_t>(breaks);
+        Require(IsValidLayout(layout), "every break set is a legal arrangement");
+        const auto placed = Resolve(layout, true, true);
+        Require(placed.count == 7, "all seven records are placed");
+        Require(WidestRow(placed) >= kMinimumWidestRow, "and none is below the floor");
+        const auto restored = UnpackLayout(PackLayout(layout));
+        Require(restored.has_value() && restored->breaks == layout.breaks,
+                "and it round-trips through the stored form");
+    }
+    Require(WidestRow(singles) >= kMinimumWidestRow, "the floor is enforced");
+
+    // Everything with a widest row of two or more is left exactly as asked.
+    const auto narrow = Resolve(LayoutWithRows({2, 1, 1, 1, 1, 1}), true, true);
+    Require(narrow.rows == 6, "two at the top is enough to keep six rows");
+    Require(CollapsedWidth(WidestRow(narrow)) == 160, "and it is 160 dip wide");
+}
+
 void TestCompactLayoutMoveInsert() {
     using namespace gtg::tray::compact;
     const Order start = DefaultOrder();
 
-    // Forward: the dropped record takes the slot, the rest shift back.
-    const auto forward = MoveInsert(start, 0, 3);
-    Require(forward[0] == Metric::Power && forward[1] == Metric::Vram &&
-            forward[2] == Metric::Gpu && forward[3] == Metric::Temperature,
-            "moving forward shifts the intervening records back");
+    const Order forward = MoveInsert(start, 0, 3);
+    Require(forward[3] == Metric::Temperature && forward[0] == Metric::Power,
+            "a forward move shifts the records between");
+    const Order backward = MoveInsert(start, 5, 1);
+    Require(backward[1] == Metric::Ram && backward[2] == Metric::Power,
+            "a backward move shifts the other way");
+    Require(MoveInsert(start, 2, 2) == start, "a move onto itself is identity");
+    Require(MoveInsert(start, -1, 2) == start, "a negative index is refused");
+    Require(MoveInsert(start, 2, kRecordCount) == start,
+            "an index past the end is refused");
 
-    // Backward: the rest shift forward.
-    const auto backward = MoveInsert(start, 6, 0);
-    Require(backward[0] == Metric::Fps && backward[1] == Metric::Temperature &&
-            backward[6] == Metric::Ram,
-            "moving backward shifts the intervening records forward");
-
-    // Identity and refusal.
-    Require(MoveInsert(start, 2, 2) == start, "moving onto its own slot changes nothing");
-    Require(MoveInsert(start, -1, 3) == start, "a negative index is refused");
-    Require(MoveInsert(start, 0, 7) == start, "an out-of-range target is refused");
-
-    // A move can never lose or duplicate a record.
     for (int from = 0; from < kRecordCount; ++from) {
         for (int to = 0; to < kRecordCount; ++to) {
             Require(IsValidOrder(MoveInsert(start, from, to)),
@@ -844,145 +2094,154 @@ void TestCompactLayoutMoveInsert() {
 
 void TestCompactLayoutStoredValueCannotHideARecord() {
     using namespace gtg::tray::compact;
-
-    // Round trip.
-    Layout custom{MoveInsert(DefaultOrder(), 6, 0), 6};
+    Layout custom;
+    custom.order = MoveInsert(DefaultOrder(), 0, 4);
+    custom.breaks = LayoutWithRows({3, 2, 2}).breaks;
     const auto restored = UnpackLayout(PackLayout(custom));
-    Require(restored.has_value(), "a well-formed value round trips");
-    Require(restored->order == custom.order && restored->row1 == custom.row1,
-            "the round trip preserves order and row count");
+    Require(restored && restored->order == custom.order &&
+                restored->breaks == custom.breaks,
+            "a layout survives the round trip");
 
-    // A duplicated record, and therefore a missing one, is refused.
-    Order duplicated = DefaultOrder();
-    duplicated[6] = duplicated[0];
-    Require(!IsValidOrder(duplicated), "a duplicated record is not a valid order");
-    Require(!UnpackLayout(PackLayout({duplicated, 5})).has_value(),
-            "a duplicated record is refused on load");
+    // The previous schema put a three-bit first-row count where the breaks now
+    // live, so an untagged value would decode as a plausible but different
+    // arrangement. Losing a layout is better than silently reshaping it.
+    const std::uint32_t old_format = 0x00A53210u;   // no format nibble
+    Require(!UnpackLayout(old_format), "a value from the old schema is rejected");
+    Require(SanitizeLayout(old_format).breaks == 0,
+            "and sanitizes to the default single row");
 
-    // Illegal row counts are refused.
-    Require(!UnpackLayout(PackLayout({DefaultOrder(), 4})).has_value(),
-            "fewer than five in the first row is refused");
-    Require(!UnpackLayout(PackLayout({DefaultOrder(), 8})).has_value(),
-            "more records than exist in the first row is refused");
+    Require(!UnpackLayout(0), "zero is not a valid layout");
+    Require(SanitizeLayout(0).order == DefaultOrder(), "zero gives the default");
 
-    // Arbitrary rubbish never yields a layout that hides a record.
-    for (std::uint32_t raw : {0u, 1u, 0xFFFFFFFFu, 0xDEADBEEFu, 0x00FFFFFFu}) {
-        const Layout used = SanitizeLayout(raw);
-        Require(IsValidOrder(used.order),
-                "a rejected stored value still yields every record exactly once");
-        Require(used.row1 >= kCellsPerRow && used.row1 <= kRecordCount,
-                "a rejected stored value still yields a legal row count");
+    // A duplicated or missing record must never survive.
+    Layout duplicated = custom;
+    duplicated.order[2] = duplicated.order[1];
+    Require(!UnpackLayout(PackLayout(duplicated)), "a duplicate is rejected");
+
+    for (std::uint32_t rubbish : {0xFFFFFFFFu, 0x12345678u, 0xDEADBEEFu,
+                                  0x10000000u, 0x1FFFFFFFu}) {
+        const Layout safe = SanitizeLayout(rubbish);
+        int seen[7]{};
+        for (const Metric metric : safe.order)
+            ++seen[static_cast<int>(metric)];
+        for (int i = 0; i < 7; ++i)
+            Require(seen[i] == 1, "every record present exactly once after sanitizing");
+        Require((safe.breaks >> kMaxBreaks) == 0, "no break bit outside the field");
     }
-    Require(SanitizeLayout(0u).order == DefaultOrder(),
-            "an absent or zero value is the default arrangement");
 }
 
 void TestCellHitTestingAcrossScales() {
     using namespace gtg::tray::compact;
-    for (float scale : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
-        const Layout two_rows{DefaultOrder(), 5};
-        const auto placed = Resolve(two_rows, true, true);
-        const int width = static_cast<int>(CollapsedWidth(placed.row1) * scale);
-        const auto grid = MakeCellGrid(placed.row1, width, scale);
+    for (const float scale : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
+        for (const auto& rows : {std::initializer_list<int>{7},
+                                 std::initializer_list<int>{5, 2},
+                                 std::initializer_list<int>{3, 2, 2},
+                                 std::initializer_list<int>{2, 2, 2, 1}}) {
+            const auto placed = Resolve(LayoutWithRows(rows), true, true);
+            const int width =
+                static_cast<int>(CollapsedWidth(WidestRow(placed)) * scale);
+            const auto grid = MakeCellGrid(WidestRow(placed), width, scale);
 
-        // Every slot finds itself, and no slot finds another.
-        for (int slot = 0; slot < placed.count; ++slot) {
-            const CellOrigin origin = CellOriginAt(grid, slot);
-            const int cx = static_cast<int>(origin.x + grid.cell_width_dip * scale / 2.0F);
-            const int cy = static_cast<int>(origin.y + kCellHeightDip * scale / 2.0F);
-            Require(CellSlotAt(grid, placed.count, cx, cy) == slot,
-                    "a cell centre hits its own slot");
-            const auto target = DropTargetAt(grid, cx, cy);
-            Require(target.row == slot / grid.per_row &&
-                    target.column == slot % grid.per_row,
-                    "a cell centre resolves to its own row and column");
+            for (int slot = 0; slot < placed.count; ++slot) {
+                const auto origin = CellOriginAt(grid, placed, slot);
+                const int x = static_cast<int>(
+                    origin.x + grid.cell_width_dip * scale / 2.0F);
+                const int y = static_cast<int>(
+                    origin.y + kCellHeightDip * scale / 2.0F);
+                Require(CellSlotAt(grid, placed, x, y) == slot,
+                        "every cell finds itself at every scale");
+                const auto target = DropTargetAt(grid, placed, x, y);
+                Require(target.row == RowOf(placed, slot),
+                        "a release inside a cell resolves to its own row");
+            }
+            // The header is never a cell.
+            Require(CellSlotAt(grid, placed, width / 2, 4) < 0,
+                    "the header is not a cell");
+            // One band below the last row means a new row.
+            const float below =
+                (kCellsTopDip + static_cast<float>(placed.rows) *
+                                    static_cast<float>(kCollapsedRowPitch) +
+                 4.0F) * scale;
+            Require(DropTargetAt(grid, placed, width / 2,
+                                 static_cast<int>(below)).row == placed.rows,
+                    "the band below the last row opens a new one");
         }
-
-        // The header belongs to the drag bar and the two buttons, never a cell.
-        const int header = static_cast<int>(25 * scale);
-        for (int x = 0; x < width; x += 7)
-            Require(CellSlotAt(grid, placed.count, x, header / 2) == -1,
-                    "the header is never a cell");
-        Require(DropTargetAt(grid, width / 2, header / 2).row == -1,
-                "a release in the header is refused");
-
-        // Releasing below the second row is refused rather than clamped into it.
-        const int far_below =
-            static_cast<int>((kCellsTopDip + kCollapsedRowPitch * 3) * scale);
-        Require(DropTargetAt(grid, width / 2, far_below).row == -1,
-                "a release below the rows is refused");
-
-        // A release in the gap between two cells still resolves.
-        const CellOrigin first = CellOriginAt(grid, 0);
-        const int gap_x =
-            static_cast<int>(first.x + grid.cell_width_dip * scale + 1.0F);
-        const int gap_y = static_cast<int>(first.y + kCellHeightDip * scale / 2.0F);
-        Require(CellSlotAt(grid, placed.count, gap_x, gap_y) == -1,
-                "the gap is not inside a cell");
-        Require(DropTargetAt(grid, gap_x, gap_y).row == 0,
-                "but a release in the gap still lands in the first row");
     }
 }
 
 void TestCompactDropRules() {
     using namespace gtg::tray::compact;
-    const Layout two_rows{DefaultOrder(), 5};          // T P V G C | R F
-    const auto placed = Resolve(two_rows, true, true);
+    const Layout one_row;
+    const auto flat = Resolve(one_row, true, true);
 
-    // Reordering within a row moves the record and leaves the rows alone.
-    const Layout reordered = ApplyDrop(two_rows, placed, 0, 0, 3);
-    Require(reordered.row1 == 5, "a same-row drop does not change the rows");
-    Require(Describe(Resolve(reordered, true, true)) == L"P V G T C | R F ",
-            "a same-row drop reorders only");
+    // Dropping below the last row starts a new one. Without this no
+    // arrangement deeper than the current one could ever be reached.
+    const Layout split = ApplyDrop(one_row, flat, 6, flat.rows, 0);
+    const auto after = Resolve(split, true, true);
+    Require(after.rows == 2, "a release below the last row opens a row");
+    Require(after.row_length[0] == 6 && after.row_length[1] == 1,
+            "and the dragged record is alone in it");
 
-    // Dragging down opens a second row by shrinking the first.
-    const Layout one_row{DefaultOrder(), 7};           // T P V G C R F
-    const auto wide = Resolve(one_row, true, true);
-    const Layout dropped_down = ApplyDrop(one_row, wide, 0, 1, 0);
-    Require(dropped_down.row1 == 6, "dragging down shrinks the first row by one");
-    Require(Resolve(dropped_down, true, true).rows == 2,
-            "dragging down opens the second row");
+    // Dragging the only cell of the last row back up removes that row, so
+    // rows merge without needing a gesture of their own.
+    const Layout merged = ApplyDrop(split, after, 6, 0, 6);
+    Require(Resolve(merged, true, true).rows == 1, "emptying a row removes it");
 
-    // Dragging up from the second row grows the first row again.
-    const Layout dropped_up = ApplyDrop(two_rows, placed, 5, 0, 0);
-    Require(dropped_up.row1 == 6, "dragging up grows the first row by one");
+    // Out of range is refused, never clamped.
+    Require(ApplyDrop(one_row, flat, -1, 0, 0).breaks == one_row.breaks,
+            "a negative source is refused");
+    Require(ApplyDrop(one_row, flat, 99, 0, 0).breaks == one_row.breaks,
+            "a source past the end is refused");
+    Require(ApplyDrop(one_row, flat, 0, flat.rows + 1, 0).breaks == one_row.breaks,
+            "a row two bands below the last is refused");
+    Require(ApplyDrop(one_row, flat, 0, 0, -1).breaks == one_row.breaks,
+            "a negative column is refused");
 
-    // Moving everything up ends with a single row.
-    Layout climbing{DefaultOrder(), 5};
-    for (int i = 0; i < 4; ++i) {
-        const auto now = Resolve(climbing, true, true);
-        if (now.rows == 1) break;
-        climbing = ApplyDrop(climbing, now, now.row1, 0, 0);
+    // The move that used to be refused -- splitting the last two-wide row into
+    // a seventh, leaving a single column -- now completes. Nothing is refused
+    // for the shape it would produce.
+    const Layout six_rows = LayoutWithRows({2, 1, 1, 1, 1, 1});
+    const auto tall = Resolve(six_rows, true, true);
+    Require(WidestRow(tall) == 2, "the arrangement starts two wide");
+    const Layout split_to_column = ApplyDrop(six_rows, tall, 1, tall.rows, 0);
+    const auto single_column = Resolve(split_to_column, true, true);
+    Require(single_column.rows == 7 && WidestRow(single_column) == 1,
+            "and can be dragged the rest of the way into a single column");
+
+    // Exhaustive: every drop from every arrangement yields something valid.
+    for (const auto& rows : {std::initializer_list<int>{7},
+                             std::initializer_list<int>{5, 2},
+                             std::initializer_list<int>{4, 3},
+                             std::initializer_list<int>{3, 2, 2},
+                             std::initializer_list<int>{2, 2, 2, 1}}) {
+        const Layout layout = LayoutWithRows(rows);
+        const auto placed = Resolve(layout, true, true);
+        for (int from = 0; from < placed.count; ++from) {
+            for (int row = 0; row <= placed.rows; ++row) {
+                for (int column = 0; column <= placed.count; ++column) {
+                    const Layout next = ApplyDrop(layout, placed, from, row, column);
+                    Require(IsValidLayout(next), "every drop yields a valid layout");
+                    const auto reflowed = Resolve(next, true, true);
+                    Require(reflowed.count == placed.count,
+                            "no drop loses or duplicates a record");
+                    Require(WidestRow(reflowed) >= kMinimumWidestRow,
+                            "no drop leaves the overlay too narrow to escape");
+                    int total = 0;
+                    for (int r = 0; r < reflowed.rows; ++r)
+                        total += reflowed.row_length[static_cast<std::size_t>(r)];
+                    Require(total == reflowed.count,
+                            "the rows always account for every record");
+                }
+            }
+        }
     }
-    Require(Resolve(climbing, true, true).rows == 1,
-            "moving every record up leaves a single row");
-
-    // The floor holds: five in the first row cannot be reduced further.
-    const Layout floored = ApplyDrop(two_rows, placed, 0, 1, 0);
-    Require(floored.row1 == 5 && floored.order == two_rows.order,
-            "the first row never falls below five");
-
-    // Nonsense drops are refused rather than clamped into something plausible.
-    Require(ApplyDrop(two_rows, placed, -1, 0, 0).order == two_rows.order,
-            "a drop with no source is refused");
-    Require(ApplyDrop(two_rows, placed, 99, 0, 0).order == two_rows.order,
-            "a drop from a slot that does not exist is refused");
-    Require(ApplyDrop(two_rows, placed, 0, 5, 0).order == two_rows.order,
-            "a drop outside the two rows is refused");
-
-    // Whatever happens, no record is lost.
-    for (int from = 0; from < placed.count; ++from)
-        for (int row = 0; row < 2; ++row)
-            for (int column = 0; column < 7; ++column)
-                Require(IsValidLayout(ApplyDrop(two_rows, placed, from, row, column)),
-                        "every drop yields a valid arrangement");
 }
 
 void TestLockAndChevronNeverOverlap() {
     using namespace gtg::tray::compact;
     for (float scale : {1.0F, 1.25F, 1.5F, 2.0F, 2.5F}) {
-        for (int row1 : {5, 6, 7}) {
-            const int width = static_cast<int>(CollapsedWidth(row1) * scale);
+        for (int widest : {2, 3, 5, 6, 7}) {
+            const int width = static_cast<int>(CollapsedWidth(widest) * scale);
             const int header = static_cast<int>(25 * scale);
             // Neither control may claim a point belonging to the other, and
             // neither may reach into the drag bar that moves the window.
@@ -1010,29 +2269,36 @@ void TestCompactLayoutDrivesFootprint() {
     using namespace gtg::tray::compact;
     // The arithmetic reproduces the shipped widths rather than re-deriving
     // them: five records is 388 dip and six is 464, exactly as before.
-    Require(CollapsedWidth(5) == 388, "five in the first row is 388 dip");
-    Require(CollapsedWidth(6) == 464, "six in the first row is 464 dip");
-    Require(CollapsedWidth(7) == 540, "seven in the first row is 540 dip");
+    Require(CollapsedWidth(5) == 388, "five in the widest row is 388 dip");
+    Require(CollapsedWidth(6) == 464, "six is 464 dip");
+    Require(CollapsedWidth(7) == 540, "seven is 540 dip");
+    Require(CollapsedWidth(2) == 160, "two is 160 dip");
 
-    const Layout wide{DefaultOrder(), 7};
-    const auto one_row = ChooseFootprint(true, Resolve(wide, true, true),
-                                         2560, 1440);
-    Require(one_row.width == 540 && one_row.rows == 1,
-            "an arrangement of seven is a single wide row");
+    struct Case { std::initializer_list<int> rows; int width; int height; };
+    // Heights are one row pitch apart, which is what keeps the margin under
+    // the last cell constant. They used to be 54 apart -- a dip short -- and
+    // the margin shrank with every row added.
+    const Case cases[] = {
+        {{7},          540, 88},
+        {{5, 2},       388, 143},
+        {{4, 3},       312, 143},
+        {{3, 2, 2},    236, 198},
+        {{2, 2, 2, 1}, 160, 253},
+        {{5, 1, 1},    388, 198},
+    };
+    for (const auto& c : cases) {
+        const auto placed = Resolve(LayoutWithRows(c.rows), true, true);
+        const auto footprint = ChooseFootprint(true, placed, 2560, 1440);
+        Require(footprint.width == c.width, "width follows the widest row");
+        Require(footprint.height == c.height, "height follows the row count");
+    }
 
-    const Layout narrow{DefaultOrder(), 5};
-    const auto two_rows = ChooseFootprint(true, Resolve(narrow, true, true),
-                                          2560, 1440);
-    Require(two_rows.width == 388 && two_rows.rows == 2,
-            "an arrangement of five plus two is narrow and tall");
-
-    // Honest consequence of the model: a first row longer than the records
-    // available is clamped, so disabling a record can narrow the overlay.
-    // Width is stable for a given arrangement, not across every toggle.
-    const auto clamped = ChooseFootprint(true, Resolve(wide, true, false),
-                                         2560, 1440);
-    Require(clamped.width == 464 && clamped.rows == 1,
-            "disabling a record shrinks an over-long first row");
+    // Honest consequence of the model: disabling a record reflows the rows, so
+    // a preference toggle can change the shape.
+    const auto without_fps = ChooseFootprint(
+        true, Resolve(LayoutWithRows({5, 2}), true, false), 2560, 1440);
+    Require(without_fps.rows == 2 && without_fps.width == 388,
+            "six records in a five-plus-two arrangement stay two rows");
 }
 
 void TestCompactLockPreferenceDefaultsToLocked() {
@@ -1050,8 +2316,13 @@ void TestConfigValidation() {
     gtg::ProtectionConfig valid;
     Require(!gtg::ValidateConfig(valid).has_value(), "default config should be valid");
 
+    // Equal was rejected once; it is now the monitor-only configuration a
+    // fresh install starts in.
     valid.safe_power_w = valid.normal_power_w;
-    Require(gtg::ValidateConfig(valid).has_value(), "safe power must be below normal power");
+    Require(!gtg::ValidateConfig(valid).has_value(), "equal limits are monitor-only, not invalid");
+    valid.safe_power_w = valid.normal_power_w + 1;
+    Require(gtg::ValidateConfig(valid).has_value(), "safe power must not exceed normal power");
+    valid.safe_power_w = valid.normal_power_w - 50;
 }
 
 void TestRecoveryPolicy() {
@@ -2009,7 +3280,19 @@ int main(int argc, char** argv) {
         {"HostMemoryComputeBoundaries", TestHostMemoryComputeBoundaries},
         {"HostMemoryHistoryRetentionAndClear",
          TestHostMemoryHistoryRetentionAndClear},
+        {"PowerDefaultsComeFromTheCard", TestPowerDefaultsComeFromTheCard},
+        {"MonitorOnlyWatchesAndNeverWrites", TestMonitorOnlyWatchesAndNeverWrites},
+        {"RainAnimationIsDeterministicAndBounded", TestRainAnimationIsDeterministicAndBounded},
+        {"BusyIndicatorCoversItsCellExactly", TestBusyIndicatorCoversItsCellExactly},
+        {"OsdPreferenceDefaultsOn", TestOsdPreferenceDefaultsOn},
         {"RamPreferenceDefaultsOn", TestRamPreferenceDefaultsOn},
+        {"LowMemorySignalIsAvailable", TestLowMemorySignalIsAvailable},
+        {"ReclaimPolicySkipsWhatItMust", TestReclaimPolicySkipsWhatItMust},
+        {"ReclaimShipsLive", TestReclaimShipsLive},
+        {"ReclaimResultToneIsHonest", TestReclaimResultToneIsHonest},
+        {"ReclaimIndicatorHasAFloor", TestReclaimIndicatorHasAFloor},
+        {"ReclaimBudgetBoundsTheWorker", TestReclaimBudgetBoundsTheWorker},
+        {"ReclaimOutcomeReportsHonestly", TestReclaimOutcomeReportsHonestly},
         {"CompactDefaultFootprintIsOneRow",
          TestCompactDefaultFootprintIsOneRow},
         {"CellHitTestingAcrossScales", TestCellHitTestingAcrossScales},
@@ -2018,7 +3301,16 @@ int main(int argc, char** argv) {
         {"CompactLayoutDrivesFootprint", TestCompactLayoutDrivesFootprint},
         {"CompactLockPreferenceDefaultsToLocked",
          TestCompactLockPreferenceDefaultsToLocked},
-        {"CompactLayoutPlacement", TestCompactLayoutPlacement},
+        {"CompactRowComposition", TestCompactRowComposition},
+        {"EighthRecordFillsTheWord", TestEighthRecordFillsTheWord},
+        {"LaneValueTakesWhatTheAnnotationLeaves",
+         TestLaneValueTakesWhatTheAnnotationLeaves},
+        {"NetworkVerdictJudgesTheWorst", TestNetworkVerdictJudgesTheWorst},
+        {"NetworkResultSaysWhatWasMeasured", TestNetworkResultSaysWhatWasMeasured},
+        {"NetworkThroughputArithmetic", TestNetworkThroughputArithmetic},
+        {"CompactSwapOnOverlap", TestCompactSwapOnOverlap},
+        {"CompactWidestRowFloor", TestCompactWidestRowFloor},
+        {"HeaderStatusTextThreshold", TestHeaderStatusTextThreshold},
         {"CompactLayoutMoveInsert", TestCompactLayoutMoveInsert},
         {"CompactLayoutStoredValueCannotHideARecord",
          TestCompactLayoutStoredValueCannotHideARecord},

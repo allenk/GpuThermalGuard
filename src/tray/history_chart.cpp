@@ -255,7 +255,12 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     const Gdiplus::REAL gap = 4.0F * scale;
     const bool show_ram = ram_history_ != nullptr;
     const bool show_fps = fps_history_ != nullptr;
-    const int plot_count = 5 + (show_ram ? 1 : 0) + (show_fps ? 1 : 0);
+    const bool show_net = net_history_ != nullptr;
+    // Lanes divide the box, so an eighth costs the other seven about 14 % of
+    // their height: 26.7 dip becomes 22.9 against a floor of 16. That is why
+    // the record is off unless a reader asks for it.
+    const int plot_count =
+        5 + (show_ram ? 1 : 0) + (show_fps ? 1 : 0) + (show_net ? 1 : 0);
     const Gdiplus::REAL plots_height = static_cast<Gdiplus::REAL>(height) -
         margin * 2.0F - footer_height - gap * (plot_count - 1);
     const Gdiplus::REAL plot_height = std::max(16.0F, plots_height / plot_count);
@@ -276,6 +281,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     const Gdiplus::RectF cpu_plot = take_lane();
     const Gdiplus::RectF ram_plot = show_ram ? take_lane() : Gdiplus::RectF{};
     const Gdiplus::RectF fps_plot = show_fps ? take_lane() : Gdiplus::RectF{};
+    const Gdiplus::RectF net_plot = show_net ? take_lane() : Gdiplus::RectF{};
 
     Gdiplus::FontFamily font_family(L"Segoe UI");
     Gdiplus::Font label_font(&font_family, 7.7F, Gdiplus::FontStyleRegular,
@@ -295,6 +301,16 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     // Physical RAM leads in magenta; Virtual Commit follows in dark yellow.
     // The two are overlaid, never stacked: their denominators differ.
     const Gdiplus::Color ram_color(255, 198, 58, 140);
+    // Received takes the record's own lime. Transmit needs to be told apart
+    // from it at a glance, and the neutral grey that works against the dark
+    // OSD disappears against this chart's near-white plot background -- so
+    // here it is a saturated slate blue, dark enough to read on white and far
+    // enough from lime to separate where the two cross.
+    //
+    // It is still not a second record: no cell, no lane, no slot in the
+    // arrangement, exactly like virtual commit behind RAM.
+    const Gdiplus::Color net_color(255, 138, 176, 40);
+    const Gdiplus::Color net_sent_color(255, 62, 96, 140);
     const Gdiplus::Color commit_color(255, 186, 148, 0);
     Gdiplus::SolidBrush plot_brush(plot_background);
     Gdiplus::Pen border_pen(border_color, 1.0F);
@@ -316,6 +332,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         draw_lane_frame(plot);
     if (show_ram) draw_lane_frame(ram_plot);
     if (show_fps) draw_lane_frame(fps_plot);
+    if (show_net) draw_lane_frame(net_plot);
 
     const auto draw_axis_label = [&](const std::wstring& label,
                                      const Gdiplus::RectF& plot,
@@ -333,6 +350,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     draw_axis_label(L"CPU %", cpu_plot, cpu_color);
     if (show_ram) draw_axis_label(L"RAM", ram_plot, ram_color);
     if (show_fps) draw_axis_label(L"FPS", fps_plot, fps_color);
+    if (show_net) draw_axis_label(L"NET", net_plot, net_color);
 
     const std::uint64_t live_now = GetTickCount64();
     const std::uint64_t view_end = EffectiveViewEnd(live_now);
@@ -417,7 +435,11 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
             Gdiplus::PointF(plot.X, plot.Y), Gdiplus::PointF(plot.X, plot.GetBottom()),
             Gdiplus::Color(62, color.GetR(), color.GetG(), color.GetB()),
             Gdiplus::Color(5, color.GetR(), color.GetG(), color.GetB()));
-        Gdiplus::Pen line(color, std::max(1.05F, 0.95F * scale));
+        // Thinner than it was. Eight lanes divide the same box, so each is
+        // about 23 dip tall, and a stroke sized for a 27 dip lane turns a
+        // busy series into a solid block at that height -- which is what the
+        // network lane made obvious.
+        Gdiplus::Pen line(color, std::max(0.75F, 0.7F * scale));
         line.SetLineJoin(Gdiplus::LineJoinRound);
         for (const auto& segment : segments) {
             if (segment.size() == 1 && mark_all_singletons) {
@@ -479,6 +501,51 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         };
         draw_series(ram_plot, collect_memory(true), commit_color);
         draw_series(ram_plot, collect_memory(false), ram_color);
+    }
+    if (show_net) {
+        // One axis for both directions, scaled to the larger of them across
+        // the visible window. Independent axes would draw a trickle of upload
+        // level with a flood of download.
+        double net_max = 0.0;
+        for (const auto& sample : net_history_->Samples()) {
+            if (sample.monotonic_ms < visible_start ||
+                sample.monotonic_ms > view_end) continue;
+            if (sample.received_bytes_per_second)
+                net_max = std::max(net_max,
+                                   static_cast<double>(*sample.received_bytes_per_second));
+            if (sample.sent_bytes_per_second)
+                net_max = std::max(net_max,
+                                   static_cast<double>(*sample.sent_bytes_per_second));
+        }
+        // An idle link draws flat along the baseline, which is true. Dividing
+        // by it is not, so the span never reaches zero.
+        if (!(net_max > 0.0)) net_max = 1.0;
+        const auto collect_net = [&](const bool sent) {
+            std::vector<std::vector<Gdiplus::PointF>> segments;
+            std::vector<Gdiplus::PointF> current;
+            for (const auto& sample : net_history_->Samples()) {
+                if (sample.monotonic_ms < visible_start ||
+                    sample.monotonic_ms > view_end) continue;
+                const auto value = sent ? sample.sent_bytes_per_second
+                                        : sample.received_bytes_per_second;
+                // A refused reading breaks the line instead of being drawn as
+                // no traffic: the adapter stopped reporting, which is not the
+                // same as a quiet link.
+                if (!value) {
+                    if (!current.empty()) segments.push_back(std::move(current));
+                    current.clear();
+                    continue;
+                }
+                current.push_back({x_for(sample.monotonic_ms),
+                                   y_for(net_plot, static_cast<double>(*value),
+                                         0.0, net_max)});
+            }
+            if (!current.empty()) segments.push_back(std::move(current));
+            return segments;
+        };
+        // Sent first, so received stays legible where the two cross.
+        draw_series(net_plot, collect_net(true), net_sent_color);
+        draw_series(net_plot, collect_net(false), net_color);
     }
     if (fps_history_ != nullptr) {
         double fps_max = 60.0;

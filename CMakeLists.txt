@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(GpuThermalGuard VERSION 0.11.0 LANGUAGES CXX)
+project(GpuThermalGuard VERSION 0.12.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "GpuThermalGuard currently supports Windows only")
@@ -69,6 +69,7 @@ add_library(gtg_telemetry STATIC
     src/telemetry/telemetry_history.hpp
     src/telemetry/telemetry_freshness.hpp
     src/sysmem/host_memory.hpp
+    src/sysmem/reclaim.hpp
 )
 target_include_directories(gtg_telemetry PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(gtg_telemetry PUBLIC gtg_build_options)
@@ -88,6 +89,15 @@ target_link_libraries(GpuThermalGuardProbe PRIVATE gtg_nvml gtg_build_options)
 
 add_executable(GpuThermalGuard WIN32
     src/app_main.cpp
+    # iphlpapi is resolved at run time, so nothing is added to the link line.
+    src/net/action.hpp
+    src/net/estats_win32.cpp
+    src/net/estats_win32.hpp
+    src/net/history.hpp
+    src/net/throughput.hpp
+    src/net/verdict.hpp
+    src/net/throughput_win32.cpp
+    src/net/throughput_win32.hpp
     src/supervision/supervisor.cpp
     src/service/service_main.cpp
     src/service/service_main.hpp
@@ -111,6 +121,9 @@ add_executable(GpuThermalGuard WIN32
     src/fps/dxgi_observer.cpp
     src/fps/dxgi_observer.hpp
     src/sysmem/host_memory.hpp
+    src/sysmem/reclaim.hpp
+    src/sysmem/reclaim_win32.hpp
+    src/sysmem/reclaim_nt.hpp
     src/resources/resource.h
     src/resources/GpuThermalGuard.rc
     src/resources/GpuThermalGuard.manifest
@@ -156,12 +169,16 @@ if(BUILD_TESTING)
         add_executable(gtg_osd_fps_smoke
             tests/osd_overlay_smoke.cpp
             src/logging/logger.cpp
+            # The overlay's network action reaches the real probe; the smoke
+            # build includes the overlay whole, so it needs the same source.
+            src/net/estats_win32.cpp
+            src/fps/dxgi_observer.cpp
         )
         target_include_directories(gtg_osd_fps_smoke PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_link_libraries(gtg_osd_fps_smoke PRIVATE
             gtg_telemetry gtg_build_options wtl gdiplus wtsapi32 dwmapi advapi32
-            user32 gdi32 shell32)
+            user32 gdi32 shell32 tdh)
         add_test(NAME gtg_osd_fps_smoke COMMAND gtg_osd_fps_smoke)
         set_tests_properties(gtg_osd_fps_smoke PROPERTIES TIMEOUT 30)
         add_executable(gtg_fps_history_chart_smoke

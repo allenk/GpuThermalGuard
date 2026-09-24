@@ -1,6 +1,8 @@
 #include "tray/osd_overlay.hpp"
 #include "localization/localization.hpp"
 #include "logging/logger.hpp"
+#include "sysmem/reclaim_win32.hpp"
+#include "tray/osd_animation.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -91,6 +93,82 @@ std::wstring FormatMetric(const std::optional<double> value, const wchar_t* suff
 
 using MetricMember = std::optional<double> telemetry::Sample::*;
 
+// One accent per record, named once. These eighteen literals used to be
+// repeated across the compact cells, the narrow two-column fallback and the
+// expanded lanes, so a record could be recoloured in one view and not the
+// others. Accent() is the only place that maps a record to its colour.
+const Gdiplus::Color kAccentTemperature(255, 255, 91, 94);
+const Gdiplus::Color kAccentPower(255, 77, 160, 255);
+const Gdiplus::Color kAccentVram(255, 255, 173, 69);
+const Gdiplus::Color kAccentGpu(255, 75, 214, 139);
+const Gdiplus::Color kAccentCpu(255, 183, 121, 255);
+const Gdiplus::Color kAccentRam(255, 255, 122, 196);
+const Gdiplus::Color kAccentFps(255, 92, 220, 215);
+// Virtual commit rides behind RAM and is deliberately not a record of its own:
+// it has no cell, no lane and no slot in the arrangement.
+const Gdiplus::Color kAccentCommit(255, 228, 196, 76);
+// Network is one record with one accent, like every other. Receive carries it;
+// transmit is drawn in a neutral that claims to be nobody -- the same shape as
+// commit riding behind RAM, and for the same reason: a second hue here would
+// read as a second record.
+//
+// Lime is the one clear gap in the palette. The seven accents sit at roughly
+// 359, 213, 35, 150, 271, 328 and 178 degrees; 75 collides with none of them.
+const Gdiplus::Color kAccentNetwork(255, 200, 232, 92);
+// Bright enough to be told apart from lime where the two cross, and cool
+// enough not to be mistaken for a second lime. Against the main window's
+// near-white chart this same role needs a much darker colour; see
+// `net_sent_color` in history_chart.cpp.
+const Gdiplus::Color kNetworkSent(255, 122, 186, 255);
+
+// The figure the reader sees after a reclaim. GiB rather than a percentage,
+// deliberately: the cell already shows a percentage, and a delta in the same
+// unit would be read as the reading itself.
+std::wstring FormatReclaimResult(const sysmem::reclaim::Outcome& outcome) {
+    switch (sysmem::reclaim::ToneOf(outcome)) {
+        case sysmem::reclaim::ResultTone::Gain: {
+            const double gib = sysmem::reclaim::FreedGib(outcome);
+            return std::format(L"+{:.{}f} GB", gib,
+                               sysmem::reclaim::FreedDecimals(gib));
+        }
+        case sysmem::reclaim::ResultTone::Loss: {
+            const double gib = sysmem::reclaim::FreedGib(outcome);
+            return std::format(L"{:.{}f} GB", gib,
+                               sysmem::reclaim::FreedDecimals(gib));
+        }
+        case sysmem::reclaim::ResultTone::Neutral:
+            break;
+    }
+    // Something was done, but the machine moved less than the noise floor.
+    // Saying "+0.0 GB" would claim more than is known.
+    return L"--";
+}
+
+std::uint32_t ReclaimResultTint(const sysmem::reclaim::Outcome& outcome) noexcept {
+    // Green already means healthy in this palette, so a gain borrows it
+    // instead of introducing a colour the reader has to learn.
+    switch (sysmem::reclaim::ToneOf(outcome)) {
+        case sysmem::reclaim::ResultTone::Gain:   return 0xFF4BD68BU;
+        case sysmem::reclaim::ResultTone::Loss:   return 0xFFFF5B5EU;
+        case sysmem::reclaim::ResultTone::Neutral: break;
+    }
+    return 0xB4CDD6E2U;
+}
+
+Gdiplus::Color Accent(const compact::Metric metric) noexcept {
+    switch (metric) {
+        case compact::Metric::Temperature: return kAccentTemperature;
+        case compact::Metric::Power: return kAccentPower;
+        case compact::Metric::Vram: return kAccentVram;
+        case compact::Metric::Gpu: return kAccentGpu;
+        case compact::Metric::Cpu: return kAccentCpu;
+        case compact::Metric::Ram: return kAccentRam;
+        case compact::Metric::Fps: return kAccentFps;
+        case compact::Metric::Network: return kAccentNetwork;
+    }
+    return kAccentTemperature;
+}
+
 void DrawCompactSparkline(Gdiplus::Graphics& graphics,
                           const std::deque<telemetry::Sample>& samples,
                           std::uint64_t start, std::uint64_t end,
@@ -148,6 +226,85 @@ void DrawCompactSparkline(Gdiplus::Graphics& graphics,
 // Two overlaid series on a shared 0-100 % scale: Virtual Commit first, then
 // physical RAM, so RAM always reads as the subject. Unavailable readings break
 // the stroke rather than dropping to a fabricated 0 %.
+// Both directions of a network record, on one axis.
+//
+// The shared span is the point. Scaled independently, 12 MB/s of receive and
+// 800 B/s of send would be drawn the same height, and the cell would be
+// telling its reader the opposite of what is happening. `peak` is the largest
+// rate in either direction across the window, so the quieter direction is
+// drawn quiet.
+//
+// Each curve is a line over a translucent area down to the baseline, which is
+// the shape every other sparkline here already uses -- the two differ by
+// colour and by the receive curve being drawn last, so it stays legible where
+// they cross.
+void DrawNetworkSparkline(Gdiplus::Graphics& graphics,
+                          const std::deque<net::HistorySample>& samples,
+                          const std::uint64_t start, const std::uint64_t end,
+                          const Gdiplus::RectF& bounds, const double peak,
+                          const Gdiplus::Color received_color,
+                          const Gdiplus::Color sent_color, const float scale) {
+    const double duration = static_cast<double>(std::max<std::uint64_t>(1, end - start));
+    // A flat pair of curves on an idle link is correct; dividing by it is not.
+    const double span = peak > 0.0 ? peak : 1.0;
+
+    const auto stroke = [&](const bool sent, const Gdiplus::Color color) {
+        std::vector<Gdiplus::PointF> points;
+        for (const auto& sample : samples) {
+            if (sample.monotonic_ms < start || sample.monotonic_ms > end) continue;
+            const auto& value = sent ? sample.sent_bytes_per_second
+                                     : sample.received_bytes_per_second;
+            // A refused reading leaves a hole rather than a line drawn across
+            // it. The link stopped reporting; joining the ends would invent
+            // the traffic that was never measured.
+            if (!value) {
+                if (points.size() >= 2) {
+                    Gdiplus::GraphicsPath area;
+                    area.AddLines(points.data(), static_cast<INT>(points.size()));
+                    area.AddLine(points.back(),
+                                 {points.back().X, bounds.GetBottom()});
+                    area.AddLine(Gdiplus::PointF(points.back().X, bounds.GetBottom()),
+                                 Gdiplus::PointF(points.front().X, bounds.GetBottom()));
+                    area.CloseFigure();
+                    Gdiplus::SolidBrush fill(Gdiplus::Color(
+                        40, color.GetR(), color.GetG(), color.GetB()));
+                    graphics.FillPath(&fill, &area);
+                    Gdiplus::Pen line(color, std::max(1.0F, 1.0F * scale));
+                    line.SetLineJoin(Gdiplus::LineJoinRound);
+                    graphics.DrawLines(&line, points.data(),
+                                       static_cast<INT>(points.size()));
+                }
+                points.clear();
+                continue;
+            }
+            const double height = static_cast<double>(*value) / span;
+            points.emplace_back(
+                bounds.X + static_cast<float>((sample.monotonic_ms - start) / duration) *
+                               bounds.Width,
+                bounds.GetBottom() -
+                    static_cast<float>(std::clamp(height, 0.0, 1.0)) * bounds.Height);
+        }
+        if (points.size() < 2) return;
+        Gdiplus::GraphicsPath area;
+        area.AddLines(points.data(), static_cast<INT>(points.size()));
+        area.AddLine(points.back(), {points.back().X, bounds.GetBottom()});
+        area.AddLine(Gdiplus::PointF(points.back().X, bounds.GetBottom()),
+                     Gdiplus::PointF(points.front().X, bounds.GetBottom()));
+        area.CloseFigure();
+        Gdiplus::SolidBrush fill(Gdiplus::Color(
+            40, color.GetR(), color.GetG(), color.GetB()));
+        graphics.FillPath(&fill, &area);
+        Gdiplus::Pen line(color, std::max(1.0F, 1.0F * scale));
+        line.SetLineJoin(Gdiplus::LineJoinRound);
+        graphics.DrawLines(&line, points.data(), static_cast<INT>(points.size()));
+    };
+
+    // Sent first, so received is on top where they overlap: it is the larger
+    // of the two almost always, and the one the reader is looking for.
+    stroke(true, sent_color);
+    stroke(false, received_color);
+}
+
 void DrawMemorySparkline(Gdiplus::Graphics& graphics,
                          const std::deque<sysmem::HistorySample>& samples,
                          const std::uint64_t start, const std::uint64_t end,
@@ -327,17 +484,59 @@ void DrawMetricLane(Gdiplus::Graphics& graphics,
                                     row.Height);
     DrawText(graphics, label, label_rect, label_font, color,
              Gdiplus::StringAlignmentNear);
+    // How much of the top band the annotation actually takes, measured rather
+    // than reserved. The reservation was a flat 240 dip whatever was written
+    // there, which left the value a fixed 132 dip -- and "349.5 W (350 W)"
+    // does not fit in 132 dip, so a reader on a 350 W card saw
+    // "349.5 W (350..." with the limit cut off. A truncated number is a
+    // different number, which is the one thing this project does not let a
+    // figure become.
+    Gdiplus::StringFormat measure;
+    measure.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    const auto width_of = [&](const std::wstring& text, Gdiplus::Font& font) {
+        if (text.empty()) return 0.0F;
+        Gdiplus::RectF measured;
+        graphics.MeasureString(text.c_str(), -1, &font,
+                               Gdiplus::PointF(0.0F, 0.0F), &measure, &measured);
+        return measured.Width;
+    };
+
+    float annotation_width = 0.0F;
     if (!annotation.empty()) {
+        const std::wstring annotation_text(annotation);
         const Gdiplus::RectF annotation_rect(graph_span.x, row.Y,
                                               row.Width - 240.0F * scale,
                                               22.0F * scale);
-        DrawText(graphics, std::wstring(annotation), annotation_rect, label_font,
+        DrawText(graphics, annotation_text, annotation_rect, label_font,
                  Gdiplus::Color(230, color.GetR(), color.GetG(), color.GetB()),
                  Gdiplus::StringAlignmentNear);
+        // The annotation is drawn first and keeps what it needs; the value
+        // takes the rest. They can no longer collide, and neither is sized by
+        // a constant that has to be revisited when a string changes.
+        annotation_width = std::min(width_of(annotation_text, label_font),
+                                    annotation_rect.Width);
     }
-    const Gdiplus::RectF value_rect(row.GetRight() - 140.0F * scale, row.Y,
-                                    132.0F * scale, 22.0F * scale);
-    DrawText(graphics, current, value_rect, value_font,
+
+    const auto value_span =
+        compact::LaneValueSpan(row.X, row.Width, annotation_width, scale);
+    const Gdiplus::RectF value_rect(value_span.x, row.Y, value_span.width,
+                                    22.0F * scale);
+    // Everything free is usually enough. When it is not -- a wide value under
+    // a wide annotation -- step the face down rather than cut the figure, the
+    // same ladder the compact cell walks.
+    Gdiplus::FontFamily value_family;
+    value_font.GetFamily(&value_family);
+    const float base_size = value_font.GetSize();
+    float value_size = base_size;
+    for (; value_size > base_size * 0.72F; value_size -= 0.5F) {
+        Gdiplus::Font probe(&value_family, value_size, Gdiplus::FontStyleBold,
+                            Gdiplus::UnitPixel);
+        if (width_of(current, probe) <= value_rect.Width) break;
+    }
+    Gdiplus::Font fitted(&value_family, value_size, Gdiplus::FontStyleBold,
+                         Gdiplus::UnitPixel);
+    DrawText(graphics, current, value_rect,
+             value_size < base_size ? fitted : value_font,
              stale ? Gdiplus::Color(190, 205, 214, 226)
                    : Gdiplus::Color(255, 245, 248, 252),
              Gdiplus::StringAlignmentFar);
@@ -612,6 +811,7 @@ void OsdOverlay::SetVisible(const bool should_show) {
         topmost_repair_reason_.clear();
         refresh_pending_ = false;
         if (drag_handle_.m_hWnd != nullptr) drag_handle_.ShowWindow(SW_HIDE);
+        EndAction();
         ShowWindow(SW_HIDE);
     }
 }
@@ -657,6 +857,18 @@ void OsdOverlay::SetCompactLocked(const bool locked) noexcept {
     if (compact_locked_ == locked) return;
     compact_locked_ = locked;
     RequestRefresh();
+}
+
+void OsdOverlay::SetNetEnabled(const bool enabled) noexcept {
+    if (net_enabled_ == enabled) return;
+    net_enabled_ = enabled;
+    // The arrangement gains or loses a cell, so the window changes width.
+    const POINT position = Position();
+    const auto layout = CurrentLayout();
+    POINT next = position;
+    (void)FitToWorkArea(next, layout);
+    ApplyPosition(next, layout);
+    RenderLatest();
 }
 
 void OsdOverlay::SetRamEnabled(const bool enabled) noexcept {
@@ -753,10 +965,11 @@ LRESULT OsdOverlay::OnDragCursor(UINT, WPARAM, LPARAM, BOOL& handled) {
     const Layout geometry = CurrentLayout();
     const auto grid = compact::MakeCellGrid(geometry.columns, geometry.width,
                                             geometry.scale);
-    // A release outside the two rows changes nothing, so say so before the
-    // reader commits to it.
+    const auto placed = CurrentPlacement();
+    // A release outside the rows, or more than one band below the last one,
+    // changes nothing -- so say so before the reader commits to it.
     const bool droppable =
-        compact::DropTargetAt(grid, cursor.x, cursor.y).row >= 0;
+        compact::DropTargetAt(grid, placed, cursor.x, cursor.y).row >= 0;
     ::SetCursor(::LoadCursorW(nullptr, droppable ? IDC_SIZEALL : IDC_NO));
     return TRUE;
 }
@@ -787,11 +1000,577 @@ std::wstring CompactLabel(const compact::Metric metric) {
         case compact::Metric::Cpu: return L"CPU";
         case compact::Metric::Ram: return L"RAM";
         case compact::Metric::Fps: return L"FPS";
+        case compact::Metric::Network:
+            return std::wstring(localization::Select(L"網路", L"NET"));
     }
     return L"";
 }
 
 }  // namespace
+
+bool OsdBusyIndicator::Begin(const HWND owner, const RECT& screen_rect,
+                             const std::uint32_t accent, const float scale,
+                             std::wstring label,
+                             const animation::Effect effect) noexcept {
+    try {
+        End();
+        accent_ = accent;
+        effect_ = effect;
+        scale_ = scale > 0.1F ? scale : 1.0F;
+        label_ = std::move(label);
+        started_ms_ = GetTickCount64();
+        // Owned by the overlay so Windows keeps it above its owner, and
+        // NOACTIVATE so pressing it never steals focus from the game. No
+        // WS_EX_TRANSPARENT: swallowing the pointer is the point.
+        const DWORD ex_style = WS_EX_LAYERED | WS_EX_NOACTIVATE |
+                               WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+        RECT bounds = screen_rect;   // _U_RECT wants a non-const pointer
+        if (Create(owner, &bounds, nullptr, WS_POPUP, ex_style) == nullptr) {
+            return false;
+        }
+        SetWindowPos(HWND_TOPMOST, screen_rect.left, screen_rect.top,
+                     screen_rect.right - screen_rect.left,
+                     screen_rect.bottom - screen_rect.top,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        Paint();
+        // Its own cadence. The overlay keeps rendering at 500 ms throughout.
+        (void)SetTimer(kAnimationTimerId, kAnimationIntervalMs);
+        return true;
+    } catch (...) {
+        End();
+        return false;
+    }
+}
+
+void OsdBusyIndicator::ShowResult(std::wstring text,
+                                  const std::uint32_t tint,
+                                  const int bars) noexcept {
+    if (m_hWnd == nullptr) return;
+    try {
+        result_ = std::move(text);
+    } catch (...) {
+        result_.clear();
+    }
+    result_tint_ = tint;
+    result_bars_ = bars;
+    showing_result_ = true;
+    // The sweep has nothing left to say, so the timer stops and the figure is
+    // painted once. A still frame also costs the game nothing.
+    KillTimer(kAnimationTimerId);
+    Paint();
+}
+
+void OsdBusyIndicator::End() noexcept {
+    if (m_hWnd == nullptr) return;
+    KillTimer(kAnimationTimerId);
+    DestroyWindow();
+    label_.clear();
+    result_.clear();
+    result_bars_ = -1;
+    showing_result_ = false;
+}
+
+LRESULT OsdBusyIndicator::OnTimer(UINT, const WPARAM id, LPARAM, BOOL& handled) {
+    if (id != kAnimationTimerId) {
+        handled = FALSE;
+        return 0;
+    }
+    Paint();
+    return 0;
+}
+
+void OsdBusyIndicator::Paint() noexcept {
+    if (m_hWnd == nullptr) return;
+    RECT rect{};
+    if (GetWindowRect(&rect) == FALSE) return;
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    if (width <= 0 || height <= 0) return;
+
+    const HDC screen = ::GetDC(nullptr);
+    if (screen == nullptr) return;
+    const HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ::ReleaseDC(nullptr, screen);
+        return;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    const HBITMAP bitmap =
+        CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr) {
+        DeleteDC(memory);
+        ::ReleaseDC(nullptr, screen);
+        return;
+    }
+    const HGDIOBJ previous = SelectObject(memory, bitmap);
+
+    {
+        Gdiplus::Graphics graphics(memory);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+        const float s = scale_;
+        const Gdiplus::Color accent(
+            static_cast<BYTE>((accent_ >> 24) & 0xFF),
+            static_cast<BYTE>((accent_ >> 16) & 0xFF),
+            static_cast<BYTE>((accent_ >> 8) & 0xFF),
+            static_cast<BYTE>(accent_ & 0xFF));
+
+        // The cell keeps its own shape and accent, so the reader sees the
+        // record they clicked rather than a foreign panel appearing on top.
+        //
+        // Inset by half the pen. A stroke straddles its path, so a rectangle
+        // flush with the bitmap loses the outer half of its right and bottom
+        // edges to the edge of the surface -- the frame came out open on two
+        // sides. The dashboard's own cells do not show this because they are
+        // drawn inside a larger bitmap with room for the stroke to spill; this
+        // window is exactly one cell, so it has none.
+        const float pen_width = s;
+        Gdiplus::GraphicsPath path;
+        AddRoundedRectangle(
+            path, {pen_width * 0.5F, pen_width * 0.5F,
+                   static_cast<Gdiplus::REAL>(width) - pen_width,
+                   static_cast<Gdiplus::REAL>(height) - pen_width}, 3.0F * s);
+        Gdiplus::SolidBrush base(Gdiplus::Color(
+            232, 22, 27, 36));
+        graphics.FillPath(&base, &path);
+        Gdiplus::Pen border(Gdiplus::Color(
+            210, accent.GetR(), accent.GetG(), accent.GetB()), pen_width);
+        graphics.DrawPath(&border, &path);
+
+        Gdiplus::FontFamily family(L"Segoe UI");
+        Gdiplus::Font label_font(&family, 9.0F * s, Gdiplus::FontStyleRegular,
+                                 Gdiplus::UnitPixel);
+        DrawText(graphics, label_,
+                 {4.0F * s, 1.0F * s, static_cast<Gdiplus::REAL>(width) - 8.0F * s,
+                  14.0F * s},
+                 label_font, accent, Gdiplus::StringAlignmentNear);
+
+        if (showing_result_) {
+            // The figure sits where the value normally does, so the eye lands
+            // in the same place it already reads this cell. One frame, no
+            // timer: a still result costs a game nothing.
+            // Adaptive precision keeps the common cases at full size, but a
+            // three-digit figure on a very large machine still would not fit.
+            // Step down until it does rather than truncate: an ellipsis in the
+            // middle of a number turns it into a different number. Measured on
+            // this palette, "+128 GB" needs one step and "+128.0 GB" needs
+            // four, which is why precision is reduced first.
+            // The mark, when the action has one. Three bars, `n` filled --
+            // drawn rather than typeset, because an emoji at this size is a
+            // smudge and because the palette here is already vector. The
+            // unfilled bars stay visible at low alpha so the reader sees one
+            // of three rather than a lone bar meaning nothing.
+            float text_left = 4.0F * s;
+            if (result_bars_ >= 0) {
+                const float bar_width = 2.5F * s;
+                const float gap = 1.5F * s;
+                const float bar_base = 26.0F * s;   // bars grow upward from here
+                const Gdiplus::Color mark(
+                    static_cast<BYTE>((result_tint_ >> 24) & 0xFF),
+                    static_cast<BYTE>((result_tint_ >> 16) & 0xFF),
+                    static_cast<BYTE>((result_tint_ >> 8) & 0xFF),
+                    static_cast<BYTE>(result_tint_ & 0xFF));
+                for (int i = 0; i < 3; ++i) {
+                    const float bar_height = (3.0F + 3.0F * static_cast<float>(i)) * s;
+                    const bool filled = i < result_bars_;
+                    Gdiplus::SolidBrush brush(Gdiplus::Color(
+                        static_cast<BYTE>(filled ? mark.GetA() : 60),
+                        mark.GetR(), mark.GetG(), mark.GetB()));
+                    graphics.FillRectangle(
+                        &brush, text_left + static_cast<float>(i) * (bar_width + gap),
+                        bar_base - bar_height, bar_width, bar_height);
+                }
+                text_left += 3.0F * bar_width + 2.0F * gap + 3.0F * s;
+            }
+            const float box_width =
+                static_cast<Gdiplus::REAL>(width) - 4.0F * s - text_left;
+            Gdiplus::StringFormat measure;
+            measure.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            float point_size = 15.0F;
+            for (; point_size > 10.0F; point_size -= 1.0F) {
+                Gdiplus::Font probe(&family, point_size * s,
+                                    Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+                Gdiplus::RectF measured;
+                graphics.MeasureString(result_.c_str(), -1, &probe,
+                                       Gdiplus::PointF(0.0F, 0.0F), &measure,
+                                       &measured);
+                if (measured.Width <= box_width) break;
+            }
+            Gdiplus::Font result_font(&family, point_size * s,
+                                      Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+            const Gdiplus::Color tint(
+                static_cast<BYTE>((result_tint_ >> 24) & 0xFF),
+                static_cast<BYTE>((result_tint_ >> 16) & 0xFF),
+                static_cast<BYTE>((result_tint_ >> 8) & 0xFF),
+                static_cast<BYTE>(result_tint_ & 0xFF));
+            DrawText(graphics, result_,
+                     {text_left, 14.0F * s, box_width, 22.0F * s},
+                     result_font, tint, Gdiplus::StringAlignmentNear);
+        } else {
+            // The animation is arithmetic, drawn here and decided in
+            // osd_animation.hpp. Nothing here is a progress bar: how long a
+            // reclaim takes is set by the processes being trimmed, so a bar
+            // filling at an invented rate would be a lie told smoothly.
+            //
+            // Blocks rather than glyphs. A cell is 72 x 51 dip, and characters
+            // at that size are texture rather than symbols; four-dip blocks
+            // read as falling at a glance.
+            const std::uint64_t elapsed = GetTickCount64() - started_ms_;
+            const float block = animation::kBlockDip * s;
+            const float field_left = 4.0F * s;
+            const float field_top = 16.0F * s;
+            const int columns =
+                animation::BlocksAcross(static_cast<float>(width) / s - 8.0F);
+            const int rows = animation::BlocksAcross(
+                static_cast<float>(height) / s - 19.0F);
+            // One brush recoloured per block rather than one per block: at 33
+            // ms a cell can light a hundred blocks a frame, and a GDI+ object
+            // each would be churn paid for by the game.
+            Gdiplus::SolidBrush brush(accent);
+            for (int cx = 0; cx < columns; ++cx) {
+                for (int cy = 0; cy < rows; ++cy) {
+                    const float level = animation::IntensityAt(
+                        effect_, cx, cy, columns, rows, elapsed);
+                    if (level <= 0.0F) continue;
+                    // The record's own accent, so the cell keeps its identity
+                    // while it works. Squared, so the trail falls away quickly
+                    // and the head stays the thing the eye lands on.
+                    const auto alpha =
+                        static_cast<BYTE>(25.0F + 220.0F * level * level);
+                    brush.SetColor(Gdiplus::Color(alpha, accent.GetR(),
+                                                  accent.GetG(),
+                                                  accent.GetB()));
+                    graphics.FillRectangle(
+                        &brush, field_left + static_cast<float>(cx) * block,
+                        field_top + static_cast<float>(cy) * block,
+                        block - 1.0F * s, block - 1.0F * s);
+                }
+            }
+        }
+    }
+
+    POINT source{0, 0};
+    POINT position{rect.left, rect.top};
+    SIZE size{width, height};
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    (void)UpdateLayeredWindow(m_hWnd, screen, &position, &size, memory, &source,
+                              0, &blend, ULW_ALPHA);
+
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ::ReleaseDC(nullptr, screen);
+}
+
+// A double-click on a cell activates that record. Only while the dashboard is
+// locked: unlocked is arrange mode and keeps the drag gesture it already has,
+// so the two can never be confused with one another.
+LRESULT OsdOverlay::OnCellActivate(UINT, WPARAM, const LPARAM point, BOOL& handled) {
+    if (!collapsed_ || !compact_locked_ || !ShowsLock()) {
+        handled = FALSE;
+        return 0;
+    }
+    // The indicator's existence is the guard. No second boolean to fall out of
+    // step with what the reader can see.
+    if (busy_indicator_.Active()) return 0;
+
+    const auto geometry = CurrentLayout();
+    const auto grid = compact::MakeCellGrid(geometry.columns, geometry.width,
+                                            geometry.scale);
+    const auto placed = CurrentPlacement();
+    const POINT cursor{GET_X_LPARAM(point), GET_Y_LPARAM(point)};
+    const int slot = compact::CellSlotAt(grid, placed, cursor.x, cursor.y);
+    if (slot < 0) return 0;
+    // Two records have an action. Every other one ignores the gesture rather
+    // than pretending to do something.
+    switch (placed.cells[static_cast<std::size_t>(slot)]) {
+        case compact::Metric::Ram: BeginReclaim(slot); break;
+        case compact::Metric::Network: BeginNetworkProbe(slot); break;
+        default: break;
+    }
+    return 0;
+}
+
+bool OsdOverlay::BeginAction(const int slot,
+                             const compact::Metric metric) noexcept {
+    try {
+        if (busy_indicator_.Active()) return false;
+        if (action_worker_.joinable()) action_worker_.join();
+
+        const auto geometry = CurrentLayout();
+        const auto grid = compact::MakeCellGrid(geometry.columns, geometry.width,
+                                                geometry.scale);
+        const auto placed = CurrentPlacement();
+        const auto origin = compact::CellOriginAt(grid, placed, slot);
+        RECT window_rect{};
+        if (GetWindowRect(&window_rect) == FALSE) return false;
+        // Round, do not truncate. A cell is 51 dip tall, which is 127.5 px at
+        // 250 % scaling; truncating made the indicator a pixel short and left
+        // the cell's own border showing along its bottom and right, which is
+        // exactly what the owner saw. Truncation always loses on the far edge,
+        // never the near one, so the artefact only ever appeared on two sides.
+        const auto round_to_px = [](const float value) {
+            return static_cast<int>(value + 0.5F);
+        };
+        const int left = window_rect.left + round_to_px(origin.x);
+        const int top = window_rect.top + round_to_px(origin.y);
+        const RECT cell{
+            left, top,
+            left + round_to_px(grid.cell_width_dip * geometry.scale),
+            top + round_to_px(compact::kCellHeightDip * geometry.scale)};
+
+        const Gdiplus::Color accent = Accent(metric);
+        const std::uint32_t argb =
+            (static_cast<std::uint32_t>(accent.GetA()) << 24) |
+            (static_cast<std::uint32_t>(accent.GetR()) << 16) |
+            (static_cast<std::uint32_t>(accent.GetG()) << 8) |
+            static_cast<std::uint32_t>(accent.GetB());
+        // The house effect. Neither action has progress to report -- a
+        // reclaim's length is set by the processes being trimmed and the
+        // probe's by a fixed window -- so whatever is drawn here must not look
+        // like it is counting down to anything.
+        if (!busy_indicator_.Begin(m_hWnd, cell, argb, geometry.scale,
+                                   CompactLabel(metric),
+                                   animation::kDefaultEffect)) {
+            return false;
+        }
+
+        action_started_ms_ = GetTickCount64();
+        action_visible_until_ms_ = 0;
+        action_result_until_ms_ = 0;
+        action_done_.store(false, std::memory_order_release);
+
+        // The teardown poll is deliberately coarse: it only has to notice that
+        // the work finished and that the minimum has elapsed. The animation
+        // runs on the indicator's own timer, not this one.
+        (void)SetTimer(kActionTimerId, kActionPollIntervalMs);
+        return true;
+    } catch (...) {
+        EndAction();
+        return false;
+    }
+}
+
+void OsdOverlay::BeginReclaim(const int slot) noexcept {
+    reclaim_outcome_ = sysmem::reclaim::Outcome{};
+    if (!BeginAction(slot, compact::Metric::Ram)) return;
+    active_action_ = CellAction::Reclaim;
+    try {
+
+        // Its own thread. Never the protection worker, and never this one: on
+        // the message loop the trim would stall the loop, which would also
+        // stop the indicator animating. The animation is not decoration, it is
+        // evidence that the work is somewhere else.
+        const sysmem::reclaim::Policy policy = reclaim_policy_;
+        action_worker_ = std::thread([this, policy]() noexcept {
+            sysmem::reclaim::Outcome outcome;
+            try {
+                outcome = sysmem::reclaim::Run(policy);
+            } catch (...) {
+                // A reclaim that throws must still take its indicator down.
+            }
+            reclaim_outcome_ = outcome;
+            action_done_.store(true, std::memory_order_release);
+        });
+    } catch (...) {
+        EndAction();
+    }
+}
+
+// Measure the foreground program's path and report what the stack already
+// knows about it.
+//
+// Note what is NOT here: nothing is sent, nothing is opened, nothing is
+// resolved for the purpose of timing it. Every figure comes from counters the
+// TCP stack kept whether or not this program asked. That is why the action can
+// be honest about improving nothing -- it never claimed to be a test.
+void OsdOverlay::BeginNetworkProbe(const int slot) noexcept {
+    net_verdict_ = net::Verdict{};
+    net_status_ = net::ProbeStatus::NoLibrary;
+    if (!BeginAction(slot, compact::Metric::Network)) return;
+    active_action_ = CellAction::Network;
+    try {
+        // Its own thread, for the same reason the reclaim has one -- but here
+        // the thread also sleeps out the measurement window, and doing that on
+        // the message loop would stop the very animation that tells the reader
+        // the work is somewhere else.
+        action_worker_ = std::thread([this]() noexcept {
+            net::Verdict verdict;
+            net::ProbeStatus status = net::ProbeStatus::NoLibrary;
+            if (net_stub_) {
+                verdict = net_stub_->first;
+                status = net_stub_->second;
+                net_verdict_ = verdict;
+                net_status_ = status;
+                action_done_.store(true, std::memory_order_release);
+                return;
+            }
+            try {
+                net::Probe probe;
+                if (probe.Begin()) {
+                    probe.Attempt();
+                    Sleep(static_cast<DWORD>(net::action::kMeasureWindowMs));
+                    verdict = probe.Finish();
+                }
+                status = probe.status();
+            } catch (...) {
+                // A probe that throws must still take its indicator down.
+            }
+            net_verdict_ = verdict;
+            net_status_ = status;
+            action_done_.store(true, std::memory_order_release);
+        });
+    } catch (...) {
+        EndAction();
+    }
+}
+
+void OsdOverlay::EndAction() noexcept {
+    if (m_hWnd != nullptr) KillTimer(kActionTimerId);
+    busy_indicator_.End();
+    if (action_worker_.joinable()) {
+        // Every worker is bounded -- the reclaim by reclaim::BudgetSpent, the
+        // probe by its measurement window -- so this join cannot wait
+        // indefinitely. Without that, a topmost window that swallows input
+        // would be stuck over the reader's screen.
+        action_worker_.join();
+    }
+    active_action_ = CellAction::None;
+    action_started_ms_ = 0;
+    action_visible_until_ms_ = 0;
+    action_result_until_ms_ = 0;
+    action_done_.store(false, std::memory_order_release);
+    if (m_hWnd != nullptr) RequestRefresh();
+}
+
+LRESULT OsdOverlay::OnOverlayTimer(UINT, const WPARAM id, LPARAM, BOOL& handled) {
+    if (id != kActionTimerId) {
+        handled = FALSE;
+        return 0;
+    }
+    const std::uint64_t now = GetTickCount64();
+    if (!busy_indicator_.Active() || active_action_ == CellAction::None) {
+        KillTimer(kActionTimerId);
+        return 0;
+    }
+    // How long this particular action is allowed to take, and how long its
+    // answer stays up. The rest of this function is identical for both, which
+    // is why only the numbers are chosen here.
+    const bool is_network = active_action_ == CellAction::Network;
+    const std::uint64_t minimum_visible_ms =
+        is_network ? net::action::kMinimumVisibleMs
+                   : sysmem::reclaim::kMinimumVisibleMs;
+    const std::uint64_t result_hold_ms =
+        is_network ? net::action::kResultHoldMs : sysmem::reclaim::kResultHoldMs;
+    const std::uint64_t budget_ms =
+        is_network ? net::action::kWorkBudgetMs : sysmem::reclaim::kWorkBudgetMs;
+    // Written once. "Is this deadline behind us" is not a rule belonging to
+    // either action, and giving each its own copy is how the two would drift.
+    const auto elapsed = [now](const std::uint64_t deadline) {
+        return deadline != 0 && now >= deadline;
+    };
+
+    if (action_done_.load(std::memory_order_acquire)) {
+        if (action_visible_until_ms_ == 0) {
+            // Work can finish faster than a reader can perceive. The floor is
+            // what stops the indicator flashing past and inviting a second
+            // click at the very moment the first one is still settling.
+            action_visible_until_ms_ =
+                action_started_ms_ + minimum_visible_ms;
+        }
+        if (!elapsed(action_visible_until_ms_)) return 0;
+        // The rain has run its course. Say what happened, in the cell, for a
+        // moment. Nothing pops up and nothing takes focus: the reader is in a
+        // game and an interruption would cost more than the answer is worth.
+        if (action_result_until_ms_ == 0) {
+            if (!ReportActionResult(now)) {
+                EndAction();
+                return 0;
+            }
+            action_result_until_ms_ = now + result_hold_ms;
+            return 0;
+        }
+        if (elapsed(action_result_until_ms_)) EndAction();
+        return 0;
+    }
+    // Each worker has its own budget, but if one were ever to overrun even
+    // that, the indicator must still come down rather than live on the
+    // reader's screen. Twice the budget is generous and finite.
+    if (now > action_started_ms_ && now - action_started_ms_ > budget_ms * 2) {
+        EndAction();
+    }
+    return 0;
+}
+
+// What the finished action puts in the cell. False means there is nothing
+// worth showing and the indicator should simply go away.
+bool OsdOverlay::ReportActionResult(const std::uint64_t now) noexcept {
+    switch (active_action_) {
+        case CellAction::Reclaim: {
+            // One record per invocation. Unlike the RAM telemetry beside it,
+            // this is a user-initiated system-level action: it changed other
+            // processes, and someone asking later why a machine behaved oddly
+            // deserves to find out that it happened. Written after the fact,
+            // on the message loop, through the try-only admission -- a full
+            // queue drops it rather than waiting.
+            (void)logging::TryInfo(std::format(
+                L"host memory reclaim: considered={} trimmed={} would_trim={} "
+                L"failed={} skipped={} cache_flushed={} timed_out={} dry_run={} "
+                L"freed_gib={:.2f} elapsed_ms={}",
+                reclaim_outcome_.considered, reclaim_outcome_.trimmed,
+                reclaim_outcome_.would_trim,
+                reclaim_outcome_.failed, reclaim_outcome_.skipped,
+                reclaim_outcome_.cache_flushed ? 1 : 0,
+                reclaim_outcome_.timed_out ? 1 : 0,
+                reclaim_policy_.dry_run ? 1 : 0,
+                sysmem::reclaim::FreedGib(reclaim_outcome_),
+                now > action_started_ms_ ? now - action_started_ms_ : 0));
+            if (!sysmem::reclaim::HasResultToShow(reclaim_outcome_,
+                                                  reclaim_policy_.dry_run)) {
+                return false;
+            }
+            busy_indicator_.ShowResult(FormatReclaimResult(reclaim_outcome_),
+                                       ReclaimResultTint(reclaim_outcome_));
+            return true;
+        }
+        case CellAction::Network: {
+            // Recorded the same way and for a weaker reason: this action
+            // changed nothing on the machine. It is logged so that a verdict
+            // the reader disputes can be checked against what was measured,
+            // rather than argued from memory.
+            (void)logging::TryInfo(std::format(
+                L"network verdict: status={} grade={} rtt_ms={} connections={} "
+                L"elapsed_ms={}",
+                static_cast<int>(net_status_),
+                static_cast<int>(net_verdict_.grade), net_verdict_.rtt_ms,
+                net_verdict_.connections,
+                now > action_started_ms_ ? now - action_started_ms_ : 0));
+            // Always shown, including every way it can fail. A reclaim that
+            // freed nothing has nothing to say; a probe that measured nothing
+            // has something specific to say, and "idle" or "denied" is the
+            // answer to the question the reader just asked.
+            busy_indicator_.ShowResult(
+                net::action::ResultText(net_verdict_, net_status_),
+                net::action::TintFor(net_verdict_.grade),
+                net::action::BarsFor(net_verdict_.grade));
+            return true;
+        }
+        case CellAction::None: break;
+    }
+    return false;
+}
 
 void OsdOverlay::BeginDragImage(const compact::Metric metric,
                                 const compact::CellGrid& grid,
@@ -890,14 +1669,15 @@ void OsdOverlay::EndDragImage() noexcept {
 
 void OsdOverlay::FinishArrangement(const int from_slot, const POINT point) noexcept {
     const Layout geometry = CurrentLayout();
-    const auto placed = compact::Resolve(layout_, ram_enabled_, fps_enabled_);
+    const auto placed = CurrentPlacement();
     const auto grid = compact::MakeCellGrid(geometry.columns, geometry.width,
                                             geometry.scale);
-    const auto target = compact::DropTargetAt(grid, point.x, point.y);
-    if (target.row < 0) return;  // released outside the cells: change nothing
-    const auto next =
-        compact::ApplyDrop(layout_, placed, from_slot, target.row, target.column);
-    if (next.order == layout_.order && next.row1 == layout_.row1) return;
+    // Read against the dragged image's origin, not the cursor: the reader is
+    // aiming a block they can see, not a point they cannot.
+    const POINT origin{point.x - drag_hotspot_.x, point.y - drag_hotspot_.y};
+    const auto plan = compact::PlanDrop(grid, placed, origin.x, origin.y);
+    const auto next = compact::ApplyPlan(layout_, placed, from_slot, plan);
+    if (next.order == layout_.order && next.breaks == layout_.breaks) return;
     SetCompactLayout(next);
     RenderLatest();
 }
@@ -921,17 +1701,17 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
         // aim that misses leaves the chevron and the drag bar their own input.
         if (Arrangeable()) {
             const auto placed =
-                compact::Resolve(layout_, ram_enabled_, fps_enabled_);
+                CurrentPlacement();
             const int slot = compact::CellSlotAt(
                 compact::MakeCellGrid(geometry.columns, geometry.width,
                                       geometry.scale),
-                placed.count, cursor.x, cursor.y);
+                placed, cursor.x, cursor.y);
             if (slot >= 0) {
                 drag_from_ = slot;
                 ::SetCapture(input_window);
                 const auto grid = compact::MakeCellGrid(
                     geometry.columns, geometry.width, geometry.scale);
-                const auto origin = compact::CellOriginAt(grid, slot);
+                const auto origin = compact::CellOriginAt(grid, placed, slot);
                 BeginDragImage(placed.cells[static_cast<std::size_t>(slot)],
                                grid, cursor,
                                POINT{static_cast<LONG>(origin.x),
@@ -971,12 +1751,16 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
     lock_gesture_.Cancel();
     toggle_gesture_.Cancel();
     EndDragImage();
+    EndAction();
     if (message == WM_CANCELMODE && ::GetCapture() == input_window)
         ::ReleaseCapture();
     return 0;
 }
 
 void OsdOverlay::ToggleCollapsed() noexcept {
+    // The expanded view has no cells, so an indicator pinned to one would be
+    // left floating over a lane.
+    EndAction();
     POINT next = Position();
     collapsed_ = !collapsed_;
     const auto layout = CurrentLayout();
@@ -996,6 +1780,9 @@ LRESULT OsdOverlay::OnDpiChanged(UINT, WPARAM, const LPARAM lparam, BOOL&) {
 }
 
 LRESULT OsdOverlay::OnDisplayChanged(UINT, WPARAM, LPARAM, BOOL&) {
+    // The cell this indicator was pinned over has just moved or changed size,
+    // so it would sit over the wrong place, or over nothing.
+    EndAction();
     POINT next = Position();
     const Layout layout = CurrentLayout();
     (void)FitToWorkArea(next, layout);
@@ -1007,6 +1794,7 @@ LRESULT OsdOverlay::OnDisplayChanged(UINT, WPARAM, LPARAM, BOOL&) {
 LRESULT OsdOverlay::OnSessionChanged(UINT, const WPARAM event, LPARAM, BOOL&) {
     if (event == WTS_SESSION_LOCK) {
         session_locked_ = true;
+        EndAction();
         (void)logging::TryInfo(L"Windows session locked; OSD remains registered");
     } else if (event == WTS_SESSION_UNLOCK) {
         session_locked_ = false;
@@ -1241,7 +2029,7 @@ OsdOverlay::Layout OsdOverlay::CurrentLayout() const noexcept {
                                  static_cast<int>(dpi));
     }
     const auto footprint = compact::ChooseFootprint(
-        collapsed_, compact::Resolve(layout_, ram_enabled_, fps_enabled_),
+        collapsed_, CurrentPlacement(),
         work_width_dip, work_height_dip);
     return {MulDiv(footprint.width, static_cast<int>(dpi), 96),
             MulDiv(footprint.height, static_cast<int>(dpi), 96),
@@ -1251,8 +2039,20 @@ OsdOverlay::Layout OsdOverlay::CurrentLayout() const noexcept {
 
 bool OsdOverlay::FitToWorkArea(POINT& point, const Layout& layout) const noexcept {
     RECT proposed{point.x, point.y, point.x + layout.width, point.y + layout.height};
-    HMONITOR monitor = MonitorFromRect(&proposed, MONITOR_DEFAULTTONULL);
-    const bool repaired = monitor == nullptr;
+    const bool repaired = MonitorFromRect(&proposed, MONITOR_DEFAULTTONULL) == nullptr;
+    // The monitor is decided by where the window already is, not by where a
+    // resize would spill it to.
+    //
+    // MonitorFromRect answers with the monitor the rectangle overlaps most.
+    // Expanding an 84-dip column docked on a right edge widens the proposed
+    // rectangle across the neighbouring screen, which then wins that test, and
+    // the clamp below pins the window to *its* left edge. To the reader the
+    // overlay vanishes and reappears on another screen -- it reads as losing
+    // the window, not as a repair.
+    //
+    // The anchor cannot move the window between screens, so expanding keeps it
+    // where it was and slides it left only as far as fitting requires.
+    HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
     if (monitor == nullptr) monitor = MonitorFromRect(&proposed, MONITOR_DEFAULTTONEAREST);
     MONITORINFO info{sizeof(info)};
     if (monitor == nullptr || GetMonitorInfoW(monitor, &info) == FALSE) return repaired;
@@ -1357,9 +2157,18 @@ bool OsdOverlay::Render() noexcept {
                                  Gdiplus::UnitPixel);
         Gdiplus::Font value_font(&family, 12.5F * s, Gdiplus::FontStyleBold,
                                  Gdiplus::UnitPixel);
-        DrawText(graphics, L"GTG",
-                 {10.0F * s, 2.0F * s, 30.0F * s, 22.0F * s}, title_font,
-                 Gdiplus::Color(222, 237, 243, 251), Gdiplus::StringAlignmentNear);
+        // At one cell across the header is 84 dip and the two buttons take 50
+        // of it. The label and the dot both sit under them at their usual
+        // places, so the label goes and the dot moves to the left margin --
+        // which is also what leaves 34 x 25 dip of grabbable drag strip.
+        const int widest_columns =
+            layout.columns < 0 ? -layout.columns : layout.columns;
+        const bool show_title = !collapsed_ || compact::HeaderShowsTitle(widest_columns);
+        if (show_title) {
+            DrawText(graphics, L"GTG",
+                     {10.0F * s, 2.0F * s, 30.0F * s, 22.0F * s}, title_font,
+                     Gdiplus::Color(222, 237, 243, 251), Gdiplus::StringAlignmentNear);
+        }
         const std::uint64_t now_ms = GetTickCount64();
         static const std::deque<telemetry::Sample> empty;
         const auto& samples = history_ == nullptr ? empty : history_->Samples();
@@ -1451,38 +2260,78 @@ bool OsdOverlay::Render() noexcept {
         Gdiplus::SolidBrush dot(Gdiplus::Color(
             compact::PulseAlpha(collapsed_ && attention, animations != FALSE, now_ms),
             status_color.GetR(), status_color.GetG(), status_color.GetB()));
-        graphics.FillEllipse(&dot, 46.0F * s, 9.0F * s, 6.0F * s, 6.0F * s);
+        const float dot_left = (show_title ? 46.0F : 11.0F) * s;
+        graphics.FillEllipse(&dot, dot_left, 9.0F * s, 6.0F * s, 6.0F * s);
         const float status_left = 58.0F * s;
-        // The lock takes one more button width from the status line. At the
-        // narrowest arrangement this still leaves every Traditional Chinese
-        // status intact: the longest is 210 dip against 274 available.
-        const float header_buttons = static_cast<float>(layout.drag_height) *
-                                     (ShowsLock() ? 2.0F : 1.0F);
-        DrawText(graphics, displayed_status,
-                 {status_left, 2.0F * s, layout.width - header_buttons - status_left - 4.0F * s,
-                  22.0F * s}, status_font,
-                 status_color, Gdiplus::StringAlignmentNear);
-        Gdiplus::Pen handle(Gdiplus::Color(38, 203, 215, 231), 1.0F * s);
-        graphics.DrawLine(&handle, layout.width / 2.0F - 10.0F * s, 23.0F * s,
-                          layout.width / 2.0F + 10.0F * s, 23.0F * s);
-        const float button_x = static_cast<float>(layout.width - layout.drag_height);
+        const float header_buttons =
+            static_cast<float>(compact::HeaderButtonWidth(layout.drag_height)) *
+            (ShowsLock() ? 2.0F : 1.0F);
+        // Two cells across leaves 48 dip for the status, which fits only the
+        // shortest Chinese string. Rather than truncate a warning into an
+        // ellipsis, the header keeps the dot and drops the words: the colour
+        // already says which state this is, and the detail lives in the main
+        // window. Above two cells there is room for every string in either
+        // language, so nothing changes there.
+        const bool show_status_text =
+            !collapsed_ || compact::HeaderShowsStatusText(widest_columns);
+        if (show_status_text) {
+            DrawText(graphics, displayed_status,
+                     {status_left, 2.0F * s,
+                      layout.width - header_buttons - status_left - 4.0F * s,
+                      22.0F * s}, status_font,
+                     status_color, Gdiplus::StringAlignmentNear);
+        }
+        // The hint line marks where the window can be grabbed, and under a
+        // title it sits in the middle of the strip it describes. With no title
+        // there is no middle to speak of: the line ended up under the status
+        // dot, pointing at nothing in particular. The dot is already the only
+        // thing in that corner, and the whole corner is draggable, so at one
+        // cell across the line is simply not drawn.
+        if (show_title) {
+            Gdiplus::Pen handle(Gdiplus::Color(38, 203, 215, 231), 1.0F * s);
+            graphics.DrawLine(&handle, layout.width / 2.0F - 10.0F * s, 23.0F * s,
+                              layout.width / 2.0F + 10.0F * s, 23.0F * s);
+        }
+        // The buttons are square and narrower than the band is tall. At the
+        // band's full 25 dip their 3-dip insets left a 6-dip gap that read as
+        // two unrelated controls, and at one cell across the lock landed near
+        // the middle of an 84-dip window. Nine tenths closes the gap, moves
+        // both towards the corner they belong in, and widens the drag strip
+        // from 34 to 40 dip in the process.
+        const float button_w =
+            static_cast<float>(compact::HeaderButtonWidth(layout.drag_height));
+        // Everything inside a button is expressed against the band it used to
+        // fill, so one factor rescales the whole glyph rather than a dozen
+        // hand-adjusted offsets.
+        const float bs = button_w / static_cast<float>(compact::kDragBandDip);
+        const float button_y =
+            (static_cast<float>(layout.drag_height) - button_w) / 2.0F;
+        const float button_x = static_cast<float>(layout.width) - button_w;
         Gdiplus::SolidBrush button_fill(Gdiplus::Color(22, 203, 215, 231));
-        graphics.FillRectangle(&button_fill, button_x + 3.0F * s, 3.0F * s, 19.0F * s, 19.0F * s);
-        Gdiplus::Pen chevron(Gdiplus::Color(235, 224, 235, 248), 1.5F * s);
+        graphics.FillRectangle(&button_fill, button_x + 3.0F * bs,
+                               button_y + 3.0F * bs, 19.0F * bs, 19.0F * bs);
+        Gdiplus::Pen chevron(Gdiplus::Color(235, 224, 235, 248), 1.5F * bs);
         chevron.SetLineJoin(Gdiplus::LineJoinRound);
-        const float edge_y = (collapsed_ ? 10.0F : 14.0F) * s;
-        const float middle_y = (collapsed_ ? 14.0F : 10.0F) * s;
+        const float edge_y = button_y + (collapsed_ ? 10.0F : 14.0F) * bs;
+        const float middle_y = button_y + (collapsed_ ? 14.0F : 10.0F) * bs;
+        // The two plates are already adjacent, but each glyph is centred in
+        // its own plate, so the gap the eye sees is the sum of two inner
+        // margins -- wider than the seam between the plates. Nudging the
+        // glyphs towards each other closes it without moving either plate or
+        // its hit rectangle.
+        const float chevron_nudge = 1.5F * bs;
         const Gdiplus::PointF arrow[]{
-            {button_x + 8.0F * s, edge_y}, {button_x + 12.5F * s, middle_y},
-            {button_x + 17.0F * s, edge_y}};
+            {button_x + 8.0F * bs - chevron_nudge, edge_y},
+            {button_x + 12.5F * bs - chevron_nudge, middle_y},
+            {button_x + 17.0F * bs - chevron_nudge, edge_y}};
         graphics.DrawLines(&chevron, arrow, 3);
 
         // The lock is offered only where arranging is possible: the compact
         // dashboard, and only in builds whose body receives pointer input.
         if (ShowsLock()) {
-            const float lock_x = button_x - static_cast<float>(layout.drag_height);
-            graphics.FillRectangle(&button_fill, lock_x + 3.0F * s, 3.0F * s,
-                                   19.0F * s, 19.0F * s);
+            const float lock_x = button_x - button_w;
+            graphics.FillRectangle(&button_fill, lock_x + 3.0F * bs,
+                                   button_y + 3.0F * bs, 19.0F * bs, 19.0F * bs);
             // Locked is the resting state of an always-on-top window, so it
             // carries exactly the weight of the chevron beside it: the same
             // tint, the same pen, outline only. Unlocked is an alert -- amber
@@ -1497,15 +2346,17 @@ bool OsdOverlay::Render() noexcept {
             const Gdiplus::Color lock_tint = compact_locked_
                 ? Gdiplus::Color(235, 224, 235, 248)
                 : Gdiplus::Color(235, 255, 184, 72);
-            Gdiplus::Pen lock_pen(lock_tint, 1.4F * s);
+            Gdiplus::Pen lock_pen(lock_tint, 1.4F * bs);
             lock_pen.SetLineJoin(Gdiplus::LineJoinRound);
             // Closed: the shackle sits on the body. Open: it lifts and shifts.
-            const float body_top = 12.0F * s;
-            const float arc_x = lock_x + (compact_locked_ ? 9.0F : 10.75F) * s;
-            graphics.DrawArc(&lock_pen, arc_x, body_top - 5.25F * s, 7.0F * s,
-                             7.0F * s, 180.0F, 180.0F);
-            const Gdiplus::RectF body(lock_x + 7.75F * s, body_top, 9.5F * s,
-                                      6.5F * s);
+            const float body_top = button_y + 12.0F * bs;
+            const float lock_nudge = 1.0F * bs;
+            const float arc_x =
+                lock_x + (compact_locked_ ? 9.0F : 10.75F) * bs + lock_nudge;
+            graphics.DrawArc(&lock_pen, arc_x, body_top - 5.25F * bs, 7.0F * bs,
+                             7.0F * bs, 180.0F, 180.0F);
+            const Gdiplus::RectF body(lock_x + 7.75F * bs + lock_nudge, body_top,
+                                      9.5F * bs, 6.5F * bs);
             if (compact_locked_) {
                 graphics.DrawRectangle(&lock_pen, body);
             } else {
@@ -1535,131 +2386,261 @@ bool OsdOverlay::Render() noexcept {
             // chart body folds to one row. Never invent zero for missing data.
             Gdiplus::Font small_font(&family, 9.0F * s, Gdiplus::FontStyleRegular,
                                      Gdiplus::UnitPixel);
-            const float cell_width_dip = layout.columns == 3
-                ? (static_cast<float>(layout.width) / s - 20.0F) / 3.0F
-                : 72.0F;
-            const float cell_width = cell_width_dip * s;
-            // Cells wrap at layout.columns and the overlay grows downward, so
-            // a preference toggle never changes the overlay's width.
-            const int per_row = std::max(1, layout.columns);
-            const float column_stride_dip =
-                layout.columns == 3 ? cell_width_dip + 4.0F : 76.0F;
-            const auto cell_origin = [&](const int index) {
-                return std::pair<float, float>{
-                    (6.0F + (index % per_row) * column_stride_dip) * s,
-                    (30.0F + (index / per_row) *
-                                 static_cast<float>(compact::kCollapsedRowPitch)) * s};
+            // Geometry comes from the shared grid, the same one hit testing
+            // uses. Render used to derive cell origins from its own copy of
+            // these numbers, and two copies of one layout is exactly how the
+            // expanded lanes drifted apart. A second pointer gesture would
+            // have made any drift land on the wrong cell.
+            const auto grid = compact::MakeCellGrid(layout.columns, layout.width, s);
+            const float cell_width = grid.cell_width_dip * s;
+
+            // A record describes itself, then one block draws every record the
+            // same way. RAM and FPS are rows in that description rather than
+            // special cases appended after it: they differ only in where their
+            // value and their sparkline come from.
+            enum class Spark { None, Telemetry, Memory, Fps, Network };
+            // One format for every measurement below; MeasureString wraps by
+            // default and a wrapped measurement is not the width that will be
+            // drawn.
+            Gdiplus::StringFormat measure_format;
+            measure_format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            struct CellContent {
+                std::wstring label;
+                // Drawn after the label in a smaller face, when a record has a
+                // unit that changes. Only network does: every other record's
+                // unit is part of its value and never moves.
+                std::wstring unit;
+                std::wstring value;
+                Gdiplus::Color accent{};
+                MetricMember member{nullptr};
+                double minimum_span{};
+                bool unavailable{};
+                bool attention{};   // the reading itself is the warning
+                Spark spark{Spark::None};
             };
-            const auto cell = [&](int index, const std::wstring& label,
-                                  const std::wstring& value, MetricMember member,
-                                  const Gdiplus::Color color, double minimum_span,
-                                  std::optional<bool> unavailable_override =
-                                      std::nullopt) {
-                const auto [x, y] = cell_origin(index);
-                const bool unavailable = unavailable_override
-                    ? *unavailable_override
-                    : (member == nullptr
-                           ? fps_snapshot_.status != fps::Status::Ready : stale);
-                Gdiplus::SolidBrush background(Gdiplus::Color(15, color.GetR(), color.GetG(), color.GetB()));
-                Gdiplus::Pen border(Gdiplus::Color(42, color.GetR(), color.GetG(), color.GetB()), s);
-                Gdiplus::GraphicsPath path;
-                AddRoundedRectangle(path, {x, y, cell_width, 51.0F * s}, 3.0F * s);
-                graphics.FillPath(&background, &path);
-                graphics.DrawPath(&border, &path);
-                DrawText(graphics, label, {x + 4.0F * s, y + 1.0F * s, cell_width - 8.0F * s, 14.0F * s},
-                         small_font, color, Gdiplus::StringAlignmentNear);
-                DrawText(graphics, value, {x + 4.0F * s, y + 14.0F * s, cell_width - 8.0F * s, 22.0F * s},
-                         value_font, unavailable ? Gdiplus::Color(180, 205, 214, 226)
-                                          : Gdiplus::Color(255, 245, 248, 252),
-                         Gdiplus::StringAlignmentNear);
-                if (member != nullptr) {
-                    DrawCompactSparkline(graphics, samples, start, end, member,
-                        {x + 5.0F * s, y + 37.0F * s, cell_width - 10.0F * s, 10.0F * s},
-                        Gdiplus::Color(stale ? 140 : 235, color.GetR(), color.GetG(), color.GetB()),
-                        minimum_span, s);
-                }
-            };
-            const Gdiplus::Color ram_color(255, 255, 122, 196);
-            const Gdiplus::Color commit_color(255, 228, 196, 76);
-            // Cells are drawn by walking the reader's arrangement, so the
-            // order lives in one place instead of being implied by a sequence
-            // of calls. A record appears once or not at all; nothing here can
-            // place one twice or drop one.
-            const auto placed =
-                compact::Resolve(layout_, ram_enabled_, fps_enabled_);
-            for (int slot = 0; slot < placed.count; ++slot) {
-                switch (placed.cells[static_cast<std::size_t>(slot)]) {
+            const auto describe = [&](const compact::Metric metric) {
+                CellContent c;
+                c.label = CompactLabel(metric);
+                c.accent = Accent(metric);
+                c.unavailable = stale;
+                c.spark = Spark::Telemetry;
+                switch (metric) {
                 case compact::Metric::Temperature:
-                    cell(slot, std::wstring(localization::Select(L"溫度", L"Temp")),
-                        FormatMetric(optional(&telemetry::Sample::temperature_c), L" °C"),
-                        &telemetry::Sample::temperature_c,
-                        Gdiplus::Color(255, 255, 91, 94), 10.0);
+                    c.member = &telemetry::Sample::temperature_c;
+                    c.value = FormatMetric(optional(c.member), L" °C");
+                    c.minimum_span = 10.0;
                     break;
                 case compact::Metric::Power:
-                    cell(slot, std::wstring(localization::Select(L"功率", L"Power")),
-                        FormatMetric(optional(&telemetry::Sample::power_w), L" W", 1),
-                        &telemetry::Sample::power_w,
-                        Gdiplus::Color(255, 77, 160, 255), 100.0);
+                    c.member = &telemetry::Sample::power_w;
+                    c.value = FormatMetric(optional(c.member), L" W", 1);
+                    c.minimum_span = 100.0;
                     break;
                 case compact::Metric::Vram:
-                    cell(slot, L"VRAM",
-                        FormatMetric(optional(&telemetry::Sample::vram_utilization_percent), L"%"),
-                        &telemetry::Sample::vram_utilization_percent,
-                        Gdiplus::Color(255, 255, 173, 69), 20.0);
+                    c.member = &telemetry::Sample::vram_utilization_percent;
+                    c.value = FormatMetric(optional(c.member), L"%");
+                    c.minimum_span = 20.0;
                     break;
                 case compact::Metric::Gpu:
-                    cell(slot, L"GPU",
-                        FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
-                        &telemetry::Sample::gpu_utilization_percent,
-                        Gdiplus::Color(255, 75, 214, 139), 20.0);
+                    c.member = &telemetry::Sample::gpu_utilization_percent;
+                    c.value = FormatMetric(optional(c.member), L"%");
+                    c.minimum_span = 20.0;
                     break;
                 case compact::Metric::Cpu:
-                    cell(slot, L"CPU",
-                        FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
-                        &telemetry::Sample::cpu_utilization_percent,
-                        Gdiplus::Color(255, 183, 121, 255), 20.0);
+                    c.member = &telemetry::Sample::cpu_utilization_percent;
+                    c.value = FormatMetric(optional(c.member), L"%");
+                    c.minimum_span = 20.0;
                     break;
                 case compact::Metric::Ram: {
                     // One coherent live reading, as in the expanded lane.
-                    const auto live_ram = sysmem::Query();
-                    const std::wstring ram_value =
-                        live_ram.physical_percent
-                            ? std::format(L"{:.0f}%", *live_ram.physical_percent)
-                            : L"-";
-                    cell(slot, L"RAM", ram_value, nullptr, ram_color, 0.0,
-                         !live_ram.physical_percent);
-                    if (ram_history_ != nullptr) {
-                        const auto [x, y] = cell_origin(slot);
-                        DrawMemorySparkline(graphics, ram_history_->Samples(),
-                            start, end,
-                            {x + 5.0F * s, y + 37.0F * s,
-                             cell_width - 10.0F * s, 10.0F * s},
-                            Gdiplus::Color(235, ram_color.GetR(),
-                                           ram_color.GetG(), ram_color.GetB()),
-                            Gdiplus::Color(200, commit_color.GetR(),
-                                           commit_color.GetG(),
-                                           commit_color.GetB()),
-                            s);
-                    }
+                    const auto live = sysmem::Query();
+                    c.value = live.physical_percent
+                        ? std::format(L"{:.0f}%", *live.physical_percent)
+                        : L"-";
+                    c.unavailable = !live.physical_percent;
+                    c.attention = host_memory_low_ && live.physical_percent.has_value();
+                    c.spark = ram_history_ != nullptr ? Spark::Memory : Spark::None;
                     break;
                 }
-                case compact::Metric::Fps: {
-                    const std::wstring fps_value =
-                        fps_snapshot_.status == fps::Status::Ready
-                            ? std::format(L"{:.0f}", fps_snapshot_.displayed_fps)
-                            : L"-";
-                    cell(slot, L"FPS", fps_value, nullptr,
-                         Gdiplus::Color(255, 92, 220, 215), 0.0);
-                    if (fps_history_ != nullptr) {
-                        const auto [x, y] = cell_origin(slot);
-                        DrawFpsSparkline(graphics, fps_history_->Samples(),
-                            start, end,
-                            {x + 5.0F * s, y + 37.0F * s,
-                             cell_width - 10.0F * s, 10.0F * s},
-                            Gdiplus::Color(235, 92, 220, 215), s);
+                case compact::Metric::Network: {
+                    // Both directions in one unit, chosen from the peak over
+                    // the drawn window rather than the latest reading: the
+                    // instantaneous value crosses unit boundaries constantly,
+                    // and the label would flicker. The number and the curve
+                    // beneath it are then scaled by the same quantity.
+                    const auto* latest =
+                        net_history_ == nullptr ? nullptr : net_history_->Latest();
+                    // The curve still scales to the window peak -- the
+                    // Spark::Network case below asks for it -- but the number
+                    // no longer depends on it at all.
+                    constexpr net::Unit unit = net::kDisplayUnit;
+                    c.unit = net::UnitSuffix(unit);
+                    const bool readable = latest != nullptr &&
+                                          latest->received_bytes_per_second &&
+                                          latest->sent_bytes_per_second;
+                    if (readable) {
+                        const int rx = net::TenthsIn(
+                            *latest->received_bytes_per_second, unit);
+                        const int tx = net::TenthsIn(
+                            *latest->sent_bytes_per_second, unit);
+                        // Whole units, padded to two digits so the pair keeps
+                        // its shape as the numbers change -- a cell whose text
+                        // jumps between two and three characters twitches at
+                        // the edge of vision, which is the opposite of what a
+                        // glanceable readout is for. The separator is the one
+                        // VRAM already uses.
+                        // One decimal below a hundred, none above.
+                        //
+                        // The decimal is what makes a fixed megabyte scale
+                        // usable at all: ordinary traffic is a fraction of one
+                        // -- this machine idles between 0.1 and 0.5 -- and
+                        // whole units would print `0 · 0` for all of it.
+                        //
+                        // Above a hundred it is the decimal that breaks the
+                        // row instead. Measured: a saturated 10 GbE link reads
+                        // `1192.1 · 1190.3` at 95.8 dip and would need 7.5 pt
+                        // type to fit a 64 dip row, which is past legible.
+                        // Without the decimals the same pair is 74.0 and fits
+                        // at 10.5. Nobody needs to know whether 1192 MB/s was
+                        // really 1192.1.
+                        // The larger figure decides for both, so the pair
+                        // keeps one shape. Formatting each for its own
+                        // magnitude gives `297 · 31.5`, which reads as two
+                        // unrelated measurements rather than one reading.
+                        const bool coarse = rx >= 1000 || tx >= 1000;
+                        const auto figure = [coarse](const int tenths) {
+                            return coarse
+                                ? std::format(L"{}", tenths / 10)
+                                : std::format(L"{}.{}", tenths / 10, tenths % 10);
+                        };
+                        c.value = std::format(L"{} · {}", figure(rx), figure(tx));
+                    } else {
+                        c.value = L"-";
                     }
+                    c.unavailable = !readable;
+                    c.spark = net_history_ != nullptr ? Spark::Network : Spark::None;
                     break;
                 }
+                case compact::Metric::Fps:
+                    c.value = fps_snapshot_.status == fps::Status::Ready
+                        ? std::format(L"{:.0f}", fps_snapshot_.displayed_fps)
+                        : L"-";
+                    c.unavailable = fps_snapshot_.status != fps::Status::Ready;
+                    c.spark = fps_history_ != nullptr ? Spark::Fps : Spark::None;
+                    break;
+                }
+                return c;
+            };
+
+            const auto placed = CurrentPlacement();
+            for (int slot = 0; slot < placed.count; ++slot) {
+                const auto content =
+                    describe(placed.cells[static_cast<std::size_t>(slot)]);
+                const auto origin = compact::CellOriginAt(grid, placed, slot);
+                const float x = origin.x;
+                const float y = origin.y;
+                const Gdiplus::Color accent = content.accent;
+                // Attention raises the cell's own accent rather than replacing
+                // it. A record that changes colour under warning stops being
+                // recognisable at a glance, which is the one thing the compact
+                // dashboard exists to preserve; a brighter fill and a solid
+                // border read as urgency while the record stays itself.
+                const BYTE fill_alpha = content.attention ? 46 : 15;
+                const BYTE border_alpha = content.attention ? 190 : 42;
+                Gdiplus::SolidBrush background(Gdiplus::Color(
+                    fill_alpha, accent.GetR(), accent.GetG(), accent.GetB()));
+                Gdiplus::Pen border(Gdiplus::Color(
+                    border_alpha, accent.GetR(), accent.GetG(), accent.GetB()), s);
+                Gdiplus::GraphicsPath path;
+                AddRoundedRectangle(
+                    path, {x, y, cell_width, compact::kCellHeightDip * s}, 3.0F * s);
+                graphics.FillPath(&background, &path);
+                graphics.DrawPath(&border, &path);
+                DrawText(graphics, content.label,
+                    {x + 4.0F * s, y + 1.0F * s, cell_width - 8.0F * s, 14.0F * s},
+                    small_font, accent, Gdiplus::StringAlignmentNear);
+                if (!content.unit.empty()) {
+                    // A size below the label, so a record that has to show its
+                    // unit does not shout louder than the seven that do not.
+                    Gdiplus::RectF label_size;
+                    graphics.MeasureString(content.label.c_str(), -1, &small_font,
+                                           Gdiplus::PointF(0.0F, 0.0F),
+                                           &measure_format, &label_size);
+                    Gdiplus::Font unit_font(&family, 7.5F * s,
+                                            Gdiplus::FontStyleRegular,
+                                            Gdiplus::UnitPixel);
+                    DrawText(graphics, content.unit,
+                        {x + 6.0F * s + label_size.Width, y + 2.5F * s,
+                         cell_width - 10.0F * s - label_size.Width, 12.0F * s},
+                        unit_font,
+                        Gdiplus::Color(190, accent.GetR(), accent.GetG(),
+                                       accent.GetB()),
+                        Gdiplus::StringAlignmentNear);
+                }
+                // The value steps down until it fits rather than being cut off
+                // with an ellipsis. A truncated number is a different number,
+                // and network throughput has no ceiling to design a width
+                // against: measured, 999 · 999 fits at 12.5 and 1023 · 1023
+                // needs 10.5.
+                const float value_box = cell_width - 8.0F * s;
+                // Measured at the real font: `0.7 · 0.1` is 51.4 dip and
+                // fits at full size, while both directions saturated on a
+                // gigabit link -- `119.2 · 118.5` -- is 81.0 and needs 9.5.
+                float value_size = 12.5F;
+                Gdiplus::RectF value_measured;
+                for (; value_size > 8.5F; value_size -= 1.0F) {
+                    Gdiplus::Font probe(&family, value_size * s,
+                                        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+                    graphics.MeasureString(content.value.c_str(), -1, &probe,
+                                           Gdiplus::PointF(0.0F, 0.0F),
+                                           &measure_format, &value_measured);
+                    if (value_measured.Width <= value_box) break;
+                }
+                Gdiplus::Font fitted_value(&family, value_size * s,
+                                           Gdiplus::FontStyleBold,
+                                           Gdiplus::UnitPixel);
+                DrawText(graphics, content.value,
+                    {x + 4.0F * s, y + 14.0F * s, value_box, 22.0F * s},
+                    fitted_value,
+                    content.unavailable ? Gdiplus::Color(180, 205, 214, 226)
+                                        : Gdiplus::Color(255, 245, 248, 252),
+                    Gdiplus::StringAlignmentNear);
+                const Gdiplus::RectF spark_bounds{
+                    x + 5.0F * s, y + 37.0F * s, cell_width - 10.0F * s, 10.0F * s};
+                switch (content.spark) {
+                case Spark::None:
+                    break;
+                case Spark::Telemetry:
+                    DrawCompactSparkline(graphics, samples, start, end,
+                        content.member, spark_bounds,
+                        Gdiplus::Color(content.unavailable ? 140 : 235,
+                                       accent.GetR(), accent.GetG(), accent.GetB()),
+                        content.minimum_span, s);
+                    break;
+                case Spark::Memory:
+                    DrawMemorySparkline(graphics, ram_history_->Samples(),
+                        start, end, spark_bounds,
+                        Gdiplus::Color(235, kAccentRam.GetR(),
+                                       kAccentRam.GetG(), kAccentRam.GetB()),
+                        Gdiplus::Color(200, kAccentCommit.GetR(),
+                                       kAccentCommit.GetG(), kAccentCommit.GetB()),
+                        s);
+                    break;
+                case Spark::Network:
+                    DrawNetworkSparkline(graphics, net_history_->Samples(),
+                        start, end, spark_bounds,
+                        net_history_->PeakWithin(start, end),
+                        Gdiplus::Color(235, kAccentNetwork.GetR(),
+                                       kAccentNetwork.GetG(), kAccentNetwork.GetB()),
+                        Gdiplus::Color(200, kNetworkSent.GetR(),
+                                       kNetworkSent.GetG(), kNetworkSent.GetB()),
+                        s);
+                    break;
+                case Spark::Fps:
+                    DrawFpsSparkline(graphics, fps_history_->Samples(),
+                        start, end, spark_bounds,
+                        Gdiplus::Color(235, kAccentFps.GetR(),
+                                       kAccentFps.GetG(), kAccentFps.GetB()), s);
+                    break;
                 }
             }
         } else {
@@ -1690,20 +2671,20 @@ bool OsdOverlay::Render() noexcept {
             };
             card(0, std::wstring(localization::Select(L"溫度", L"Temp")),
                  FormatMetric(optional(&telemetry::Sample::temperature_c), L" °C"),
-                 Gdiplus::Color(255, 255, 91, 94));
+                 kAccentTemperature);
             card(1, std::wstring(localization::Select(L"功率", L"Power")),
                  FormatMetric(optional(&telemetry::Sample::power_w), L" W", 1),
-                 Gdiplus::Color(255, 77, 160, 255));
+                 kAccentPower);
             card(2, L"VRAM %",
                  FormatMetric(optional(&telemetry::Sample::vram_utilization_percent), L"%"),
-                 Gdiplus::Color(255, 255, 173, 69));
+                 kAccentVram);
             card(3, L"GPU %",
                  FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
-                 Gdiplus::Color(255, 75, 214, 139));
+                 kAccentGpu);
             card(4, L"CPU %",
                  FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
-                 Gdiplus::Color(255, 183, 121, 255));
-            card(5, L"FPS", fps_value, Gdiplus::Color(255, 92, 220, 215));
+                 kAccentCpu);
+            card(5, L"FPS", fps_value, kAccentFps);
             if (fps_history_ != nullptr) {
                 const float x = (12.0F + card_width_dip + 6.0F) * s;
                 const float y = (31.0F + 2.0F * 53.0F) * s;
@@ -1729,21 +2710,23 @@ bool OsdOverlay::Render() noexcept {
             }
         }
 
-        // Derived, not hard-coded: this reproduces the previous 57 and 52 for
-        // five and six records and keeps a seventh inside the window.
-        const int expanded_lanes =
-            5 + (ram_enabled_ ? 1 : 0) + (fps_enabled_ ? 1 : 0);
+        // Lanes follow the same arrangement as the compact cells. Each record
+        // asks where it sits rather than being placed by the order of the
+        // calls below, so the two views cannot drift apart.
+        const auto expanded_placed = CurrentPlacement();
+        // The lane count is the placement's, not a sum of the optional flags.
+        // It was written out as `5 + ram + fps`, which is a third copy of the
+        // rule about which records exist -- it did not know about the eighth,
+        // so the window divided its height by seven, every lane came out too
+        // tall and the last one fell past the bottom edge. The record was
+        // drawn; it was simply drawn off the window.
+        const int expanded_lanes = expanded_placed.count;
         const float row_height =
             ((static_cast<float>(layout.height) / s - 31.0F) /
                  static_cast<float>(expanded_lanes) - 2.0F) * s;
         const float row_width = 376.0F * s;
         const float row_x = 6.0F * s;
         const float row_start = 31.0F * s;
-        // Lanes follow the same arrangement as the compact cells. Each record
-        // asks where it sits rather than being placed by the order of the
-        // calls below, so the two views cannot drift apart.
-        const auto expanded_placed =
-            compact::Resolve(layout_, ram_enabled_, fps_enabled_);
         const auto lane_row = [&](const compact::Metric metric) {
             int slot = 0;
             for (int i = 0; i < expanded_placed.count; ++i) {
@@ -1764,7 +2747,7 @@ bool OsdOverlay::Render() noexcept {
             lane_row(compact::Metric::Temperature),
             std::wstring(localization::Select(L"溫度", L"Temp")),
             FormatMetric(temperature, L" °C"),
-            Gdiplus::Color(255, 255, 91, 94), 30.0, 105.0,
+            kAccentTemperature, 30.0, 105.0,
             &telemetry::Sample::temperature_c, label_font, value_font,
             presentation_gaps, true,
             static_cast<double>(trigger_temperature_c_), temperature_maximum, stale);
@@ -1780,7 +2763,7 @@ bool OsdOverlay::Render() noexcept {
             lane_row(compact::Metric::Power),
             std::wstring(localization::Select(L"功率", L"Power")),
             power_value,
-            Gdiplus::Color(255, 77, 160, 255), 0.0, power_maximum,
+            kAccentPower, 0.0, power_maximum,
             &telemetry::Sample::power_w, label_font, value_font,
             presentation_gaps, false,
             static_cast<double>(safe_power_w_), {}, stale);
@@ -1798,21 +2781,21 @@ bool OsdOverlay::Render() noexcept {
         DrawMetricLane(graphics, samples, start, end,
             lane_row(compact::Metric::Vram),
             L"VRAM %", vram_value,
-            Gdiplus::Color(255, 255, 173, 69), 0.0, 100.0,
+            kAccentVram, 0.0, 100.0,
             &telemetry::Sample::vram_utilization_percent, label_font, value_font,
             presentation_gaps, false,
             std::nullopt, vram_maximum, stale);
         DrawMetricLane(graphics, samples, start, end,
             lane_row(compact::Metric::Gpu),
             L"GPU %", FormatMetric(optional(&telemetry::Sample::gpu_utilization_percent), L"%"),
-            Gdiplus::Color(255, 75, 214, 139), 0.0, 100.0,
+            kAccentGpu, 0.0, 100.0,
             &telemetry::Sample::gpu_utilization_percent, label_font, value_font,
             presentation_gaps, false,
             std::nullopt, {}, stale);
         DrawMetricLane(graphics, samples, start, end,
             lane_row(compact::Metric::Cpu),
             L"CPU %", FormatMetric(optional(&telemetry::Sample::cpu_utilization_percent), L"%"),
-            Gdiplus::Color(255, 183, 121, 255), 0.0, 100.0,
+            kAccentCpu, 0.0, 100.0,
             &telemetry::Sample::cpu_utilization_percent, label_font, value_font,
             presentation_gaps, false,
             std::nullopt, {}, stale);
@@ -1842,8 +2825,8 @@ bool OsdOverlay::Render() noexcept {
                 {ram_label.x, ram_row.Y, ram_label.width, ram_row.Height},
                 label_font, ram_color, Gdiplus::StringAlignmentNear);
             DrawText(graphics, ram_value,
-                {ram_row.GetRight() - 140.0F * ram_scale, ram_row.Y,
-                 132.0F * ram_scale, 22.0F * ram_scale},
+                {ram_row.GetRight() - 140.0F * s, ram_row.Y,
+                 132.0F * s, 22.0F * ram_scale},
                 value_font, Gdiplus::Color(255, 245, 248, 252),
                 Gdiplus::StringAlignmentFar);
             if (ram_history_ != nullptr)
@@ -1856,6 +2839,55 @@ bool OsdOverlay::Render() noexcept {
                                    commit_color.GetB()),
                     ram_scale);
         }
+        if (net_enabled_) {
+            const Gdiplus::RectF net_row = lane_row(compact::Metric::Network);
+            const float net_scale = compact::LaneScale(net_row.Height);
+            const auto net_label = compact::LaneLabelSpan(net_row.X, net_scale);
+            const auto net_graph =
+                compact::LaneGraphSpan(net_row.X, net_row.Width, net_scale);
+            Gdiplus::SolidBrush background(Gdiplus::Color(12, 255, 255, 255));
+            graphics.FillRectangle(&background, net_row);
+            const double peak =
+                net_history_ == nullptr ? 0.0 : net_history_->PeakWithin(start, end);
+            // The same fixed unit as the cell: one number must mean one thing
+            // in both views, or switching between them reads as a jump.
+            constexpr net::Unit unit = net::kDisplayUnit;
+            DrawText(graphics,
+                std::wstring(localization::Select(L"網路", L"NET")),
+                {net_label.x, net_row.Y, net_label.width, net_row.Height},
+                label_font, kAccentNetwork, Gdiplus::StringAlignmentNear);
+            const auto* net_latest =
+                net_history_ == nullptr ? nullptr : net_history_->Latest();
+            const bool readable = net_latest != nullptr &&
+                                  net_latest->received_bytes_per_second &&
+                                  net_latest->sent_bytes_per_second;
+            const int rx = readable
+                ? net::TenthsIn(*net_latest->received_bytes_per_second, unit) : 0;
+            const int tx = readable
+                ? net::TenthsIn(*net_latest->sent_bytes_per_second, unit) : 0;
+            DrawText(graphics,
+                // The unit rides with the value here, not on the label:
+                // every other lane reads `52 °C`, `110.0 W`, `32% (30.6 GiB)`,
+                // and the lane has the width for it. The compact cell puts it
+                // on the label only because 64 dip has no room for both.
+                readable ? std::format(L"{}.{} · {}.{} {}", rx / 10, rx % 10,
+                                       tx / 10, tx % 10, net::UnitSuffix(unit))
+                         : std::wstring(L"-"),
+                {net_row.GetRight() - 140.0F * s, net_row.Y,
+                 132.0F * s, 22.0F * net_scale},
+                value_font, Gdiplus::Color(255, 245, 248, 252),
+                Gdiplus::StringAlignmentFar);
+            if (net_history_ != nullptr)
+                DrawNetworkSparkline(graphics, net_history_->Samples(), start, end,
+                    {net_graph.x, net_row.Y + 23.0F * net_scale,
+                     net_graph.width, net_row.Height - 30.0F * net_scale},
+                    peak,
+                    Gdiplus::Color(235, kAccentNetwork.GetR(),
+                                   kAccentNetwork.GetG(), kAccentNetwork.GetB()),
+                    Gdiplus::Color(215, kNetworkSent.GetR(), kNetworkSent.GetG(),
+                                   kNetworkSent.GetB()),
+                    net_scale);
+        }
         if (fps_enabled_) {
             const Gdiplus::RectF fps_row = lane_row(compact::Metric::Fps);
             // Same derived scale as DrawMetricLane, not the raw DPI scale.
@@ -1867,11 +2899,11 @@ bool OsdOverlay::Render() noexcept {
             graphics.FillRectangle(&background, fps_row);
             DrawText(graphics, L"FPS",
                 {fps_label.x, fps_row.Y, fps_label.width, fps_row.Height},
-                label_font, Gdiplus::Color(255, 92, 220, 215),
+                label_font, kAccentFps,
                 Gdiplus::StringAlignmentNear);
             DrawText(graphics, fps_value,
-                {fps_row.GetRight() - 140.0F * fps_scale, fps_row.Y,
-                 132.0F * fps_scale, 22.0F * fps_scale},
+                {fps_row.GetRight() - 140.0F * s, fps_row.Y,
+                 132.0F * s, 22.0F * fps_scale},
                 value_font, Gdiplus::Color(255, 245, 248, 252),
                 Gdiplus::StringAlignmentFar);
             if (fps_history_ != nullptr)

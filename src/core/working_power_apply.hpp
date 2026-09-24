@@ -17,8 +17,19 @@ ApplyResult ApplyWorkingPower(ProtectionController& controller,
     ProtectionConfig& active, const ProtectionConfig& requested,
     std::optional<int> temperature, std::int64_t sample_age_ms,
     Writer&& writer, SafeWriter&& safe_writer, Save&& save) {
+    // Armed and MonitorOnly are both states a reader may configure from.
+    // MonitorOnly is where every fresh install begins, so excluding it here
+    // made the very first configuration the one setting that could never be
+    // applied -- observed on an RTX 4080, where Apply was refused every time
+    // while the same build worked on a machine that already had stored
+    // settings and therefore never entered the state.
+    //
+    // This rule also lives in ProtectionController::UpdateWorkingConfig, and
+    // the copy here is why relaxing it there was not enough.
+    const bool configurable = controller.state() == ProtectionState::Armed ||
+                              controller.state() == ProtectionState::MonitorOnly;
     if (ValidateConfig(requested) || controller.safe_latched() ||
-        controller.state() != ProtectionState::Armed || !temperature ||
+        !configurable || !temperature ||
         sample_age_ms < 0 || sample_age_ms >= 1000 ||
         *temperature >= active.trigger_temperature_c - active.predictive_band_c ||
         *temperature >= requested.trigger_temperature_c - requested.predictive_band_c)

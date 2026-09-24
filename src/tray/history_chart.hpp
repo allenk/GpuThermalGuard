@@ -9,6 +9,7 @@
 
 #include "telemetry/telemetry_history.hpp"
 #include "fps/fps_history.hpp"
+#include "net/history.hpp"
 #include "sysmem/host_memory.hpp"
 
 namespace gtg::tray {
@@ -35,6 +36,10 @@ public:
         Invalidate(FALSE);
     }
     // A null history removes the record entirely, as with FPS.
+    void SetNetHistory(const net::History* history) noexcept {
+        net_history_ = history;
+        NotifyDataChanged();
+    }
     void SetRamHistory(const sysmem::History* history) noexcept {
         ram_history_ = history;
         Invalidate(FALSE);
@@ -62,6 +67,7 @@ private:
     const telemetry::History* history_{nullptr};
     const fps::History* fps_history_{nullptr};
     const sysmem::History* ram_history_{nullptr};
+    const net::History* net_history_{nullptr};
     int trigger_temperature_c_{85};
     int safe_power_w_{300};
     std::optional<double> maximum_power_w_;
