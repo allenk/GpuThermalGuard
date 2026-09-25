@@ -268,6 +268,18 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
             if (show_fps_) {
                 const auto target = fps::ForegroundCandidate();
                 fps_observer_.SetTarget(target);
+                // What the session that just ended actually received. The
+                // event ids it depends on are not a documented contract, so a
+                // session that saw neither side is worth a line: without it,
+                // the only symptom of a Windows update moving them is a reader
+                // wondering why the number stopped. Try-only, on the message
+                // loop, so a full queue drops it rather than waiting.
+                if (const auto counts = fps_observer_.TakeLastSessionCounts();
+                    counts.valid) {
+                    (void)logging::TryInfo(std::format(
+                        L"fps session ended: displayed={} kernel_presents={}",
+                        counts.displayed_frames, counts.kernel_presents));
+                }
                 const auto observed = fps_observer_.TryRead();
                 const auto matched = target && observed.identity == *target
                     ? observed : fps::Snapshot{};
@@ -372,7 +384,34 @@ LRESULT MainDialog::OnThemeChanged(UINT, WPARAM, LPARAM, BOOL&) {
     return 0;
 }
 
-LRESULT MainDialog::OnDpiChanged(UINT, WPARAM, LPARAM, BOOL& handled) {
+LRESULT MainDialog::OnDpiChanged(UINT, const WPARAM dpi, const LPARAM suggested,
+                                 BOOL& handled) {
+    // Recorded before anything is done about it.
+    //
+    // A game taking exclusive fullscreen changes the display mode, and Windows
+    // recomputes the recommended scale for the new resolution -- so a 150 %
+    // desktop can legitimately become 100 % while the game holds the display.
+    // Coming back should raise it again. The owner saw it stay at 100 %, and
+    // that is two different failures with the same symptom: the second change
+    // never arriving, or arriving and not being applied. Guessing between them
+    // would be guessing, so both sides are written down: what the system said,
+    // and what the window actually became.
+    const auto* rect = reinterpret_cast<const RECT*>(suggested);
+    RECT before{};
+    (void)GetWindowRect(&before);
+    // The iconic flag is here because SaveMainWindowPosition already guards
+    // against it: something in this window's past made somebody aware it gets
+    // minimised. A game taking the display exclusively is exactly when that
+    // happens, and a minimised window's rect is not the rect the dialog
+    // manager would be resizing.
+    (void)logging::TryInfo(std::format(
+        L"dpi changed: dpi={} suggested={}x{} window_was={}x{} reported={} iconic={}",
+        LOWORD(dpi),
+        rect != nullptr ? rect->right - rect->left : 0,
+        rect != nullptr ? rect->bottom - rect->top : 0,
+        before.right - before.left, before.bottom - before.top,
+        m_hWnd != nullptr ? GetDpiForWindow(m_hWnd) : 0,
+        IsIconic() != FALSE ? 1 : 0));
     // Let the dialog manager finish Per-Monitor V2 layout first, then reload an
     // exact-size ICO frame for the new device-pixel scale.
     PostMessageW(kReloadSnapshotIconMessage);
@@ -382,6 +421,15 @@ LRESULT MainDialog::OnDpiChanged(UINT, WPARAM, LPARAM, BOOL& handled) {
 }
 
 LRESULT MainDialog::OnDisplayConfigurationChanged(UINT, WPARAM, LPARAM, BOOL&) {
+    // The other half of the picture: a mode change that produced no
+    // WM_DPICHANGED at all would show up here and nowhere else.
+    RECT bounds{};
+    (void)GetWindowRect(&bounds);
+    (void)logging::TryInfo(std::format(
+        L"display changed: window={}x{} dpi={} iconic={}",
+        bounds.right - bounds.left, bounds.bottom - bounds.top,
+        m_hWnd != nullptr ? GetDpiForWindow(m_hWnd) : 0,
+        IsIconic() != FALSE ? 1 : 0));
     PostMessageW(kRepairMainPlacementMessage);
     return 0;
 }
@@ -620,9 +668,8 @@ LRESULT MainDialog::OnValidateSettings(WORD, WORD, HWND, BOOL&) {
     // temperature. At or above slowdown a trigger cannot pre-empt anything --
     // the firmware is already throttling -- and pre-empting it is the whole
     // premise of this tool. That does permit a trigger above the vendor's
-    // stated maximum operating temperature. That is the reader's decision to
-    // make: a guard that refuses the setting the reader wants is a guard
-    // they turn off.
+    // stated maximum operating temperature; it is the owner's decision, and
+    // the reasoning is in AF-20260924-monitor-only-and-device-defaults.
     if (gpu_slowdown_temperature_c_ &&
         candidate.trigger_temperature_c >=
             static_cast<int>(*gpu_slowdown_temperature_c_)) {

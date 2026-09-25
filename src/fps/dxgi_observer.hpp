@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -19,6 +20,23 @@ public:
     void SetTarget(std::optional<Identity> target) noexcept;
     [[nodiscard]] Snapshot TryRead() const noexcept;
     void Stop() noexcept;
+
+    // What the last finished session actually received, one field per side of
+    // the measurement.
+    //
+    // It exists to be written to the journal. These ETW event ids are not a
+    // documented contract, and if a Windows update moves them the only signal
+    // today is a reader noticing a dash -- which is not a way to find out.
+    // Reported here rather than logged here so that the FPS module keeps no
+    // logging dependency and still builds as an isolated target.
+    //
+    // Taking it clears it, so one session is never journalled twice.
+    struct SessionCounts {
+        bool valid{};                       // a session ran and stopped
+        std::uint64_t displayed_frames{};   // the DXGI/Win32k/DWM chain
+        std::uint64_t kernel_presents{};    // DxgKrnl, every API
+    };
+    [[nodiscard]] SessionCounts TakeLastSessionCounts() noexcept;
 
 private:
     class Impl;

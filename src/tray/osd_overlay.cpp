@@ -73,6 +73,53 @@ void DrawText(Gdiplus::Graphics& graphics, const std::wstring& text,
     graphics.DrawString(text.c_str(), -1, &font, bounds, &format, &brush);
 }
 
+// One line drawn in pieces, so a piece can differ in colour.
+//
+// Typographic format throughout, because the default StringFormat pads every
+// run by roughly a sixth of an em on each side. That is invisible when a line
+// is drawn once and accumulates into a visible gap when the same line is
+// drawn in five pieces.
+struct TextRun {
+    std::wstring text;
+    Gdiplus::Color color;
+};
+
+void DrawRuns(Gdiplus::Graphics& graphics, const std::vector<TextRun>& runs,
+              const Gdiplus::RectF& bounds, Gdiplus::Font& font,
+              const Gdiplus::StringAlignment alignment) {
+    Gdiplus::StringFormat format(Gdiplus::StringFormat::GenericTypographic());
+    format.SetFormatFlags(format.GetFormatFlags() |
+                          Gdiplus::StringFormatFlagsNoWrap |
+                          Gdiplus::StringFormatFlagsMeasureTrailingSpaces);
+    std::vector<float> widths;
+    widths.reserve(runs.size());
+    float total = 0.0F;
+    float height = 0.0F;
+    for (const auto& run : runs) {
+        Gdiplus::RectF measured;
+        graphics.MeasureString(run.text.c_str(), -1, &font,
+                               Gdiplus::PointF(0.0F, 0.0F), &format, &measured);
+        widths.push_back(measured.Width);
+        total += measured.Width;
+        if (measured.Height > height) height = measured.Height;
+    }
+    float cursor = bounds.X;
+    if (alignment == Gdiplus::StringAlignmentFar) {
+        cursor = bounds.GetRight() - total;
+    } else if (alignment == Gdiplus::StringAlignmentCenter) {
+        cursor = bounds.X + (bounds.Width - total) / 2.0F;
+    }
+    // Centred the way DrawText centres its single run, so a line that gains
+    // pieces does not shift on its row.
+    const float top = bounds.Y + (bounds.Height - height) / 2.0F;
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+        Gdiplus::SolidBrush brush(runs[i].color);
+        graphics.DrawString(runs[i].text.c_str(), -1, &font,
+                            Gdiplus::PointF(cursor, top), &format, &brush);
+        cursor += widths[i];
+    }
+}
+
 Gdiplus::Color VisualColor(const OsdVisual visual) {
     switch (visual) {
     case OsdVisual::Armed: return {255, 70, 210, 137};
@@ -120,6 +167,11 @@ const Gdiplus::Color kAccentNetwork(255, 200, 232, 92);
 // near-white chart this same role needs a much darker colour; see
 // `net_sent_color` in history_chart.cpp.
 const Gdiplus::Color kNetworkSent(255, 122, 186, 255);
+// The colour every record draws its reading in, and the tint a direction
+// mark takes beside it: near enough the record accent to belong to it, far
+// enough from the white to sit behind the number rather than beside it.
+const Gdiplus::Color kValuePrimary(255, 245, 248, 252);
+const Gdiplus::Color kNetworkMark(235, 200, 232, 92);
 
 // The figure the reader sees after a reclaim. GiB rather than a percentage,
 // deliberately: the cell already shows a percentage, and a delta in the same
@@ -987,6 +1039,37 @@ Gdiplus::Color CompactAccent(const compact::Metric metric) noexcept {
         case compact::Metric::Fps: return {255, 92, 220, 215};
     }
     return {255, 245, 248, 252};
+}
+
+// What is known about the frame source, in the fewest characters that stay
+// true: an API name when the modules could be read, a size when one could be
+// established, and nothing at all for either when it could not.
+//
+// The size is what the program PRESENTED, not what its engine rendered
+// internally: a game upscaling with DLSS or FSR resolves into its own
+// full-size swapchain and that texture never leaves the process. Reading it
+// would need code inside the game.
+std::wstring FpsBackendText(const fps::Snapshot& snapshot) {
+    if (snapshot.status != fps::Status::Ready) return {};
+    return fps::BackendLabel(snapshot.backend);
+}
+
+std::wstring FpsResolutionText(const fps::Snapshot& snapshot) {
+    if (snapshot.status != fps::Status::Ready ||
+        !snapshot.resolution.Known()) return {};
+    return std::format(L"{}\u00d7{}", snapshot.resolution.width,
+                       snapshot.resolution.height);
+}
+
+// Both, for the expanded lane, which has the width for one line.
+std::wstring FpsSource(const fps::Snapshot& snapshot) {
+    std::wstring text = FpsBackendText(snapshot);
+    const std::wstring resolution = FpsResolutionText(snapshot);
+    if (!resolution.empty()) {
+        if (!text.empty()) text += L" \u00b7 ";
+        text += resolution;
+    }
+    return text;
 }
 
 std::wstring CompactLabel(const compact::Metric metric) {
@@ -2407,10 +2490,36 @@ bool OsdOverlay::Render() noexcept {
             struct CellContent {
                 std::wstring label;
                 // Drawn after the label in a smaller face, when a record has a
-                // unit that changes. Only network does: every other record's
-                // unit is part of its value and never moves.
+                // unit that changes. Only network and FPS do: every other
+                // record's unit is part of its value and never moves.
+                //
+                // The FPS record right-aligns this, so its resolution stacks
+                // on the same edge as the backend below it: both boxes end at
+                // x + cell_width - 4 by construction, with no shared constant
+                // to keep in step. Network keeps it beside the label -- `MB/s`
+                // is too short to survive being stranded at the far edge, and
+                // a unit belongs to the word it qualifies.
                 std::wstring unit;
+                // Drawn on the value row, right of the value. The two small
+                // slots carry the FPS record's backend and resolution, and
+                // which goes where is not arbitrary: the label row has the
+                // more room, because `FPS` is three characters while a value
+                // like `120` plus its gap is wider. So the long string --
+                // `3840x2160` -- takes the label row and the short one --
+                // `D12` -- takes the value row. Put the other way round the
+                // resolution had to shrink to about five point to fit.
+                std::wstring footnote;
+                // The resolution is the one small text that has to be read
+                // rather than merely noticed, so it is drawn in a colour of
+                // its own instead of the record's accent.
+                bool unit_highlight{};
                 std::wstring value;
+                // When non-empty, `value` is drawn in these pieces instead of
+                // as one run, so a piece can take a colour of its own. The
+                // pieces must concatenate to `value`, which stays the
+                // authority for fitting: the line then occupies the width it
+                // was measured and sized for.
+                std::vector<TextRun> value_runs;
                 Gdiplus::Color accent{};
                 MetricMember member{nullptr};
                 double minimum_span{};
@@ -2512,7 +2621,38 @@ bool OsdOverlay::Render() noexcept {
                                 ? std::format(L"{}", tenths / 10)
                                 : std::format(L"{}.{}", tenths / 10, tenths % 10);
                         };
-                        c.value = std::format(L"{} · {}", figure(rx), figure(tx));
+                        // Direction marks rather than a separator. The dot
+                        // carried no information at all: nothing on screen
+                        // said which figure was down and which was up, so the
+                        // reader had to remember.
+                        //
+                        // Arrows rather than solid triangles. A filled
+                        // triangle carries as much ink as a digit, so beside
+                        // one it reads as a second glyph competing for
+                        // attention instead of as a mark qualifying the
+                        // number. An arrow is mostly stroke, so it sits back.
+                        // They are drawn at full size for the same reason the
+                        // triangles were reduced: the weight has to match the
+                        // digits, and for these two shapes that means
+                        // opposite adjustments.
+                        //
+                        // They take the record's accent, not a red/blue pair.
+                        // Red already means something on this strip: the
+                        // temperature record turns red when it is in trouble.
+                        // A second, unrelated red -- for upload traffic, which
+                        // is not a problem at all -- would make the colour
+                        // mean two contradictory things in one glance.
+                        const std::wstring down = figure(rx);
+                        const std::wstring up = figure(tx);
+                        //
+                        // Suffixed rather than prefixed: the numbers are what
+                        // the cell is read for, so they start at the left edge
+                        // where the other seven records' numbers start, and
+                        // the mark trails each one the way a unit does.
+                        c.value = std::format(L"{}↓ {}↑", down, up);
+                        c.value_runs = {
+                            {down, kValuePrimary}, {L"\u2193 ", kNetworkMark},
+                            {up, kValuePrimary}, {L"\u2191", kNetworkMark}};
                     } else {
                         c.value = L"-";
                     }
@@ -2524,6 +2664,12 @@ bool OsdOverlay::Render() noexcept {
                     c.value = fps_snapshot_.status == fps::Status::Ready
                         ? std::format(L"{:.0f}", fps_snapshot_.displayed_fps)
                         : L"-";
+                    // Beside the label, in the small face the NET cell already
+                    // uses for its unit: it is context for the number, not a
+                    // reading of its own, and it disappears with the number.
+                    c.unit = FpsResolutionText(fps_snapshot_);
+                    c.footnote = FpsBackendText(fps_snapshot_);
+                    c.unit_highlight = true;
                     c.unavailable = fps_snapshot_.status != fps::Status::Ready;
                     c.spark = fps_history_ != nullptr ? Spark::Fps : Spark::None;
                     break;
@@ -2565,23 +2711,47 @@ bool OsdOverlay::Render() noexcept {
                     graphics.MeasureString(content.label.c_str(), -1, &small_font,
                                            Gdiplus::PointF(0.0F, 0.0F),
                                            &measure_format, &label_size);
+                    const float unit_room =
+                        cell_width - 10.0F * s - label_size.Width;
                     Gdiplus::Font unit_font(&family, 7.5F * s,
                                             Gdiplus::FontStyleRegular,
                                             Gdiplus::UnitPixel);
-                    DrawText(graphics, content.unit,
-                        {x + 6.0F * s + label_size.Width, y + 2.5F * s,
-                         cell_width - 10.0F * s - label_size.Width, 12.0F * s},
-                        unit_font,
-                        Gdiplus::Color(190, accent.GetR(), accent.GetG(),
-                                       accent.GetB()),
-                        Gdiplus::StringAlignmentNear);
+                    // DrawText trims with an ellipsis, which for a resolution
+                    // would quietly produce a different number. Measure first
+                    // and say nothing rather than say something wrong; `MB/s`
+                    // has never come close to this and is unaffected.
+                    Gdiplus::RectF unit_measured;
+                    graphics.MeasureString(content.unit.c_str(), -1, &unit_font,
+                                           Gdiplus::PointF(0.0F, 0.0F),
+                                           &measure_format, &unit_measured);
+                    if (unit_measured.Width <= unit_room) {
+                        DrawText(graphics, content.unit,
+                            {x + 6.0F * s + label_size.Width, y + 2.5F * s,
+                             unit_room, 12.0F * s},
+                            unit_font,
+                            content.unit_highlight
+                                ? Gdiplus::Color(255, 198, 255, 110)
+                                : Gdiplus::Color(190, accent.GetR(),
+                                                 accent.GetG(), accent.GetB()),
+                            content.unit_highlight
+                                ? Gdiplus::StringAlignmentFar
+                                : Gdiplus::StringAlignmentNear);
+                    }
                 }
                 // The value steps down until it fits rather than being cut off
                 // with an ellipsis. A truncated number is a different number,
                 // and network throughput has no ceiling to design a width
                 // against: measured, 999 · 999 fits at 12.5 and 1023 · 1023
                 // needs 10.5.
-                const float value_box = cell_width - 8.0F * s;
+                // The value is fitted against the WHOLE row. It does not give
+                // ground to the footnote: the reading is what the record is
+                // for, and the source annotation is a note about it. Measured
+                // in a 72 dip cell, `120` at 12.5 and `3840x2160` at 7.5 come
+                // to 66 dip against 64 available -- two dip short, which used
+                // to cost the FPS number a whole size step. The footnote gives
+                // up those two dip instead, below.
+                const float value_row_width = cell_width - 8.0F * s;
+                const float value_box = value_row_width;
                 // Measured at the real font: `0.7 · 0.1` is 51.4 dip and
                 // fits at full size, while both directions saturated on a
                 // gigabit link -- `119.2 · 118.5` -- is 81.0 and needs 9.5.
@@ -2598,12 +2768,61 @@ bool OsdOverlay::Render() noexcept {
                 Gdiplus::Font fitted_value(&family, value_size * s,
                                            Gdiplus::FontStyleBold,
                                            Gdiplus::UnitPixel);
-                DrawText(graphics, content.value,
-                    {x + 4.0F * s, y + 14.0F * s, value_box, 22.0F * s},
-                    fitted_value,
+                const Gdiplus::Color value_color =
                     content.unavailable ? Gdiplus::Color(180, 205, 214, 226)
-                                        : Gdiplus::Color(255, 245, 248, 252),
-                    Gdiplus::StringAlignmentNear);
+                                        : Gdiplus::Color(255, 245, 248, 252);
+                if (content.value_runs.empty()) {
+                    DrawText(graphics, content.value,
+                        {x + 4.0F * s, y + 14.0F * s, value_box, 22.0F * s},
+                        fitted_value, value_color, Gdiplus::StringAlignmentNear);
+                } else {
+                    DrawRuns(graphics, content.value_runs,
+                             {x + 4.0F * s, y + 14.0F * s, value_box, 22.0F * s},
+                             fitted_value, Gdiplus::StringAlignmentNear);
+                }
+                // What the value did not use, rounded down by a small gap so
+                // the two never touch. The footnote steps down until it fits
+                // and is dropped entirely if it cannot -- an annotation that
+                // has run out of room is worth less than a legible reading,
+                // and a resolution with its digits cut off is a different
+                // resolution.
+                float footnote_size = 7.5F;
+                bool footnote_fits = false;
+                if (!content.footnote.empty()) {
+                    const float room =
+                        value_row_width - value_measured.Width - 3.0F * s;
+                    Gdiplus::RectF footnote_measured;
+                    for (; footnote_size >= 5.5F; footnote_size -= 0.5F) {
+                        Gdiplus::Font probe(&family, footnote_size * s,
+                                            Gdiplus::FontStyleRegular,
+                                            Gdiplus::UnitPixel);
+                        graphics.MeasureString(content.footnote.c_str(), -1,
+                                               &probe, Gdiplus::PointF(0.0F, 0.0F),
+                                               &measure_format, &footnote_measured);
+                        if (footnote_measured.Width <= room) {
+                            footnote_fits = true;
+                            break;
+                        }
+                    }
+                }
+                if (footnote_fits) {
+                    Gdiplus::Font footnote_font(&family, footnote_size * s,
+                                                Gdiplus::FontStyleRegular,
+                                                Gdiplus::UnitPixel);
+                    // Right-aligned on the value row, nudged down towards the
+                    // value's baseline.
+                    //
+                    // The record's accent, because this slot now carries the
+                    // backend -- `D12` is context for the reading, not a
+                    // reading, and three letters stay legible quiet. The
+                    // resolution gets the loud colour, on the label row.
+                    DrawText(graphics, content.footnote,
+                        {x + 4.0F * s, y + 16.0F * s, value_row_width, 20.0F * s},
+                        footnote_font,
+                        Gdiplus::Color(content.unavailable ? 120 : 225,
+                                       accent.GetR(), accent.GetG(), accent.GetB()),
+                        Gdiplus::StringAlignmentFar);
+                }
                 const Gdiplus::RectF spark_bounds{
                     x + 5.0F * s, y + 37.0F * s, cell_width - 10.0F * s, 10.0F * s};
                 switch (content.spark) {
@@ -2865,18 +3084,31 @@ bool OsdOverlay::Render() noexcept {
                 ? net::TenthsIn(*net_latest->received_bytes_per_second, unit) : 0;
             const int tx = readable
                 ? net::TenthsIn(*net_latest->sent_bytes_per_second, unit) : 0;
-            DrawText(graphics,
-                // The unit rides with the value here, not on the label:
-                // every other lane reads `52 °C`, `110.0 W`, `32% (30.6 GiB)`,
-                // and the lane has the width for it. The compact cell puts it
-                // on the label only because 64 dip has no room for both.
-                readable ? std::format(L"{}.{} · {}.{} {}", rx / 10, rx % 10,
-                                       tx / 10, tx % 10, net::UnitSuffix(unit))
-                         : std::wstring(L"-"),
-                {net_row.GetRight() - 140.0F * s, net_row.Y,
-                 132.0F * s, 22.0F * net_scale},
-                value_font, Gdiplus::Color(255, 245, 248, 252),
-                Gdiplus::StringAlignmentFar);
+            // The unit rides with the value here, not on the label: every
+            // other lane reads `52 °C`, `110.0 W`, `32% (30.6 GiB)`, and the
+            // lane has the width for it. The compact cell puts it on the
+            // label only because 64 dip has no room for both.
+            //
+            // The direction marks are the compact cell's, in the same colour
+            // and on the same side of their figure. One number has to mean
+            // one thing in both views, and so does one mark: a reader who
+            // learns the cell must not have to learn the lane again.
+            const Gdiplus::RectF net_value_box{
+                net_row.GetRight() - 140.0F * s, net_row.Y,
+                132.0F * s, 22.0F * net_scale};
+            if (readable) {
+                DrawRuns(graphics,
+                    {{std::format(L"{}.{}", rx / 10, rx % 10), kValuePrimary},
+                     {L"↓ ", kNetworkMark},
+                     {std::format(L"{}.{}", tx / 10, tx % 10), kValuePrimary},
+                     {L"↑ ", kNetworkMark},
+                     {std::wstring(net::UnitSuffix(unit)), kValuePrimary}},
+                    net_value_box, value_font, Gdiplus::StringAlignmentFar);
+            } else {
+                DrawText(graphics, std::wstring(L"-"), net_value_box,
+                         value_font, kValuePrimary,
+                         Gdiplus::StringAlignmentFar);
+            }
             if (net_history_ != nullptr)
                 DrawNetworkSparkline(graphics, net_history_->Samples(), start, end,
                     {net_graph.x, net_row.Y + 23.0F * net_scale,
@@ -2901,9 +3133,32 @@ bool OsdOverlay::Render() noexcept {
                 {fps_label.x, fps_row.Y, fps_label.width, fps_row.Height},
                 label_font, kAccentFps,
                 Gdiplus::StringAlignmentNear);
+            // The frame source, where the other lanes put their "max" note.
+            const std::wstring fps_source = FpsSource(fps_snapshot_);
+            float fps_annotation_width = 0.0F;
+            if (!fps_source.empty()) {
+                Gdiplus::StringFormat measure;
+                measure.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+                Gdiplus::RectF measured;
+                graphics.MeasureString(fps_source.c_str(), -1, &label_font,
+                                       Gdiplus::PointF(0.0F, 0.0F), &measure,
+                                       &measured);
+                fps_annotation_width = measured.Width;
+                DrawText(graphics, fps_source,
+                    {fps_graph.x, fps_row.Y, fps_row.Width - 240.0F * fps_scale,
+                     22.0F * fps_scale},
+                    label_font,
+                    Gdiplus::Color(230, kAccentFps.GetR(), kAccentFps.GetG(),
+                                   kAccentFps.GetB()),
+                    Gdiplus::StringAlignmentNear);
+            }
+            // The same measured span the other lanes use, rather than the
+            // constant that cut "349.5 W (350 W)" before it was fixed there.
+            const auto fps_value_span = compact::LaneValueSpan(
+                fps_row.X, fps_row.Width, fps_annotation_width, fps_scale);
             DrawText(graphics, fps_value,
-                {fps_row.GetRight() - 140.0F * s, fps_row.Y,
-                 132.0F * s, 22.0F * fps_scale},
+                {fps_value_span.x, fps_row.Y, fps_value_span.width,
+                 22.0F * fps_scale},
                 value_font, Gdiplus::Color(255, 245, 248, 252),
                 Gdiplus::StringAlignmentFar);
             if (fps_history_ != nullptr)

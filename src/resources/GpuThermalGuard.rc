@@ -1,5 +1,6 @@
 #include <windows.h>
 #include "resource.h"
+#include "gtg_version.h"
 
 IDI_APP             ICON "../../assets/icons/GpuThermalGuard.ico"
 IDI_TRAY_ARMED      ICON "../../assets/icons/tray-armed.ico"
@@ -67,8 +68,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,12,0,0
- PRODUCTVERSION 0,12,0,0
+ FILEVERSION GTG_VERSION_COMMA
+ PRODUCTVERSION GTG_VERSION_COMMA
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -84,12 +85,12 @@ BEGIN
   VALUE "Author", "AllenK (kwyshell)\0"
   VALUE "Comments", "GitHub: https://github.com/allenk | Medium: https://medium.com/@allenkuo\0"
   VALUE "FileDescription", "GPU Thermal Guard\0"
-  VALUE "FileVersion", "0.12.0.0\0"
+  VALUE "FileVersion", GTG_VERSION_STR
   VALUE "InternalName", "GpuThermalGuard.exe\0"
   VALUE "LegalCopyright", "Copyright (c) 2026 AllenK (kwyshell)\0"
   VALUE "OriginalFilename", "GpuThermalGuard.exe\0"
   VALUE "ProductName", "GPU Thermal Guard\0"
-  VALUE "ProductVersion", "0.12.0.0\0"
+  VALUE "ProductVersion", GTG_VERSION_STR
  END END
  BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x0409, 1200 END
 END

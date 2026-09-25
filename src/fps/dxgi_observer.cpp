@@ -117,50 +117,50 @@ std::uint64_t NowMicroseconds(const std::uint64_t frequency) noexcept {
     return QpcToMicroseconds(static_cast<std::uint64_t>(now.QuadPart), frequency);
 }
 
-// Inspect only module *names*: no injection, rendering API load, or path
-// collection. Fail closed if a protected process forbids module inspection.
-ModuleEvidence InspectDxgiModules(const std::uint32_t pid) noexcept {
+// The API name, from the module list, as a label only.
+//
+// A module is a capability hint and not proof of the active renderer -- a
+// launcher can load d3d11 while the game runs on Vulkan -- so where this and
+// the events disagree, the events win and this is the weaker claim. It opens a
+// snapshot handle and nothing else; when that is refused the answer is Unknown
+// and the reading is untouched, which is the whole difference between a label
+// and the gate this replaced.
+// Which graphics runtimes are loaded. Deliberately NOT collapsed to a single
+// answer here: a Vulkan program has d3d12.dll, dxgi.dll and opengl32.dll in its
+// module list too, dragged in by the ICD -- measured, 84 modules in our own
+// Vulkan generator. Any fixed priority over that set is wrong for somebody.
+//
+// The events decide the family; this only names it inside the family the
+// events already established.
+struct LoadedRuntimes {
+    bool d3d9{}, d3d11{}, d3d12{}, vulkan{}, opengl{};
+    bool readable{};   // false when the module list was refused
+};
+
+LoadedRuntimes BackendFromModules(const std::uint32_t pid) noexcept {
     HANDLE snapshot = INVALID_HANDLE_VALUE;
-    DWORD snapshot_error = ERROR_SUCCESS;
-    // Microsoft documents ERROR_BAD_LENGTH as a transient module-list race.
-    // Bound retries so an adversarial target cannot stall the controller.
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
-        snapshot = CreateToolhelp32Snapshot(
-            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
         if (snapshot != INVALID_HANDLE_VALUE) break;
-        snapshot_error = GetLastError();
-        if (snapshot_error != ERROR_BAD_LENGTH) break;
+        // Microsoft documents ERROR_BAD_LENGTH as a transient module-list race.
+        if (GetLastError() != ERROR_BAD_LENGTH) return {};
     }
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return snapshot_error == ERROR_ACCESS_DENIED
-            ? ModuleEvidence::AccessDenied : ModuleEvidence::OtherFailure;
-    }
+    if (snapshot == INVALID_HANDLE_VALUE) return {};
+    LoadedRuntimes loaded{};
     MODULEENTRY32W module{};
     module.dwSize = sizeof(module);
-    bool has_d3d11 = false;
-    bool has_d3d12 = false;
-    if (Module32FirstW(snapshot, &module) == FALSE) {
-        const DWORD error = GetLastError();
-        CloseHandle(snapshot);
-        return error == ERROR_ACCESS_DENIED
-            ? ModuleEvidence::AccessDenied : ModuleEvidence::OtherFailure;
+    if (Module32FirstW(snapshot, &module) != FALSE) {
+        loaded.readable = true;
+        do {
+            loaded.d3d12 |= _wcsicmp(module.szModule, L"d3d12.dll") == 0;
+            loaded.d3d11 |= _wcsicmp(module.szModule, L"d3d11.dll") == 0;
+            loaded.d3d9 |= _wcsicmp(module.szModule, L"d3d9.dll") == 0;
+            loaded.vulkan |= _wcsicmp(module.szModule, L"vulkan-1.dll") == 0;
+            loaded.opengl |= _wcsicmp(module.szModule, L"opengl32.dll") == 0;
+        } while (Module32NextW(snapshot, &module) != FALSE);
     }
-    DWORD last_error = ERROR_SUCCESS;
-    do {
-        has_d3d11 |= _wcsicmp(module.szModule, L"d3d11.dll") == 0;
-        has_d3d12 |= _wcsicmp(module.szModule, L"d3d12.dll") == 0;
-        if (has_d3d11 && has_d3d12) break;
-        if (Module32NextW(snapshot, &module) == FALSE) {
-            last_error = GetLastError();
-            break;
-        }
-    } while (true);
     CloseHandle(snapshot);
-    if (ValidatedDxgiCandidate(has_d3d11, has_d3d12))
-        return ModuleEvidence::DxgiModules;
-    if (last_error == ERROR_ACCESS_DENIED) return ModuleEvidence::AccessDenied;
-    return last_error == ERROR_NO_MORE_FILES
-        ? ModuleEvidence::NoDxgiModules : ModuleEvidence::OtherFailure;
+    return loaded;
 }
 
 }  // namespace
@@ -223,10 +223,29 @@ private:
         ObserverProbation probation;
         std::atomic<bool> correlation_failed{false};
         std::uint32_t dwm_pid{};
+        // What each side of the measurement actually delivered. Written on the
+        // consumer thread, read once when the session stops, and journalled --
+        // these event ids are not a documented contract, so "the reader saw a
+        // dash" is not an acceptable way to find out that a Windows update
+        // moved them.
+        std::atomic<std::uint64_t> kernel_presents{0};
+        std::atomic<std::uint64_t> displayed_frames{0};
+        // The size the program last presented, from whichever provider saw it.
+        // Written on the consumer thread, read under tracker_mutex_.
+        std::atomic<std::uint32_t> presented_width{0};
+        std::atomic<std::uint32_t> presented_height{0};
+        // Whether the DXGI composition path was ever seen. It is what says the
+        // program is a DXGI runtime, which no module list can prove.
+        std::atomic<bool> saw_composition_token{false};
+        LoadedRuntimes loaded_runtimes{};
+        HWND window{nullptr};
         std::uint64_t qpc_frequency{};
         ULONG last_events_lost{};
         bool running{};
     } session_;
+
+    // Guarded by tracker_mutex_, which the UI thread already takes to read.
+    DxgiObserver::SessionCounts last_counts_{};
 
     static void WINAPI OnRecord(PEVENT_RECORD record) noexcept {
         if (record == nullptr) return;
@@ -270,6 +289,17 @@ private:
                 valid = header.EventDescriptor.Version == 1 &&
                     ReadTokenKey(record, false, key);
                 if (valid) correlation.OnToken(header.ThreadId, key, timestamp);
+                // The swapchain the program put up, not the window it landed
+                // in: measured, buffers a quarter of the window make this
+                // report the quarter.
+                std::uint32_t width{}, height{};
+                if (ReadEtwProperty(record, L"DestWidth", width) &&
+                    ReadEtwProperty(record, L"DestHeight", height) &&
+                    width != 0 && height != 0) {
+                    session->presented_width.store(width, std::memory_order_relaxed);
+                    session->presented_height.store(height, std::memory_order_relaxed);
+                }
+                session->saw_composition_token.store(true, std::memory_order_relaxed);
             } else if (id == 301) {
                 TokenKey key{};
                 std::uint32_t state{};
@@ -293,7 +323,36 @@ private:
                 if (valid) correlation.OnSurfaceUpdate(key);
             }
         } else if (IsEqualGUID(header.ProviderId, kDxgKrnlProvider)) {
-            if (id == 252 && header.ProcessId == session->dwm_pid &&
+            // The kernel's own flip submission, for the target itself. No pid
+            // filter is possible here -- EVENT_FILTER_TYPE_PID is honoured by
+            // the DXGI provider but not by this one, measured -- so every
+            // process's flips arrive and all but the target's are dropped.
+            // The non-DXGI path's rectangles. Source is what was presented;
+            // Dest is where it landed. Only the size is taken -- the origins
+            // differ by the window border and say nothing about resolution.
+            if (id == 166 && header.ProcessId == session->identity.pid) {
+                std::uint32_t left{}, right{}, top{}, bottom{};
+                if (ReadEtwProperty(record, L"Source.Left", left) &&
+                    ReadEtwProperty(record, L"Source.Right", right) &&
+                    ReadEtwProperty(record, L"Source.Top", top) &&
+                    ReadEtwProperty(record, L"Source.Bottom", bottom) &&
+                    right > left && bottom > top) {
+                    session->presented_width.store(right - left,
+                                                   std::memory_order_relaxed);
+                    session->presented_height.store(bottom - top,
+                                                    std::memory_order_relaxed);
+                }
+            } else if (id == 184 && header.ProcessId == session->identity.pid) {
+                std::uint64_t window{};
+                valid = header.EventDescriptor.Version == 1 &&
+                    ReadEtwProperty(record, L"hWindow", window);
+                if (valid && window != 0) {
+                    session->kernel_presents.fetch_add(1, std::memory_order_relaxed);
+                    std::lock_guard lock(session->owner->tracker_mutex_);
+                    session->owner->tracker_.RecordPresented(
+                        session->identity, window, timestamp);
+                }
+            } else if (id == 252 && header.ProcessId == session->dwm_pid &&
                 header.ThreadId != 0) {
                 valid = header.EventDescriptor.Version == 0;
                 if (valid) correlation.OnDwmFlip(header.ThreadId, timestamp);
@@ -336,6 +395,7 @@ private:
             return;
         }
         while (const auto shown = correlation.Pop()) {
+            session->displayed_frames.fetch_add(1, std::memory_order_relaxed);
             session->probation.NoteDisplayed();
             std::lock_guard lock(session->owner->tracker_mutex_);
             session->owner->tracker_.RecordDisplayed(session->identity,
@@ -344,13 +404,23 @@ private:
     }
 
     bool StartSession(const Identity identity) noexcept {
-        // A module is only a capability hint. The mixed-module controlled
-        // ledger matched DXGI Presents; rate/surface evidence is still
-        // required before publishing a number.
-        const auto admission = ChooseObserverAdmission(
-            InspectDxgiModules(identity.pid));
-        if (admission == ObserverAdmission::Reject) return false;
+        // No capability check. The submission side now comes from the
+        // graphics kernel, which every presenting program reaches whatever API
+        // it used, so there is nothing to look for in a module list -- and the
+        // module list was the one step that could be refused: a real game
+        // returned ERROR_ACCESS_DENIED for it on 2026-09-20 and the session
+        // was rejected before it began. Evidence is what the events say, and
+        // the RateTracker's own confidence gates decide when to publish.
+        constexpr auto admission = ObserverAdmission::Normal;
         session_.identity = identity;
+        // Both are labels, taken once at session start. Neither can stop the
+        // session: a refused module list leaves the name Unknown, and a window
+        // we cannot resolve leaves the fallback size unavailable.
+        session_.loaded_runtimes = BackendFromModules(identity.pid);
+        session_.window = GetForegroundWindow();
+        session_.presented_width.store(0, std::memory_order_relaxed);
+        session_.presented_height.store(0, std::memory_order_relaxed);
+        session_.saw_composition_token.store(false, std::memory_order_relaxed);
         session_.owner = this;
         session_.probation.Begin(admission, GetTickCount64());
         session_.correlator.Reset();
@@ -407,9 +477,13 @@ private:
             !EnableEventIds(session_.controller_handle, kDwmProvider,
                             0x8000000000000080ULL,
                             std::array<USHORT, 2>{15, 196}) ||
+            // 184 and 215 are the universal submission signal: measured
+            // one-for-one against the present count under D3D11, D3D12, Vulkan
+            // and OpenGL, and attributed to the presenting process. They are
+            // what lets a Vulkan or OpenGL program have a number at all.
             !EnableEventIds(session_.controller_handle, kDxgKrnlProvider,
                             0x4000000008000001ULL,
-                            std::array<USHORT, 3>{178, 252, 273})) {
+                            std::array<USHORT, 6>{166, 178, 184, 215, 252, 273})) {
             StopSession();
             return false;
         }
@@ -457,7 +531,23 @@ private:
         }
         if (session_.consumer.joinable()) session_.consumer.join();
         session_.consumer_alive.store(false, std::memory_order_release);
+        // The consumer has joined, so these are final.
+        last_counts_ = {true,
+                        session_.displayed_frames.load(std::memory_order_relaxed),
+                        session_.kernel_presents.load(std::memory_order_relaxed)};
+        session_.displayed_frames.store(0, std::memory_order_relaxed);
+        session_.kernel_presents.store(0, std::memory_order_relaxed);
     }
+
+public:
+    DxgiObserver::SessionCounts TakeLastCounts() noexcept {
+        std::lock_guard lock(tracker_mutex_);
+        const auto counts = last_counts_;
+        last_counts_ = {};
+        return counts;
+    }
+
+private:
 
     bool SessionHealthy() noexcept {
         if (!session_.running ||
@@ -487,8 +577,65 @@ private:
             current = tracker_.Read(NowMicroseconds(session_.qpc_frequency),
                                     healthy && session_.probation.CanPublish());
         }
+        // A label never appears without a number: "-" has to keep meaning
+        // nothing was measured, and a lone API name beside a dash would read
+        // as a half-answer.
+        if (current.status == Status::Ready) {
+            current.backend = ResolveBackend();
+            current.resolution = ResolveResolution();
+        }
         std::lock_guard lock(published_mutex_);
         published_ = current;
+    }
+
+    // The events decide the family; the modules only name it. Where they
+    // disagree the events win, because a module list says what could be used
+    // and the events say what was.
+    [[nodiscard]] Backend ResolveBackend() const noexcept {
+        const auto& loaded = session_.loaded_runtimes;
+        if (!loaded.readable) {
+            // The list was refused. The events still know the family, and
+            // saying that much is better than saying nothing.
+            return session_.saw_composition_token.load(std::memory_order_relaxed)
+                       ? Backend::DXGI : Backend::Unknown;
+        }
+        if (session_.saw_composition_token.load(std::memory_order_relaxed)) {
+            // A composition token means a DXGI runtime presented. Within that
+            // family d3d12 outranks d3d11, because a D3D12 program commonly
+            // keeps d3d11 loaded for an interop layer or an overlay.
+            if (loaded.d3d12) return Backend::D3D12;
+            if (loaded.d3d11) return Backend::D3D11;
+            return Backend::DXGI;
+        }
+        // No composition token, so the DXGI modules are not the renderer --
+        // whatever dragged them in, it was not what put this frame up. Vulkan
+        // first: its ICD loads opengl32 as well, measured.
+        if (loaded.vulkan) return Backend::Vulkan;
+        if (loaded.opengl) return Backend::OpenGL;
+        if (loaded.d3d9) return Backend::D3D9;
+        return Backend::Unknown;
+    }
+
+    // Presented first, output second, nothing third -- the owner's rule.
+    [[nodiscard]] Resolution ResolveResolution() const noexcept {
+        const std::uint32_t width =
+            session_.presented_width.load(std::memory_order_relaxed);
+        const std::uint32_t height =
+            session_.presented_height.load(std::memory_order_relaxed);
+        if (width != 0 && height != 0)
+            return {width, height, ResolutionSource::Presented};
+        // The window the target is presenting into. A weaker claim -- it is
+        // where the frame landed, not what was put up -- so it is labelled as
+        // such rather than silently standing in for the other.
+        RECT client{};
+        if (session_.window != nullptr && IsWindow(session_.window) &&
+            GetClientRect(session_.window, &client) != FALSE &&
+            client.right > client.left && client.bottom > client.top) {
+            return {static_cast<std::uint32_t>(client.right - client.left),
+                    static_cast<std::uint32_t>(client.bottom - client.top),
+                    ResolutionSource::Output};
+        }
+        return {};
     }
 
     void ControlLoop() noexcept {
@@ -562,11 +709,63 @@ Snapshot DxgiObserver::TryRead() const noexcept {
     return impl_ ? impl_->TryRead() : Snapshot{};
 }
 
+DxgiObserver::SessionCounts DxgiObserver::TakeLastSessionCounts() noexcept {
+    return impl_ ? impl_->TakeLastCounts() : SessionCounts{};
+}
+
 void DxgiObserver::Stop() noexcept {
     if (!impl_) return;
     impl_->Stop();
     impl_.reset();
 }
+
+namespace {
+
+// A UWP or Store app does not own its own top-level window. The window belongs
+// to ApplicationFrameHost, which hosts it and renders nothing; the app runs in
+// its own process and presents from there. Resolving the foreground window to
+// its owner therefore picks the wrong process, and the app's frames are never
+// looked at.
+//
+// Measured on Microsoft Solitaire: ApplicationFrameHost produced not one event
+// on any of the four providers in ten seconds, while the Solitaire process
+// produced 1201 DXGI Presents and 1201 Win32k composition tokens -- a complete,
+// working chain nobody was reading.
+//
+// The hosted app is the child window of class Windows.UI.Core.CoreWindow.
+// Finding it costs three read-only calls: no process handle, no module list,
+// nothing that can be refused.
+struct HostedSearch {
+    DWORD host_pid{};
+    DWORD found_pid{};
+};
+
+BOOL CALLBACK FindHostedCoreWindow(HWND child, LPARAM parameter) noexcept {
+    auto* search = reinterpret_cast<HostedSearch*>(parameter);
+    DWORD pid{};
+    if (GetWindowThreadProcessId(child, &pid) == 0 || pid == 0 ||
+        pid == search->host_pid) return TRUE;
+    wchar_t class_name[64]{};
+    if (GetClassNameW(child, class_name, 64) == 0) return TRUE;
+    if (std::wcscmp(class_name, L"Windows.UI.Core.CoreWindow") != 0) return TRUE;
+    search->found_pid = pid;
+    return FALSE;   // the first one is the app; stop
+}
+
+// Only ever applied to the frame host. A hop taken anywhere else would start
+// reporting some other program's frames as the foreground program's, which is
+// worse than reporting nothing.
+DWORD HostedApplicationPid(const HWND window, const DWORD host_pid) noexcept {
+    wchar_t class_name[64]{};
+    if (GetClassNameW(window, class_name, 64) == 0) return 0;
+    if (std::wcscmp(class_name, L"ApplicationFrameWindow") != 0) return 0;
+    HostedSearch search{host_pid, 0};
+    (void)EnumChildWindows(window, FindHostedCoreWindow,
+                           reinterpret_cast<LPARAM>(&search));
+    return search.found_pid;
+}
+
+}  // namespace
 
 std::optional<Identity> ForegroundCandidate() noexcept {
     const HWND foreground = GetForegroundWindow();
@@ -581,6 +780,10 @@ std::optional<Identity> ForegroundCandidate() noexcept {
     DWORD pid{};
     if (GetWindowThreadProcessId(foreground, &pid) == 0 ||
         pid == 0 || pid == GetCurrentProcessId()) return std::nullopt;
+    if (const DWORD hosted = HostedApplicationPid(foreground, pid);
+        hosted != 0 && hosted != GetCurrentProcessId()) {
+        pid = hosted;
+    }
     return ProcessIdentity(pid);
 }
 

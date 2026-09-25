@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-26
+
+### Added
+
+- Frame rate for every graphics API, not only DXGI. Where Windows can confirm a frame reached the screen, that is still what is counted. Where it cannot -- Vulkan and OpenGL produce no composition token, and the chain from a window to a composition surface was followed to its end and does not close -- the card reports the rate of presents the program submitted, counted in the graphics kernel. Vulkan, OpenGL, Direct3D 9, 11 and 12 all read a number now where three of them read `-`.
+- The FPS card names what produced the number: `D9`, `D11`, `D12`, `VK` or `GL`, beside the presented resolution. Either is omitted when it cannot be established rather than guessed. The resolution is the swapchain the program put up, which for a game upscaling with DLSS or FSR is its full output size -- the internal render target never leaves the process.
+- The network card shows which direction is which. An arrow follows each figure, in the record's own colour, where a separator used to sit and say nothing.
+
+### Fixed
+
+- The frame rate no longer cycles between a number and nothing on programs that present in bursts. Measured on a real application: forty flips inside 0.326 s at 120 FPS, then silence. The guard that held those back tested elapsed time when what it exists to prevent is a rate computed from too few samples, so a burst that was fast enough to finish quickly could never satisfy it. Either a long enough span or enough samples will now do; two frames still cannot produce a reading.
+- A 4K resolution no longer prints as `3840...` in the compact card. The reading is fitted against the whole row as every other record is, and the annotation beside it steps down or is dropped -- a resolution with its digits cut off is a different resolution.
+
+### Notes
+
+- The project version is now declared once, in `version.cmake`, and written from there into the Windows resource and the application manifest at configure time. Four hand-synchronised declarations became one; `tools/prepare-release.ps1` checks that one number and that each template still derives from it.
+- An in-game overlay for exclusive fullscreen is still not included, and desktop TOPMOST OSD visibility in exclusive fullscreen is still not guaranteed.
+
 ## [0.12.0] - 2026-09-25
 
 ### Added
@@ -113,7 +131,10 @@ All notable changes to this project will be documented in this file.
 - A power-limit write is never reported as successful until the value is read back.
 - Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
-[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.10.0-beta.1...HEAD
+[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.11.0-beta.1...v0.12.0
+[0.11.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.10.0-beta.1...v0.11.0-beta.1
 [0.10.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.2...v0.10.0-beta.1
 [0.9.0-beta.2]: https://github.com/allenk/GpuThermalGuard/compare/v0.9.0-beta.1...v0.9.0-beta.2
 [0.9.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.8.0-beta.1...v0.9.0-beta.1

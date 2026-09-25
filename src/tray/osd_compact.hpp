@@ -201,9 +201,9 @@ inline constexpr int kMaxBreaks = kRecordCount - 1;
 // column is a shape a reader can ask for deliberately, to dock the dashboard
 // against a screen edge.
 //
-// A single column was refused at first, on the grounds that 84 dip could not
-// hold the lock, the chevron and a grabbable drag strip. The arithmetic
-// behind that refusal was wrong: the header
+// A single column was refused until AF-20260924-single-column-and-remembered-
+// compact, on the grounds that 84 dip could not hold the lock, the chevron and
+// a grabbable drag strip. The arithmetic behind that was wrong: the header
 // band is 25 dip tall and the two buttons take 50 dip of the 84, leaving
 // 34 x 25 dip of HTCAPTION -- 9.0 x 6.6 mm at 100 %, taller than a Windows
 // title bar. The header drops the `GTG` label and moves the status dot left at
@@ -634,10 +634,10 @@ inline constexpr unsigned kBreakMask = (1u << kMaxBreaks) - 1u;       // 7 bits
 // carried `1 << 28` in the top nibble -- bit 31 clear in all of them. A tag of
 // one at bit 31 therefore rejects them as cleanly as four bits did.
 //
-// An earlier note claimed this scheme would survive one more record than it
-// does; it had counted the indices and the breaks but not the tag it had just
-// introduced. The word is now full: a ninth record needs four-bit indices,
-// which is 36 + 8 + 1, and no
+// AF-20260923-compact-row-composition published a table saying this scheme
+// would survive one more record than it does; that table omitted the tag it
+// had just introduced. Corrected in AF-20260924-network-indicator. The word is
+// now full: a ninth record needs four-bit indices, which is 36 + 8 + 1, and no
 // arrangement of those fits. The record after this one changes the store.
 inline constexpr unsigned kFormatShift = 31;
 inline constexpr std::uint32_t kFormatVersion = 1;

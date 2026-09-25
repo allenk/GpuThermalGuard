@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(GpuThermalGuard VERSION 0.12.0 LANGUAGES CXX)
+# GTG_VERSION lives there; see its header for why it is not written here.
+include("${CMAKE_CURRENT_LIST_DIR}/version.cmake")
+project(GpuThermalGuard VERSION ${GTG_VERSION} LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "GpuThermalGuard currently supports Windows only")
@@ -87,6 +89,14 @@ add_executable(GpuThermalGuardProbe
 )
 target_link_libraries(GpuThermalGuardProbe PRIVATE gtg_nvml gtg_build_options)
 
+# The version is declared once, in version.cmake, and written out from there
+# into everything that needs it. Nothing below is hand-edited.
+set(GTG_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/resources/gtg_version.h.in"
+               "${GTG_GENERATED_DIR}/gtg_version.h" @ONLY)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/resources/GpuThermalGuard.manifest.in"
+               "${GTG_GENERATED_DIR}/GpuThermalGuard.manifest" @ONLY)
+
 add_executable(GpuThermalGuard WIN32
     src/app_main.cpp
     # iphlpapi is resolved at run time, so nothing is added to the link line.
@@ -124,11 +134,13 @@ add_executable(GpuThermalGuard WIN32
     src/sysmem/reclaim.hpp
     src/sysmem/reclaim_win32.hpp
     src/sysmem/reclaim_nt.hpp
-    src/resources/resource.h
     src/resources/GpuThermalGuard.rc
-    src/resources/GpuThermalGuard.manifest
+    "${GTG_GENERATED_DIR}/GpuThermalGuard.manifest"
 )
-target_include_directories(GpuThermalGuard PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(GpuThermalGuard PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    # so rc.exe can find the generated gtg_version.h
+    "${GTG_GENERATED_DIR}")
 target_link_libraries(GpuThermalGuard PRIVATE
     gtg_core
     gtg_nvml

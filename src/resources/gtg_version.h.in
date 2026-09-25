@@ -1,0 +1,17 @@
+#pragma once
+// Generated from gtg_version.h.in by CMake. Do not edit, and do not add
+// anything here but the version: this header is included by the resource
+// script, which is compiled by rc.exe rather than by the C++ compiler.
+//
+// The resource script includes this rather than being generated itself:
+// Visual Studio's resource editor only opens a .rc, and this project's .rc
+// carries IDD_MAIN with its whole control list. Generating the .rc would leave
+// dialog coordinates to be written by hand.
+//
+// The components come from PROJECT_VERSION_*, which CMake fills in from the
+// project() call, rather than from GTG_VERSION directly. Same number, but it
+// has been through CMake's own parse -- so a malformed version.cmake fails at
+// configure time instead of producing a resource nobody looks at until a
+// release.
+#define GTG_VERSION_COMMA @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+#define GTG_VERSION_STR   "@PROJECT_VERSION@.0\0"

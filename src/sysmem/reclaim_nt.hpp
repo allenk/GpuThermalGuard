@@ -3,8 +3,8 @@
 // The one undocumented call in this project: empty every working set on the
 // system in a single operation.
 //
-// Everything about it is deliberately conservative, because none of it is
-// documented:
+// Approved by AF-20260923-brute-force-reclaim. Everything about it is
+// deliberately conservative, because none of it is documented:
 //
 //  - Resolved at run time from ntdll, which is already loaded in every Windows
 //    process before kernel32, so this adds no binary dependency. If the export

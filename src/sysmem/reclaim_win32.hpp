@@ -4,8 +4,9 @@
 // from `reclaim.hpp`, which is pure and tested without a desktop; this file
 // only walks processes and issues the calls.
 //
-// Everything here is documented and every entry point is exported from
-// kernel32.dll, so the single /MT EXE gains no sidecar dependency:
+// Approved by AF-20260923-host-memory-reclaim. Everything here is documented
+// and every entry point is exported from kernel32.dll, so the single /MT EXE
+// gains no sidecar dependency:
 //
 //   K32EnumProcesses, K32GetProcessMemoryInfo, K32EmptyWorkingSet
 //       -- psapi.h declarations, kernel32 exports at PSAPI_VERSION >= 2

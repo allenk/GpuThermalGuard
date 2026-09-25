@@ -443,18 +443,6 @@ void TestDxgiPresentMatchingRejectsFailedAndTestCalls() {
         "unknown event schema version must be rejected");
     Require(!matcher.OnEvent(RawDxgiEvent{42, 0, 8, start.data(), 4, 500}),
         "truncated payload must be rejected");
-    Require(gtg::fps::FirstStageD3D11Candidate(true, false),
-        "known D3D11-only process is eligible for first-stage FPS");
-    Require(!gtg::fps::FirstStageD3D11Candidate(false, true) &&
-            !gtg::fps::FirstStageD3D11Candidate(true, true) &&
-            !gtg::fps::FirstStageD3D11Candidate(false, false),
-        "D3D12, mixed API and unknown targets stay unavailable");
-    Require(gtg::fps::ValidatedDxgiCandidate(false, true),
-        "trace-validated D3D12-only target is eligible");
-    Require(gtg::fps::ValidatedDxgiCandidate(true, false) &&
-            gtg::fps::ValidatedDxgiCandidate(true, true) &&
-            !gtg::fps::ValidatedDxgiCandidate(false, false),
-        "either DXGI-capable module is a hint; event evidence decides FPS");
 }
 
 void TestComposedFlipRequiresVerifiedScanout() {
@@ -2316,8 +2304,8 @@ void TestConfigValidation() {
     gtg::ProtectionConfig valid;
     Require(!gtg::ValidateConfig(valid).has_value(), "default config should be valid");
 
-    // Equal was rejected once; it is now the monitor-only configuration a
-    // fresh install starts in.
+    // Equal was rejected until AF-20260924-monitor-only-and-device-defaults;
+    // it is now the monitor-only configuration a fresh install starts in.
     valid.safe_power_w = valid.normal_power_w;
     Require(!gtg::ValidateConfig(valid).has_value(), "equal limits are monitor-only, not invalid");
     valid.safe_power_w = valid.normal_power_w + 1;

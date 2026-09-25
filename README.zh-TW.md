@@ -13,16 +13,18 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 | 主監控面板，八條歷史紀錄 | 展開 OSD，依自訂順序排列 |
 | --- | --- |
-| ![GpuThermalGuard 主面板：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS 歷史](docs/images/dashboard-zh-TW.png) | ![展開 OSD 以自訂順序顯示八列數值：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS](docs/images/osd-zh-TW.png) |
+| ![GpuThermalGuard 主面板：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS 歷史](docs/images/dashboard-zh-TW.png) | ![展開 OSD 以自訂順序顯示八列數值：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS](docs/images/osd.png) |
 
 截圖中的設定屬於單一工作站，不是所有 GPU 的建議門檻。
 
-本版本的一分鐘操作影片（精簡面板在一排、兩排與單欄之間重新排列、釋放主機記憶體、讀取網路）放在
-[YouTube](https://www.youtube.com/watch?v=qqzzCrphDic)。
+本版本的一分鐘操作影片，在 4K 遊戲畫面上錄製（精簡面板在一排、兩排與單欄之間重新排列、釋放主機記憶體，並在遊戲執行中讀取網路與影格率）放在
+[YouTube](https://www.youtube.com/watch?v=1urYDlP_he0)。
+
+![遊戲執行中的精簡面板：即時溫度、功率、VRAM、GPU、CPU、含上下行箭頭的網路，以及標示繪圖 API 與送出解析度的影格率](docs/images/osd-in-game.gif)
 
 ### Compact 精簡 OSD
 
-![精簡 OSD：一排八項即時數值與 30 秒迷你趨勢曲線](docs/images/osd-compact-zh-TW.png)
+![精簡 OSD：一排八項即時數值與 30 秒迷你趨勢曲線](docs/images/osd-compact.png)
 
 點擊 OSD 頂部的箭頭，可在完整圖表與 compact mode 之間切換。精簡模式將每個項目顯示為一張小卡，含即時數值與最近 30 秒的迷你曲線。勾選「顯示 RAM」或「顯示 FPS」各會增加一張卡；取消勾選後回到其餘項目的配置。
 
@@ -107,7 +109,11 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 自 v0.10.0-beta.1 起，「顯示 FPS」預設勾選，主視窗增加第六條獨立 FPS 歷史，OSD 增加一列／一張 FPS 卡。它跟隨目前前景程式；切換遊戲時，讀值會共用同一條時間軸。關閉後停止 FPS 觀測並清除其紀錄，原本五條溫度／硬體紀錄不變。FPS 收集器不參與獨立的 200 ms 保護迴圈。
 
-數值是支援的 Windows DXGI 呈現路徑中經驗證的「已上屏影格」速率，不是單純的 Present 呼叫次數或螢幕刷新率。暖機、切換焦點、未支援或無法確認的路徑會顯示 `-`；曲線上的暗色連接僅維持視覺連續，**不代表該段量到了 FPS**。本版尚不包含原生 Vulkan FPS 或獨佔全螢幕的遊戲內 overlay；桌面 TOPMOST OSD 不保證蓋住獨佔全螢幕。
+自 v0.13.0 起，量測涵蓋所有繪圖 API，不再只有 DXGI。在 Windows 能夠確認影格已上屏的路徑（DXGI），計的就是已上屏影格；無法確認的路徑（Vulkan 與 OpenGL 即是如此），計的是程式送出的 present 次數，由 graphics kernel 統計。兩者都是對程式本身工作的實際量測；都不是螢幕刷新率，也都不是在引擎內部取得的 frame time。
+
+在能夠判斷的情況下，卡片同時標示產生這個數字的來源：`D9`、`D11`、`D12`、`VK` 或 `GL`，以及程式實際送出的解析度。若無法辨識繪圖 API，或無法確認尺寸，該部分就不顯示 —— 不做任何猜測。這裡的解析度是程式送上畫面的 swapchain；對使用 DLSS 或 FSR 放大的遊戲而言就是它的輸出尺寸：引擎內部的 render target 不會離開該行程，因此任何在行程外的量測都看不到它。
+
+暖機、切換焦點，以及前景程式根本沒有在上屏的時候會顯示 `-` —— 閒置的程式沒有影格率。曲線上的暗色連接僅維持視覺連續，**不代表該段量到了 FPS**。本版尚不包含獨佔全螢幕的遊戲內 overlay；桌面 TOPMOST OSD 不保證蓋住獨佔全螢幕。
 
 ## 為什麼打造這個工具
 

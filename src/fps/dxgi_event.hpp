@@ -8,21 +8,12 @@
 
 namespace gtg::fps {
 
-// The first product milestone has only been validated with a D3D11 DXGI
-// target. DXGI Present events alone do not identify the rendering API.
-[[nodiscard]] constexpr bool FirstStageD3D11Candidate(
-    const bool has_d3d11, const bool has_d3d12) noexcept {
-    return has_d3d11 && !has_d3d12;
-}
-
-// Module presence is only a DXGI-capability hint, not evidence of the active
-// renderer. A bounded mixed-module D3D12/WARP ledger matched the same DXGI
-// Present surface/rate. Numeric FPS still requires matched events and the
-// RateTracker's dominant-surface, freshness and loss confidence gates.
-[[nodiscard]] constexpr bool ValidatedDxgiCandidate(
-    const bool has_d3d11, const bool has_d3d12) noexcept {
-    return has_d3d11 || has_d3d12;
-}
+// Module presence used to gate admission: the observer looked for d3d11.dll
+// or d3d12.dll before it would start. That gate is gone. The submission side
+// now comes from the graphics kernel, which every presenting program reaches
+// whatever API it used, so there is nothing to look for -- and the lookup was
+// the one step that could be refused, returning ERROR_ACCESS_DENIED on a real
+// game and rejecting the session before it began.
 
 struct RawDxgiEvent {
     std::uint16_t id{};

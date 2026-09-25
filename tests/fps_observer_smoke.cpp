@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <windows.h>
 
 #include <cstdint>
@@ -26,8 +27,22 @@ int main(int argc, char** argv) {
         const auto snapshot = observer.TryRead();
         if (snapshot.status == gtg::fps::Status::Ready) {
             ++ready;
-            std::cout << "fps=" << snapshot.displayed_fps
-                      << " surface=" << snapshot.surface << '\n';
+            std::wcout << L"fps=" << snapshot.displayed_fps
+                       << L" measure="
+                       << (snapshot.measure == gtg::fps::Measure::Displayed
+                               ? L"displayed" : L"presented")
+                       << L" backend="
+                       << (snapshot.backend == gtg::fps::Backend::Unknown
+                               ? L"?" : gtg::fps::BackendLabel(snapshot.backend))
+                       << L" res=" << snapshot.resolution.width << L"x"
+                       << snapshot.resolution.height
+                       << (snapshot.resolution.source ==
+                                   gtg::fps::ResolutionSource::Presented
+                               ? L"(presented)"
+                               : snapshot.resolution.source ==
+                                         gtg::fps::ResolutionSource::Output
+                                     ? L"(output)" : L"(none)")
+                       << L" surface=" << snapshot.surface << L'\n';
         } else {
             std::cout << "status=" << static_cast<int>(snapshot.status) << '\n';
         }

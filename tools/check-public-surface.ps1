@@ -9,7 +9,7 @@ $allowedTopLevel = @(
     'assets', 'CHANGELOG.md', 'CMakeLists.txt', 'CMakePresets.json',
     'CONTRIBUTING.md', 'Directory.Build.props', 'docs', 'LICENSE', 'README.md',
     'README.zh-TW.md', 'SECURITY.md', 'src', 'tests', 'third_party',
-    'THIRD_PARTY_NOTICES.md', 'tools'
+    'THIRD_PARTY_NOTICES.md', 'tools', 'version.cmake'
 )
 
 $tracked = & git -C $RepositoryRoot ls-files

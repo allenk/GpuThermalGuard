@@ -17,12 +17,14 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 Screenshots show one workstation's settings, not recommended limits for every GPU.
 
-A one-minute walkthrough of this release -- rearranging the compact dashboard between one row, two rows and a single column, releasing host memory, and reading the network -- is on
-[YouTube](https://www.youtube.com/watch?v=qqzzCrphDic).
+A one-minute walkthrough of this release, recorded over a game at 4K -- the compact dashboard moving between one row, two rows and a single column, host memory being released, and the network and frame rate being read while the game runs -- is on
+[YouTube](https://www.youtube.com/watch?v=1urYDlP_he0).
+
+![The compact dashboard over a running game: live temperature, power, VRAM, GPU, CPU, network with per-direction arrows, and frame rate with its graphics API and presented resolution](docs/images/osd-in-game.gif)
 
 ### Compact OSD
 
-![Compact OSD, one row of eight live metrics with 30-second miniature trends](docs/images/osd-compact.png)
+![Compact OSD, one row of eight live metrics with 30-second miniature trends, the network card showing both directions and the FPS card its graphics API and resolution](docs/images/osd-compact.png)
 
 Use the chevron in the OSD header to switch between the full charts and compact mode. Compact mode shows each record as a small card with a live value and a 30-second miniature trend. **Show RAM** and **Show FPS** each add a card; unchecking one returns the layout to the records that remain.
 
@@ -105,7 +107,11 @@ The verdict is the worst of the connections measured, never the average -- a gam
 
 Starting with v0.10.0-beta.1, **Show FPS** is checked by default and adds a separate sixth history lane to the dashboard and an FPS row/card to the OSD. It follows the current foreground app, so switching games mixes their readings on one time axis. Turning it off stops FPS observation, clears that FPS history, and leaves the five thermal histories unchanged. The FPS collector is outside the independent 200 ms protection loop.
 
-The number represents verified displayed frames on supported Windows DXGI presentation paths, not raw Present calls or the monitor refresh rate. During warm-up, focus changes, or unsupported/ambiguous paths, it shows `-`; dark curve sections are visual continuity, **not measured FPS**. Native Vulkan FPS and an in-game overlay for exclusive fullscreen are not included in this release. Desktop TOPMOST OSD visibility in exclusive fullscreen is not guaranteed.
+Since v0.13.0 the measurement covers every graphics API, not only DXGI. Where Windows can confirm a frame reached the screen -- the DXGI path -- that is what is counted. Where it cannot, which is the case for Vulkan and OpenGL, the number is the rate of presents the program submitted, counted in the graphics kernel. Both are real measurements of the program's own work; neither is the monitor refresh rate and neither is a frame time sampled inside the engine.
+
+The card also names what produced the number when that can be established: `D9`, `D11`, `D12`, `VK` or `GL`, and the resolution the program actually presented. If the graphics API cannot be identified, or the size cannot be, that part is simply absent -- nothing is guessed. The resolution is the swapchain the program put up, which for a game upscaling with DLSS or FSR is its full output size: the internal render target never leaves the process, so no measurement outside it can see one.
+
+It shows `-` during warm-up, across focus changes, and whenever the foreground program is presenting nothing at all -- an idle program has no frame rate. Dark curve sections are visual continuity, **not measured FPS**. An in-game overlay for exclusive fullscreen is not included in this release, and desktop TOPMOST OSD visibility in exclusive fullscreen is not guaranteed.
 
 ## Why I built it
 
