@@ -10,6 +10,9 @@
 #include "tray/main_dialog.hpp"
 #include "logging/logger.hpp"
 #include "supervision/supervisor.hpp"
+#ifdef GTG_FEATURE_OVERLAY
+#include "../overlay/integration/runtime.hpp"
+#endif
 
 WTL::CAppModule _Module;
 
@@ -34,6 +37,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     int argument_count = 0;
     wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
     const bool parsed = arguments != nullptr;
+#ifdef GTG_FEATURE_OVERLAY
+    if (parsed && argument_count >= 2 && _wcsicmp(arguments[1], L"--overlay-helper") == 0) {
+        const int result = argument_count == 3 ? gtg::overlay::integration::HelperMain(arguments[2]) : ERROR_BAD_ARGUMENTS;
+        LocalFree(arguments);
+        return result;
+    }
+#endif
     const bool service_mode = parsed && argument_count >= 2 &&
         _wcsicmp(arguments[1], L"--service") == 0;
     const bool tray_mode = !parsed || argument_count < 2 ||

@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-07
+
+GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows how the frame got to the screen.
+
+### Added
+
+- **In-game overlay** for native 64-bit Direct3D 11 and Direct3D 12 games, visible in exclusive and borderless fullscreen. GTG draws the dashboard; `gtg_overlay.dll`, loaded into the game only when you press the overlay hotkey with that game in front, draws the picture just before the game presents. A helper process (the same EXE) checks the target and works out the Direct3D entry points in its own process before anything is loaded. Up to four games at once; a further press hides or shows the overlay. Built on [Splice](https://github.com/allenk/splice) 1.1, included as a submodule.
+- **Overlay hotkey**, `Alt`+`F10` by default, recorded as keycaps through a keyboard hook that exists only while the dialog is in front. A combination needs a modifier, `F12` is refused (Windows reserves it for debuggers), and one another program holds is reported instead of saved.
+- **Two downloads with one EXE.** Without `gtg_overlay.dll` beside it the EXE hides the overlay controls and registers no hotkey.
+- **Light and dark themes**: Auto (follows the Windows app mode, live), Dark and Light. High contrast keeps the system colours; a Windows build that cannot draw dark controls falls back to light. The main window is redesigned, and its title bar shows the version.
+- **Wall clock** in the OSD header two seconds after the pointer leaves, in place of the lock and chevron; not while the arrangement is unlocked. The in-game overlay always shows it.
+- **Play time** on the FPS card: counted only while a game has a steady frame rate, carried across a game restart, handed to the next game after three minutes without one, with the time it earned meanwhile added back.
+- **Magnetic alignment**: dragging the OSD snaps to work-area edges, screen edges and monitor seams; `Shift` places freely.
+- **Trip marker** on the main window's temperature history at the moment protection tripped.
+
+### Changed
+
+- **FPS distinguishes composed frames from independent flip.** When Windows composes a game, the displayed frames are counted; when the game flips straight to the screen, the frames it presented are counted. Previously a game on independent flip could read a fraction of its real rate -- about 26 instead of about 248 in one measured case -- or nothing at all.
+- The chevron stays where you click it: expanding and collapsing grow and shrink the OSD to its left, and each view reopens where it was left.
+- Building from source now needs vcpkg (`VCPKG_ROOT`) for the overlay's Dear ImGui; `-DGTG_FEATURE_OVERLAY=OFF` does not.
+
+### Fixed
+
+- The compact OSD reopened with the right height but the wrong horizontal position when arranged as a single column near a screen's right edge.
+- The status icon in the main window was upscaled from a 48-pixel image and looked soft at high DPI.
+- **Save & Apply** looked different from the buttons beside it.
+
+### Notes
+
+- **1.0.0 is not Authenticode-signed.** Verify downloads with `SHA256SUMS.txt` and the build-provenance attestation.
+- The overlay hides nothing from anti-cheat. Do not use it in protected or competitive online games; a game that refuses it is unsupported.
+- Not supported by the overlay: Vulkan, OpenGL, Direct3D 9, 32-bit games, HDR.
+
 ## [0.13.0] - 2026-09-26
 
 ### Added

@@ -89,6 +89,22 @@ inline constexpr float kLaneGraphInsetDip = 100.0F;  // left + right inset
 // shortened the rows.
 inline constexpr float kLaneNominalHeightDip = 60.0F;
 
+// DIP to device pixels and back, at a given scale.
+//
+// Rounded, not truncated, and that is the whole reason these exist as named
+// functions with a test. They replaced MulDiv, which rounds; a truncating
+// cast is a pixel short of it on any odd dimension, and gtg_fps_observer_smoke
+// -- which compares the overlay's window rect against MulDiv -- caught exactly
+// that regression once already.
+constexpr int ToPixels(const float dip, const float scale) noexcept {
+    return static_cast<int>(dip * scale + 0.5F);
+}
+
+constexpr int ToDip(const int pixels, const float scale) noexcept {
+    return scale > 0.0F
+        ? static_cast<int>(static_cast<float>(pixels) / scale + 0.5F) : pixels;
+}
+
 constexpr float LaneScale(float row_height) noexcept {
     return row_height / kLaneNominalHeightDip;
 }
@@ -615,6 +631,39 @@ inline constexpr int kStatusTextMinimumColumns = 3;
 
 [[nodiscard]] constexpr bool HeaderShowsStatusText(int widest_row) noexcept {
     return widest_row >= kStatusTextMinimumColumns;
+}
+
+// The header's buttons are for the pointer. Two seconds after it leaves, they
+// give their place to a wall clock (AF-20261006-osd-idle-clock).
+inline constexpr std::uint64_t kHeaderIdleAfterMs = 2'000;
+
+// Whether the header is idle. Never while the pointer is there, and never
+// while the arrangement is unlocked: the amber lock is an alert, and hiding
+// it would hide the one state the reader must notice (owner, 2026-10-06).
+[[nodiscard]] constexpr bool HeaderIdle(const bool pointer_present, const bool unlocked,
+                                        const std::uint64_t now_ms,
+                                        const std::uint64_t last_pointer_ms) noexcept {
+    if (pointer_present || unlocked) return false;
+    return now_ms >= last_pointer_ms && now_ms - last_pointer_ms >= kHeaderIdleAfterMs;
+}
+
+// 24-hour local time with seconds, "23:59:59". Fixed width: Segoe UI digits
+// are tabular, so the text does not shift as the seconds change.
+[[nodiscard]] constexpr std::array<wchar_t, 9> FormatWallClock(const int hour, const int minute,
+                                                               const int second) noexcept {
+    const auto two = [](const int value, wchar_t* out) {
+        const int v = value < 0 ? 0 : value % 100;
+        out[0] = static_cast<wchar_t>(L'0' + v / 10);
+        out[1] = static_cast<wchar_t>(L'0' + v % 10);
+    };
+    std::array<wchar_t, 9> text{};
+    two(hour, &text[0]);
+    text[2] = L':';
+    two(minute, &text[3]);
+    text[5] = L':';
+    two(second, &text[6]);
+    text[8] = L'\0';
+    return text;
 }
 
 inline constexpr unsigned kRecordBits = 3;

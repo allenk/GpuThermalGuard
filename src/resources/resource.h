@@ -7,6 +7,7 @@
 #define IDI_TRAY_FAULT                  105
 #define IDI_CAMERA                      106
 #define IDD_MAIN                        201
+#define IDD_OVERLAY_HOTKEY              202
 #define IDC_GPU_NAME                    1001
 #define IDC_GPU_TEMP                    1002
 #define IDC_GPU_POWER                   1003
@@ -47,6 +48,19 @@
 #define IDC_SHOW_FPS                    1044
 #define IDC_SHOW_RAM                    1045
 #define IDC_SHOW_NET                    1046
+#define IDC_OSD_SCALE_LABEL             1047
+#define IDC_OSD_SCALE                   1048
+#define IDC_THEME_LABEL                 1049
+#define IDC_THEME                       1050
+#define IDC_LANGUAGE_LABEL              1051
+#define IDC_OVERLAY_ENABLED             1052
+#define IDC_OVERLAY_HOTKEY              1053
+#define IDC_OVERLAY_AUTO_SDR            1054
+#define IDC_DISPLAY_LABEL               1055
+#define IDC_HOTKEY_PROMPT               1060
+#define IDC_HOTKEY_EDIT                 1061
+#define IDC_HOTKEY_NOTE                 1062
+#define IDC_HOTKEY_DEFAULT              1063
 #define IDM_TRAY_OPEN                   40001
 #define IDM_TRAY_REFRESH                40002
 #define IDM_TRAY_EXIT                   40003

@@ -6,17 +6,25 @@
 #include <tdh.h>
 #include <tlhelp32.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <mutex>
 #include <string>
+#include <vector>
+#ifdef GTG_FPS_ISOLATED_SMOKE
+#include <unordered_set>
+#endif
 #include <thread>
 
+#include "fps/backend_resolution.hpp"
+#include "fps/present_path.hpp"
 #include "fps/dxgi_event.hpp"
 #include "fps/display_correlator.hpp"
 #include "fps/observer_admission.hpp"
@@ -33,6 +41,48 @@ constexpr GUID kDwmProvider{0x9E9BBA3C, 0x2E38, 0x40CB,
                             {0x99, 0xF4, 0x9E, 0x82, 0x81, 0x42, 0x51, 0x64}};
 constexpr GUID kDxgKrnlProvider{0x802EC45A, 0x1E99, 0x4B83,
                                 {0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D}};
+// The D3D runtimes' own providers (AF-20261004-fps-backend-runtime-evidence):
+// Microsoft-Windows-Direct3D12 and -Direct3D11. Only their device events are
+// taken -- 3 create, 4 destroy, 5 report (the answer to CAPTURE_STATE), the
+// same ids in both -- so per-frame events never reach the session.
+constexpr GUID kD3D12RuntimeProvider{0x5D8087DD, 0x3A9B, 0x4F56,
+                                     {0x90, 0xDF, 0x49, 0x19, 0x6C, 0xDC, 0x4F, 0x11}};
+constexpr GUID kD3D11RuntimeProvider{0xDB6F6DDB, 0xAC77, 0x4E88,
+                                     {0x82, 0x53, 0x81, 0x9D, 0xF9, 0xBB, 0xF1, 0x40}};
+constexpr std::uint64_t kD3DDevicesKeyword = 0x2;
+constexpr USHORT kD3DDeviceCreated = 3;
+constexpr USHORT kD3DDeviceDestroyed = 4;
+constexpr USHORT kD3DDeviceReported = 5;
+
+// A device event's identity: its first pointer-typed field, which in these
+// device events is the device. Read by type rather than by name because the
+// providers' field names are not published; 0 when there is none, and the
+// ledger then counts instead.
+std::uint64_t DeviceIdentity(EVENT_RECORD* record) noexcept {
+    ULONG size = 0;
+    if (TdhGetEventInformation(record, 0, nullptr, nullptr, &size) !=
+        ERROR_INSUFFICIENT_BUFFER || size == 0) return 0;
+    std::vector<BYTE> buffer(size);
+    auto* info = reinterpret_cast<TRACE_EVENT_INFO*>(buffer.data());
+    if (TdhGetEventInformation(record, 0, nullptr, info, &size) != ERROR_SUCCESS) return 0;
+    for (ULONG i = 0; i < info->TopLevelPropertyCount; ++i) {
+        const EVENT_PROPERTY_INFO& property = info->EventPropertyInfoArray[i];
+        if ((property.Flags & PropertyStruct) != 0 ||
+            property.nonStructType.InType != TDH_INTYPE_POINTER) continue;
+        PROPERTY_DATA_DESCRIPTOR descriptor{};
+        descriptor.PropertyName =
+            reinterpret_cast<ULONGLONG>(buffer.data() + property.NameOffset);
+        descriptor.ArrayIndex = ULONG_MAX;
+        ULONG value_size = 0;
+        if (TdhGetPropertySize(record, 0, nullptr, 1, &descriptor, &value_size) !=
+                ERROR_SUCCESS || value_size == 0 || value_size > sizeof(std::uint64_t)) return 0;
+        std::uint64_t value = 0;
+        if (TdhGetProperty(record, 0, nullptr, 1, &descriptor, value_size,
+                           reinterpret_cast<BYTE*>(&value)) != ERROR_SUCCESS) return 0;
+        return value;
+    }
+    return 0;
+}
 
 template <typename T>
 bool ReadEtwProperty(EVENT_RECORD* record, const wchar_t* name,
@@ -132,11 +182,6 @@ std::uint64_t NowMicroseconds(const std::uint64_t frequency) noexcept {
 //
 // The events decide the family; this only names it inside the family the
 // events already established.
-struct LoadedRuntimes {
-    bool d3d9{}, d3d11{}, d3d12{}, vulkan{}, opengl{};
-    bool readable{};   // false when the module list was refused
-};
-
 LoadedRuntimes BackendFromModules(const std::uint32_t pid) noexcept {
     HANDLE snapshot = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -230,6 +275,29 @@ private:
         // moved them.
         std::atomic<std::uint64_t> kernel_presents{0};
         std::atomic<std::uint64_t> displayed_frames{0};
+        // How the target's frames reach the screen; while they bypass DWM the
+        // correlator's matches are not offered as displayed. Consumer thread
+        // only. present_path.hpp.
+        PresentPath present_path;
+#ifdef GTG_FPS_ISOLATED_SMOKE
+        std::uint64_t research_withheld{};
+        // Research, 2026-10-07:
+        // which presentation path the target's frames take, read from the
+        // IndependentFlip field of Win32k TokenStateChanged at InFrame, which
+        // GTG never reads; whether DxgKrnl 215 arrives; and the first event
+        // that failed correlation. Consumer thread only, so no locking.
+        std::unordered_set<std::uint64_t> research_luids;
+        std::uint64_t research_inframe_iflip{};
+        std::uint64_t research_inframe_composed{};
+        std::uint64_t research_inframe_unread{};
+        std::uint64_t research_215{};
+        std::uint64_t research_184_windowless{};
+        bool research_failed{};
+        USHORT research_fail_id{};
+        UCHAR research_fail_version{};
+        bool research_fail_unhealthy{};
+        std::wstring research_fail_provider;
+#endif
         // The size the program last presented, from whichever provider saw it.
         // Written on the consumer thread, read under tracker_mutex_.
         std::atomic<std::uint32_t> presented_width{0};
@@ -237,6 +305,15 @@ private:
         // Whether the DXGI composition path was ever seen. It is what says the
         // program is a DXGI runtime, which no module list can prove.
         std::atomic<bool> saw_composition_token{false};
+        // The target's live D3D devices. The ledger belongs to the consumer
+        // thread; the counts are what the publisher reads.
+        DeviceLedger device_ledger;
+        std::atomic<std::uint32_t> live_d3d11_devices{0};
+        std::atomic<std::uint32_t> live_d3d12_devices{0};
+        // Both runtime providers enabled and asked for their state. Without
+        // both, "D3D11 only" could just mean the D3D12 provider was not
+        // listening, so the devices are not used.
+        std::atomic<bool> runtime_devices_observed{false};
         LoadedRuntimes loaded_runtimes{};
         HWND window{nullptr};
         std::uint64_t qpc_frequency{};
@@ -247,6 +324,27 @@ private:
     // Guarded by tracker_mutex_, which the UI thread already takes to read.
     DxgiObserver::SessionCounts last_counts_{};
 
+    // Consumer thread only. A failure to record (allocation) leaves the
+    // previous counts, which at worst returns the label to the module rule.
+    static void RecordDeviceEvent(Session& session, EVENT_RECORD* record,
+                                  const D3DRuntime runtime, const USHORT id) noexcept {
+        try {
+            if (id == kD3DDeviceCreated || id == kD3DDeviceReported) {
+                session.device_ledger.Live(runtime, DeviceIdentity(record));
+            } else if (id == kD3DDeviceDestroyed) {
+                session.device_ledger.Destroyed(runtime, DeviceIdentity(record));
+            } else {
+                return;
+            }
+        } catch (...) {
+            return;
+        }
+        session.live_d3d11_devices.store(session.device_ledger.Count(D3DRuntime::D3D11),
+                                         std::memory_order_relaxed);
+        session.live_d3d12_devices.store(session.device_ledger.Count(D3DRuntime::D3D12),
+                                         std::memory_order_relaxed);
+    }
+
     static void WINAPI OnRecord(PEVENT_RECORD record) noexcept {
         if (record == nullptr) return;
         auto* session = static_cast<Session*>(record->UserContext);
@@ -254,6 +352,15 @@ private:
             session->correlation_failed.load(std::memory_order_relaxed)) return;
         const auto& header = record->EventHeader;
         const auto id = header.EventDescriptor.Id;
+        // The D3D runtimes' device events feed the label, never the number.
+        const bool d3d12_runtime = IsEqualGUID(header.ProviderId, kD3D12RuntimeProvider) != 0;
+        if (d3d12_runtime || IsEqualGUID(header.ProviderId, kD3D11RuntimeProvider)) {
+            if (header.ProcessId == session->identity.pid) {
+                RecordDeviceEvent(*session, record,
+                                  d3d12_runtime ? D3DRuntime::D3D12 : D3DRuntime::D3D11, id);
+            }
+            return;
+        }
         const auto timestamp = QpcToMicroseconds(
             static_cast<std::uint64_t>(header.TimeStamp.QuadPart),
             session->qpc_frequency);
@@ -288,7 +395,14 @@ private:
                 TokenKey key{};
                 valid = header.EventDescriptor.Version == 1 &&
                     ReadTokenKey(record, false, key);
-                if (valid) correlation.OnToken(header.ThreadId, key, timestamp);
+                if (valid) {
+                    correlation.OnToken(header.ThreadId, key, timestamp);
+                    session->present_path.NoteTargetSurface(key.luid);
+                }
+#ifdef GTG_FPS_ISOLATED_SMOKE
+                if (valid && session->research_luids.size() < 64)
+                    session->research_luids.insert(key.luid);
+#endif
                 // The swapchain the program put up, not the window it landed
                 // in: measured, buffers a quarter of the window make this
                 // report the quarter.
@@ -306,7 +420,31 @@ private:
                 valid = header.EventDescriptor.Version == 1 &&
                     ReadTokenKey(record, false, key) &&
                     ReadEtwProperty(record, L"NewState", state);
-                if (valid && state == 3) correlation.OnInFrame(key);
+                if (valid && state == 3) {
+                    // Only the target's own InFrames, so the extra property
+                    // read costs nothing for the rest of the desktop. A
+                    // Windows build without the field leaves the path as it
+                    // was: composed.
+                    bool independent = false;
+                    if (session->present_path.IsTarget(key.luid)) {
+                        std::uint32_t field{};
+                        if (ReadEtwProperty(record, L"IndependentFlip", field)) {
+                            independent = field != 0;
+                            session->present_path.NoteInFrame(key.luid, independent);
+                        }
+                    }
+                    if (session->present_path.ForwardsInFrame(key.luid, independent))
+                        correlation.OnInFrame(key);
+                }
+#ifdef GTG_FPS_ISOLATED_SMOKE
+                if (valid && state == 3 && session->research_luids.count(key.luid) != 0) {
+                    std::uint32_t independent{};
+                    if (!ReadEtwProperty(record, L"IndependentFlip", independent))
+                        ++session->research_inframe_unread;
+                    else if (independent != 0) ++session->research_inframe_iflip;
+                    else ++session->research_inframe_composed;
+                }
+#endif
                 if (valid && state == 6) correlation.OnDiscard(key);
             }
         } else if (IsEqualGUID(header.ProviderId, kDwmProvider)) {
@@ -346,12 +484,19 @@ private:
                 std::uint64_t window{};
                 valid = header.EventDescriptor.Version == 1 &&
                     ReadEtwProperty(record, L"hWindow", window);
+#ifdef GTG_FPS_ISOLATED_SMOKE
+                if (valid && window == 0) ++session->research_184_windowless;
+#endif
                 if (valid && window != 0) {
                     session->kernel_presents.fetch_add(1, std::memory_order_relaxed);
                     std::lock_guard lock(session->owner->tracker_mutex_);
                     session->owner->tracker_.RecordPresented(
                         session->identity, window, timestamp);
                 }
+#ifdef GTG_FPS_ISOLATED_SMOKE
+            } else if (id == 215 && header.ProcessId == session->identity.pid) {
+                ++session->research_215;
+#endif
             } else if (id == 252 && header.ProcessId == session->dwm_pid &&
                 header.ThreadId != 0) {
                 valid = header.EventDescriptor.Version == 0;
@@ -390,6 +535,19 @@ private:
             }
         }
         if (!valid || !correlation.Healthy()) {
+#ifdef GTG_FPS_ISOLATED_SMOKE
+            if (!session->research_failed) {
+                session->research_failed = true;
+                session->research_fail_id = id;
+                session->research_fail_version = header.EventDescriptor.Version;
+                session->research_fail_unhealthy = valid;
+                session->research_fail_provider =
+                    IsEqualGUID(header.ProviderId, kDxgiProvider) ? L"DXGI" :
+                    IsEqualGUID(header.ProviderId, kWin32kProvider) ? L"Win32k" :
+                    IsEqualGUID(header.ProviderId, kDwmProvider) ? L"DWM" :
+                    IsEqualGUID(header.ProviderId, kDxgKrnlProvider) ? L"DxgKrnl" : L"other";
+            }
+#endif
             correlation.MarkLost();
             session->correlation_failed.store(true, std::memory_order_release);
             return;
@@ -397,6 +555,14 @@ private:
         while (const auto shown = correlation.Pop()) {
             session->displayed_frames.fetch_add(1, std::memory_order_relaxed);
             session->probation.NoteDisplayed();
+            // Independent flip: the frames bypass DWM, so this match is not the
+            // display path and must not out-rank the presented stream.
+            if (!session->present_path.CountsAsDisplayed()) {
+#ifdef GTG_FPS_ISOLATED_SMOKE
+                ++session->research_withheld;
+#endif
+                continue;
+            }
             std::lock_guard lock(session->owner->tracker_mutex_);
             session->owner->tracker_.RecordDisplayed(session->identity,
                 shown->surface, shown->timestamp_us);
@@ -413,6 +579,8 @@ private:
         // the RateTracker's own confidence gates decide when to publish.
         constexpr auto admission = ObserverAdmission::Normal;
         session_.identity = identity;
+        // A new target starts on the composed path until its own InFrame says otherwise.
+        session_.present_path.Reset();
         // Both are labels, taken once at session start. Neither can stop the
         // session: a refused module list leaves the name Unknown, and a window
         // we cannot resolve leaves the fallback size unavailable.
@@ -421,6 +589,11 @@ private:
         session_.presented_width.store(0, std::memory_order_relaxed);
         session_.presented_height.store(0, std::memory_order_relaxed);
         session_.saw_composition_token.store(false, std::memory_order_relaxed);
+        // The consumer thread is not running yet, so the ledger is ours here.
+        session_.device_ledger.Clear();
+        session_.live_d3d11_devices.store(0, std::memory_order_relaxed);
+        session_.live_d3d12_devices.store(0, std::memory_order_relaxed);
+        session_.runtime_devices_observed.store(false, std::memory_order_release);
         session_.owner = this;
         session_.probation.Begin(admission, GetTickCount64());
         session_.correlator.Reset();
@@ -512,8 +685,37 @@ private:
             StopSession();
             return false;
         }
+        EnableRuntimeDeviceEvidence(identity.pid);
         session_.running = true;
         return true;
+    }
+
+    // AF-20261004-fps-backend-runtime-evidence. After the consumer is running,
+    // so the state reported on CAPTURE_STATE has a reader: the device events of
+    // both D3D runtimes, PID-scoped and filtered to 3/4/5, then a request for
+    // the devices that already exist. Only if all four calls succeed are the
+    // devices used; any failure leaves the label to the module rule and never
+    // touches the number.
+    void EnableRuntimeDeviceEvidence(const DWORD pid) noexcept {
+        constexpr std::array<USHORT, 3> kDeviceEvents{
+            kD3DDeviceCreated, kD3DDeviceDestroyed, kD3DDeviceReported};
+        const bool enabled =
+            EnableEventIds(session_.controller_handle, kD3D12RuntimeProvider,
+                           kD3DDevicesKeyword, kDeviceEvents, pid) &&
+            EnableEventIds(session_.controller_handle, kD3D11RuntimeProvider,
+                           kD3DDevicesKeyword, kDeviceEvents, pid);
+        const auto capture = [&](const GUID& provider) {
+            return EnableTraceEx2(session_.controller_handle, &provider,
+                                  EVENT_CONTROL_CODE_CAPTURE_STATE, TRACE_LEVEL_VERBOSE,
+                                  kD3DDevicesKeyword, 0, 0, nullptr) == ERROR_SUCCESS;
+        };
+        const bool observed = enabled && capture(kD3D12RuntimeProvider) &&
+                               capture(kD3D11RuntimeProvider);
+        session_.runtime_devices_observed.store(observed, std::memory_order_release);
+#ifdef GTG_FPS_ISOLATED_SMOKE
+        std::fprintf(stderr, "[runtime] pid %lu: device evidence %s\n",
+                     static_cast<unsigned long>(pid), observed ? "observed" : "unavailable");
+#endif
     }
 
     void StopSession() noexcept {
@@ -531,6 +733,45 @@ private:
         }
         if (session_.consumer.joinable()) session_.consumer.join();
         session_.consumer_alive.store(false, std::memory_order_release);
+#ifdef GTG_FPS_ISOLATED_SMOKE
+        // StopSession also runs once before any target; that one has nothing to say.
+        if (session_.identity.pid != 0)
+        std::fprintf(stderr, "[runtime] pid %lu: live devices D3D11=%u D3D12=%u (observed=%d)\n",
+                     static_cast<unsigned long>(session_.identity.pid),
+                     session_.live_d3d11_devices.load(), session_.live_d3d12_devices.load(),
+                     session_.runtime_devices_observed.load() ? 1 : 0);
+        if (session_.identity.pid != 0) {
+            std::fprintf(stderr,
+                "[research] pid %lu: kernel184=%llu (windowless=%llu) dxgkrnl215=%llu "
+                "displayed=%llu (withheld=%llu) inframe: iflip=%llu composed=%llu unread=%llu surfaces=%zu\n",
+                static_cast<unsigned long>(session_.identity.pid),
+                static_cast<unsigned long long>(session_.kernel_presents.load()),
+                static_cast<unsigned long long>(session_.research_184_windowless),
+                static_cast<unsigned long long>(session_.research_215),
+                static_cast<unsigned long long>(session_.displayed_frames.load()),
+                static_cast<unsigned long long>(session_.research_withheld),
+                static_cast<unsigned long long>(session_.research_inframe_iflip),
+                static_cast<unsigned long long>(session_.research_inframe_composed),
+                static_cast<unsigned long long>(session_.research_inframe_unread),
+                session_.research_luids.size());
+            if (session_.research_failed)
+                std::fprintf(stderr, "[research] pid %lu: correlation FAILED first at %ls id=%u v%u (%s)\n",
+                    static_cast<unsigned long>(session_.identity.pid),
+                    session_.research_fail_provider.c_str(),
+                    static_cast<unsigned>(session_.research_fail_id),
+                    static_cast<unsigned>(session_.research_fail_version),
+                    session_.research_fail_unhealthy ? "correlator unhealthy" : "event did not decode");
+            else
+                std::fprintf(stderr, "[research] pid %lu: correlation healthy for the whole session\n",
+                    static_cast<unsigned long>(session_.identity.pid));
+        }
+        session_.research_luids.clear();
+        session_.research_inframe_iflip = session_.research_inframe_composed = 0;
+        session_.research_inframe_unread = session_.research_215 = 0;
+        session_.research_184_windowless = 0;
+        session_.research_withheld = 0;
+        session_.research_failed = false;
+#endif
         // The consumer has joined, so these are final.
         last_counts_ = {true,
                         session_.displayed_frames.load(std::memory_order_relaxed),
@@ -588,32 +829,14 @@ private:
         published_ = current;
     }
 
-    // The events decide the family; the modules only name it. Where they
-    // disagree the events win, because a module list says what could be used
-    // and the events say what was.
     [[nodiscard]] Backend ResolveBackend() const noexcept {
-        const auto& loaded = session_.loaded_runtimes;
-        if (!loaded.readable) {
-            // The list was refused. The events still know the family, and
-            // saying that much is better than saying nothing.
-            return session_.saw_composition_token.load(std::memory_order_relaxed)
-                       ? Backend::DXGI : Backend::Unknown;
-        }
-        if (session_.saw_composition_token.load(std::memory_order_relaxed)) {
-            // A composition token means a DXGI runtime presented. Within that
-            // family d3d12 outranks d3d11, because a D3D12 program commonly
-            // keeps d3d11 loaded for an interop layer or an overlay.
-            if (loaded.d3d12) return Backend::D3D12;
-            if (loaded.d3d11) return Backend::D3D11;
-            return Backend::DXGI;
-        }
-        // No composition token, so the DXGI modules are not the renderer --
-        // whatever dragged them in, it was not what put this frame up. Vulkan
-        // first: its ICD loads opengl32 as well, measured.
-        if (loaded.vulkan) return Backend::Vulkan;
-        if (loaded.opengl) return Backend::OpenGL;
-        if (loaded.d3d9) return Backend::D3D9;
-        return Backend::Unknown;
+        const RuntimeDevices devices{
+            session_.runtime_devices_observed.load(std::memory_order_acquire),
+            session_.live_d3d11_devices.load(std::memory_order_relaxed),
+            session_.live_d3d12_devices.load(std::memory_order_relaxed)};
+        return fps::ResolveBackend(
+            session_.loaded_runtimes,
+            session_.saw_composition_token.load(std::memory_order_relaxed), devices);
     }
 
     // Presented first, output second, nothing third -- the owner's rule.

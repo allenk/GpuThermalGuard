@@ -15,3 +15,7 @@
 // release.
 #define GTG_VERSION_COMMA @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
 #define GTG_VERSION_STR   "@PROJECT_VERSION@.0\0"
+// The version's identity, three parts, for what a reader sees (the main
+// window's caption). GTG_VERSION_STR above is the Windows file-version
+// encoding; the fourth part is never shown.
+#define GTG_VERSION_DISPLAY L"@PROJECT_VERSION@"

@@ -24,14 +24,33 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Validate public surface
         shell: pwsh
         run: ./tools/check-public-surface.ps1
 
+      # The overlay's Dear ImGui comes from vcpkg in manifest mode (vcpkg.json).
+      # The runner's vcpkg clone may predate the manifest's builtin-baseline.
+      - name: Prepare vcpkg
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C $root cat-file -e "$baseline^{commit}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            git -C $root fetch --quiet origin
+            git -C $root cat-file -e "$baseline^{commit}"
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg baseline $baseline is not available." }
+          }
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Configure (Visual Studio 2022)
         shell: pwsh
-        run: cmake -S . -B out/build/ci -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+        run: >-
+          cmake -S . -B out/build/ci -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+          "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static
 
       - name: Build
         shell: pwsh
@@ -44,5 +63,6 @@ jobs:
       - name: Verify outputs
         shell: pwsh
         run: |
-          if (-not (Test-Path out/build/ci/Release/GpuThermalGuard.exe)) { throw 'Main executable missing.' }
-          if (-not (Test-Path out/build/ci/Release/GpuThermalGuardProbe.exe)) { throw 'Probe executable missing.' }
+          foreach ($file in @('GpuThermalGuard.exe', 'GpuThermalGuardProbe.exe', 'gtg_overlay.dll')) {
+            if (-not (Test-Path "out/build/ci/Release/$file")) { throw "$file missing." }
+          }

@@ -1,5 +1,8 @@
 #include "tray/main_dialog.hpp"
+#include "gtg_version.h"
 #include "tray/window_position.hpp"
+#include "tray/control_baseline.hpp"
+#include "timing/ui_phase_timing.hpp"
 #include "supervision/supervisor.hpp"
 
 #include <algorithm>
@@ -15,6 +18,14 @@
 #include "sysmem/reclaim_nt.hpp"
 #include "localization/localization.hpp"
 #include "snapshot/ui_snapshot.hpp"
+#include "tray/ui_theme.hpp"
+#include "tray/hotkey_capture.hpp"
+#ifdef GTG_FEATURE_OVERLAY
+#include "../../overlay/integration/runtime.hpp"
+#endif
+
+#include <commctrl.h>
+#include <vector>
 
 namespace gtg::tray {
 
@@ -23,6 +34,15 @@ static_assert(MainDialog::MessagesAreDistinct(),
               "two window messages share a value; ATL's map delivers both to "
               "whichever handler is registered first, and the loser never runs");
 namespace {
+
+void AlignSettingsEdits(HWND dialog) noexcept {
+    for (const auto [label, edit] : {
+             std::pair{IDC_NORMAL_POWER_LABEL, IDC_NORMAL_POWER},
+             std::pair{IDC_SAFE_POWER_LABEL, IDC_SAFE_POWER},
+             std::pair{IDC_TRIGGER_TEMP_LABEL, IDC_TRIGGER_TEMP}}) {
+        (void)AlignEditToLabel(dialog, GetDlgItem(dialog, label), GetDlgItem(dialog, edit));
+    }
+}
 
 constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
 
@@ -80,6 +100,17 @@ HICON LoadStatusIcon(HWND control, UINT resource_id) {
     if (size <= 0) {
         size = MulDiv(48, static_cast<int>(GetDpiForWindow(control)), 96);
     }
+    // The control is sized in dialog units, so its pixel size follows the DPI
+    // and rarely equals a frame. LoadIconWithScaleDown always starts from a
+    // larger frame and filters down; LoadImage would stretch the nearest one,
+    // which with 48 px as the largest frame meant upscaling and a soft icon.
+    // The status icons now carry frames up to 128 px
+    // (tools/icons/build_status_icons.py).
+    HICON icon = nullptr;
+    if (SUCCEEDED(LoadIconWithScaleDown(ATL::_AtlBaseModule.GetResourceInstance(),
+                                        MAKEINTRESOURCEW(resource_id), size, size, &icon))) {
+        return icon;
+    }
     return static_cast<HICON>(LoadImageW(ATL::_AtlBaseModule.GetResourceInstance(),
         MAKEINTRESOURCEW(resource_id), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
 }
@@ -90,18 +121,29 @@ HICON LoadDpiIcon(HWND control, const UINT resource_id, const int size_dip) {
         MAKEINTRESOURCEW(resource_id), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
 }
 
+// Both shapes, each under its own name: OsdX/OsdY for expanded, CompactX/
+// CompactY for collapsed (AF-20261004-main-ui-redesign).
 bool SaveOsdWindowPosition(const OsdOverlay& overlay,
                            const std::wstring_view reason) noexcept {
-    const auto position = ReadWindowPosition(overlay.m_hWnd);
-    if (!position) return false;
+    if (!ReadWindowPosition(overlay.m_hWnd)) return false;
+    const auto positions = overlay.Positions();
     std::wstring error;
-    if (!settings::SaveOsdPosition(position->x, position->y, error)) {
+    if (positions.expanded &&
+        !settings::SaveOsdPosition(positions.expanded->x, positions.expanded->y, error)) {
         logging::Warning(error);
         return false;
     }
+    if (positions.collapsed &&
+        !settings::SaveCompactPosition(positions.collapsed->x, positions.collapsed->y, error)) {
+        logging::Warning(error);
+        return false;
+    }
+    const auto text = [](const std::optional<POINT>& point) {
+        return point ? std::format(L"({}, {})", point->x, point->y) : std::wstring(L"none");
+    };
     logging::Info(std::format(
-        L"OSD placement saved; position=({}, {}) reason={}",
-        position->x, position->y, reason));
+        L"OSD placement saved; expanded={} compact={} collapsed={} reason={}",
+        text(positions.expanded), text(positions.collapsed), overlay.Collapsed(), reason));
     return true;
 }
 
@@ -114,20 +156,30 @@ bool RestoreOsdWindowPosition(HWND notification_window,
     // the shape afterwards would show the reader an expanded window that
     // immediately collapses.
     overlay.RestoreCollapsed(preference.collapsed);
+    overlay.SetScalePercent(preference.scale_percent);
+    const auto positions = placement::FromStored(
+        preference.has_position ? std::optional<POINT>{POINT{preference.x, preference.y}}
+                                : std::nullopt,
+        preference.has_compact_position
+            ? std::optional<POINT>{POINT{preference.compact_x, preference.compact_y}}
+            : std::nullopt);
+    overlay.RestorePositions(positions);
+    const std::optional<POINT> saved = positions.For(preference.collapsed);
     bool placement_repaired = false;
     const bool ready = overlay.Initialize(
-        notification_window, history, preference.has_position,
-        {preference.x, preference.y}, placement_repaired);
+        notification_window, history, saved.has_value(),
+        saved.value_or(POINT{}), placement_repaired);
     if (!ready) {
         logging::Warning(L"OSD placement restore failed because overlay initialization failed");
         return false;
     }
 
     const POINT applied = overlay.Position();
-    if (preference.has_position) {
+    if (saved) {
         logging::Info(std::format(
-            L"OSD placement restored; saved=({}, {}) applied=({}, {}) repaired={}",
-            preference.x, preference.y, applied.x, applied.y, placement_repaired));
+            L"OSD placement restored; collapsed={} saved=({}, {}) applied=({}, {}) repaired={}",
+            preference.collapsed, saved->x, saved->y, applied.x, applied.y,
+            placement_repaired));
     } else {
         logging::Info(std::format(
             L"OSD placement initialized from default; applied=({}, {})",
@@ -137,10 +189,377 @@ bool RestoreOsdWindowPosition(HWND notification_window,
     return true;
 }
 
+// One EXE serves both downloads (AF-20261006-overlay-default-on): the
+// overlay exists only when gtg_overlay.dll is beside the executable. Asked
+// once; adding the DLL takes a restart.
+bool OverlayDllPresent() noexcept {
+#ifdef GTG_FEATURE_OVERLAY
+    static const bool present = [] {
+        wchar_t path[MAX_PATH * 2]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
+        if (length == 0 || length >= std::size(path)) return false;
+        std::wstring dll(path, length);
+        const auto slash = dll.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) return false;
+        dll.resize(slash + 1);
+        dll += L"gtg_overlay.dll";
+        const DWORD attributes = GetFileAttributesW(dll.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+               (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }();
+    return present;
+#else
+    return false;
+#endif
+}
+
+// Without the overlay its controls are not shown at all: a checkbox that
+// cannot do anything is worse than none.
+void HideOverlayControls(const HWND dialog) noexcept {
+    for (const int id : {IDC_OVERLAY_ENABLED, IDC_OVERLAY_AUTO_SDR, IDC_OVERLAY_HOTKEY})
+        if (const HWND control = ::GetDlgItem(dialog, id)) ::ShowWindow(control, SW_HIDE);
+}
+
+// The program a play-time count belongs to: its executable, so a game that
+// is restarted carries on. FNV-1a over the lower-cased path; 0 when the path
+// cannot be read, which counts nothing rather than guessing. Cached for the
+// one target it was last asked about -- the target changes rarely and the
+// question is asked twice a second.
+std::optional<std::uint64_t> ProgramKey(const fps::Identity& identity) {
+    static fps::Identity cached_identity{};
+    static std::uint64_t cached_key{};
+    if (identity == cached_identity) {
+        return cached_key != 0 ? std::optional<std::uint64_t>{cached_key} : std::nullopt;
+    }
+    cached_identity = identity;
+    cached_key = 0;
+    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, identity.pid)) {
+        wchar_t path[MAX_PATH * 2]{};
+        DWORD length = static_cast<DWORD>(std::size(path));
+        if (QueryFullProcessImageNameW(process, 0, path, &length) != FALSE && length != 0) {
+            std::uint64_t hash = 14695981039346656037ULL;
+            for (DWORD k = 0; k < length; ++k) {
+                hash ^= static_cast<std::uint64_t>(towlower(path[k]));
+                hash *= 1099511628211ULL;
+            }
+            cached_key = hash == 0 ? 1 : hash;
+        }
+        CloseHandle(process);
+    }
+    return cached_key != 0 ? std::optional<std::uint64_t>{cached_key} : std::nullopt;
+}
+
+// A key's name as the keyboard layout spells it: "F10", "O", "Page Up".
+std::wstring KeyName(const UINT vk) {
+    const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+    LONG lparam = static_cast<LONG>((scan & 0xFFU) << 16);
+    // The navigation keys share scan codes with the numeric keypad; without
+    // the extended bit "Page Up" is named "Num 9".
+    switch (vk) {
+    case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME: case VK_LEFT: case VK_UP:
+    case VK_RIGHT: case VK_DOWN: case VK_INSERT: case VK_DELETE: case VK_DIVIDE:
+        lparam |= 1L << 24;
+        break;
+    default:
+        if ((scan & 0xFF00U) == 0xE000U) lparam |= 1L << 24;
+        break;
+    }
+    wchar_t name[64]{};
+    if (scan != 0 && GetKeyNameTextW(lparam, name, static_cast<int>(std::size(name))) > 0)
+        return name;
+    return std::format(L"VK {:#04x}", vk);
+}
+
+// The keys of a combination in the order PowerToys shows them. Modifier names
+// are fixed English words, as on the keycaps, in either UI language.
+std::vector<std::wstring> HotkeyParts(const settings::OverlayHotkey& hotkey) {
+    std::vector<std::wstring> parts;
+    if ((hotkey.modifiers & MOD_WIN) != 0) parts.emplace_back(L"Win");
+    if ((hotkey.modifiers & MOD_CONTROL) != 0) parts.emplace_back(L"Ctrl");
+    if ((hotkey.modifiers & MOD_ALT) != 0) parts.emplace_back(L"Alt");
+    if ((hotkey.modifiers & MOD_SHIFT) != 0) parts.emplace_back(L"Shift");
+    if (hotkey.key != 0) parts.push_back(KeyName(hotkey.key));
+    return parts;
+}
+
+std::wstring HotkeyText(const settings::OverlayHotkey& hotkey) {
+    std::wstring text;
+    for (const auto& part : HotkeyParts(hotkey)) {
+        if (!text.empty()) text += L"+";
+        text += part;
+    }
+    return text;
+}
+
+// Whether Windows or another program already holds the combination, asked
+// the way PowerToys asks: register it for a moment and let it go.
+bool HotkeyTaken(const settings::OverlayHotkey& hotkey) noexcept {
+#ifdef GTG_FEATURE_OVERLAY
+    const auto current = overlay::integration::GetStatus();
+    if (current.enabled && current.modifiers == hotkey.modifiers && current.key == hotkey.key)
+        return false;
+#endif
+    constexpr int kProbeId = 0x0FFF;
+    if (RegisterHotKey(nullptr, kProbeId, hotkey.modifiers | MOD_NOREPEAT, hotkey.key) != FALSE) {
+        UnregisterHotKey(nullptr, kProbeId);
+        return false;
+    }
+    return GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED;
+}
+
+// Choosing the in-game overlay's hotkey, after PowerToys' shortcut dialog.
+//
+// Keys are read by a low-level keyboard hook that exists only while this
+// dialog is open and acts only while it is the foreground window. It swallows
+// what it records, so Alt does not open a menu, F10 does not activate one and
+// Win does not open Start. The system hotkey control this replaces drew its
+// own empty text in the Windows display language ("無" under an English UI)
+// and flickered under the dark theme.
+//
+// The overlay itself is not in this build (it lands with
+// feature/overlay-remote-load), so the choice is stored and nothing is
+// registered; the note says so.
+class OverlayHotkeyDialog final : public ATL::CDialogImpl<OverlayHotkeyDialog> {
+public:
+    enum { IDD = IDD_OVERLAY_HOTKEY };
+
+    explicit OverlayHotkeyDialog(const settings::OverlayHotkey hotkey) : hotkey_(hotkey) {}
+    [[nodiscard]] settings::OverlayHotkey hotkey() const noexcept { return hotkey_; }
+
+    BEGIN_MSG_MAP(OverlayHotkeyDialog)
+        MESSAGE_HANDLER(WM_INITDIALOG, OnInitDialog)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_DRAWITEM, OnDrawItem)
+        COMMAND_ID_HANDLER(IDOK, OnOk)
+        COMMAND_ID_HANDLER(IDCANCEL, OnCancel)
+        COMMAND_ID_HANDLER(IDC_HOTKEY_DEFAULT, OnDefault)
+    END_MSG_MAP()
+
+private:
+    LRESULT OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
+        SetWindowTextW(localization::Select(L"Overlay 熱鍵", L"Overlay Hotkey").data());
+        SetDlgItemTextW(IDC_HOTKEY_PROMPT,
+            localization::Select(L"按下要顯示遊戲內 Overlay 的組合鍵。",
+                                 L"Press the key combination that shows the in-game overlay.")
+                .data());
+        SetDlgItemTextW(IDC_HOTKEY_DEFAULT, localization::Select(L"預設", L"Default").data());
+        SetDlgItemTextW(IDOK, localization::Select(L"保存", L"Save").data());
+        SetDlgItemTextW(IDCANCEL, localization::Select(L"取消", L"Cancel").data());
+        capture_.Show(hotkey_);
+        theme::AttachDialog(m_hWnd);
+        theme::Repaint(m_hWnd);
+        active_ = this;
+        hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0);
+        if (hook_ == nullptr) {
+            hook_error_ = GetLastError();
+            logging::Warning(std::format(L"hotkey capture unavailable; SetWindowsHookEx error={}",
+                                         hook_error_));
+        }
+        Refresh();
+        return TRUE;
+    }
+
+    LRESULT OnDestroy(UINT, WPARAM, LPARAM, BOOL& handled) {
+        if (hook_ != nullptr) UnhookWindowsHookEx(hook_);
+        hook_ = nullptr;
+        active_ = nullptr;
+        handled = FALSE;
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT, const WPARAM state, LPARAM, BOOL& handled) {
+        // Keys released while another window had the keyboard never reach the
+        // hook's "while foreground" path, so nothing may stay held.
+        if (LOWORD(state) == WA_INACTIVE) {
+            capture_.ReleaseModifiers();
+            Refresh();
+        }
+        handled = FALSE;
+        return 0;
+    }
+
+    static LRESULT CALLBACK KeyboardHook(const int code, const WPARAM message,
+                                         const LPARAM data) {
+        OverlayHotkeyDialog* dialog = active_;
+        if (code == HC_ACTION && dialog != nullptr && dialog->m_hWnd != nullptr &&
+            GetForegroundWindow() == dialog->m_hWnd) {
+            const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
+            const bool injected = (key->flags & LLKHF_INJECTED) != 0;
+            if (!injected && !hotkey::PassesThrough(key->vkCode, dialog->capture_.Held())) {
+                const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+                if (down) dialog->capture_.KeyDown(key->vkCode);
+                else dialog->capture_.KeyUp(key->vkCode);
+                dialog->Refresh();
+                return 1;   // recorded, so not also delivered
+            }
+        }
+        return CallNextHookEx(nullptr, code, message, data);
+    }
+
+    // The note, the Save button and the keycaps, from the capture's state.
+    void Refresh() {
+        const settings::OverlayHotkey shown = capture_.Shown();
+        verdict_ = capture_.Judge();
+        taken_ = false;
+        if (verdict_ == hotkey::Verdict::Acceptable) {
+            // Probed only when the combination changes, not on every key-up.
+            if (!(probed_ == shown)) {
+                probed_ = shown;
+                probed_taken_ = HotkeyTaken(shown);
+            }
+            taken_ = probed_taken_;
+        }
+        const auto text = [](const wchar_t* zh, const wchar_t* en) {
+            return std::wstring(localization::Select(zh, en));
+        };
+        std::wstring note;
+        if (hook_ == nullptr) {
+            note = localization::Format(L"無法讀取按鍵（Win32 {}）。",
+                                        L"Keys cannot be read (Win32 {}).", hook_error_);
+        } else if (taken_) {
+            note = text(L"這個組合已被 Windows 或其他程式使用。",
+                        L"Windows or another program already uses this combination.");
+        } else {
+            switch (verdict_) {
+            case hotkey::Verdict::Empty:
+                note = text(L"按下組合鍵，例如 Alt+F10。",
+                            L"Press a combination, for example Alt+F10.");
+                break;
+            case hotkey::Verdict::Incomplete:
+                note = text(L"再按一個鍵。", L"Now press a key.");
+                break;
+            case hotkey::Verdict::NeedsModifier:
+                note = text(L"需要 Ctrl、Alt、Shift 或 Win。",
+                            L"Needs Ctrl, Alt, Shift or Win.");
+                break;
+            case hotkey::Verdict::Reserved:
+                note = text(L"F12 由 Windows 保留給偵錯工具，不能使用。",
+                            L"Windows reserves F12 for debuggers; it cannot be used.");
+                break;
+            case hotkey::Verdict::Acceptable:
+#ifdef GTG_FEATURE_OVERLAY
+                note = text(L"啟用 Overlay 後，熱鍵會對目前前景程式啟用或隱藏 OSD。DLL 留存至遊戲退出。",
+                            L"When enabled, the hotkey attaches or toggles the foreground app's OSD. "
+                            L"The DLL remains loaded until the game exits.");
+#else
+                note = text(
+                    L"遊戲內 Overlay 尚未包含在這個版本；設定會先保存，在它加入之前不會註冊任何熱鍵。",
+                    L"The in-game overlay is not in this build yet. The choice is saved; no "
+                    L"hotkey is registered until it is.");
+#endif
+                break;
+            }
+        }
+        SetDlgItemTextW(IDC_HOTKEY_NOTE, note.c_str());
+        ::EnableWindow(GetDlgItem(IDOK), verdict_ == hotkey::Verdict::Acceptable && !taken_);
+        // No erase: the owner-drawn preview paints every pixel itself.
+        ::InvalidateRect(GetDlgItem(IDC_HOTKEY_EDIT), nullptr, FALSE);
+    }
+
+    // The combination as keycaps, drawn off-screen and copied once so the
+    // control never shows a half-painted frame.
+    LRESULT OnDrawItem(UINT, WPARAM, const LPARAM data, BOOL& handled) {
+        const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(data);
+        if (item == nullptr || item->CtlID != IDC_HOTKEY_EDIT) {
+            handled = FALSE;
+            return 0;
+        }
+        const RECT bounds = item->rcItem;
+        const int width = bounds.right - bounds.left;
+        const int height = bounds.bottom - bounds.top;
+        HDC memory = CreateCompatibleDC(item->hDC);
+        HBITMAP bitmap = CreateCompatibleBitmap(item->hDC, width, height);
+        const HGDIOBJ previous_bitmap = SelectObject(memory, bitmap);
+        const HGDIOBJ previous_font = SelectObject(memory, GetFont());
+        RECT local{0, 0, width, height};
+        HBRUSH background = CreateSolidBrush(theme::DialogBackground());
+        FillRect(memory, &local, background);
+        DeleteObject(background);
+
+        const bool rejected = taken_ || verdict_ == hotkey::Verdict::NeedsModifier ||
+                              verdict_ == hotkey::Verdict::Reserved;
+        const bool complete = capture_.Complete();
+        const COLORREF accent = theme::Accent(RGB(37, 103, 184));
+        const COLORREF fill = rejected ? RGB(196, 43, 28) : accent;
+        const COLORREF ink = rejected || !theme::IsDark() ? RGB(255, 255, 255) : RGB(16, 24, 40);
+        const int dpi = static_cast<int>(GetDpiForWindow(m_hWnd));
+        const int pad = MulDiv(10, dpi, 96);
+        const int gap = MulDiv(6, dpi, 96);
+        const int radius = MulDiv(8, dpi, 96);
+        SetBkMode(memory, TRANSPARENT);
+        int x = 0;
+        for (const auto& part : HotkeyParts(capture_.Shown())) {
+            SIZE extent{};
+            GetTextExtentPoint32W(memory, part.c_str(), static_cast<int>(part.size()), &extent);
+            RECT cap{x, 0, x + extent.cx + pad * 2, height};
+            if (cap.right > width) break;
+            HBRUSH brush = CreateSolidBrush(fill);
+            // A modifier still waiting for its key is drawn as an outline.
+            HPEN pen = CreatePen(PS_SOLID, MulDiv(1, dpi, 96), fill);
+            const HGDIOBJ previous_brush = SelectObject(
+                memory, complete ? static_cast<HGDIOBJ>(brush) : GetStockObject(NULL_BRUSH));
+            const HGDIOBJ previous_pen = SelectObject(memory, pen);
+            RoundRect(memory, cap.left, cap.top, cap.right, cap.bottom, radius, radius);
+            SelectObject(memory, previous_pen);
+            SelectObject(memory, previous_brush);
+            DeleteObject(pen);
+            DeleteObject(brush);
+            SetTextColor(memory, complete ? ink : theme::Text());
+            DrawTextW(memory, part.c_str(), static_cast<int>(part.size()), &cap,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            x = cap.right + gap;
+        }
+        BitBlt(item->hDC, bounds.left, bounds.top, width, height, memory, 0, 0, SRCCOPY);
+        SelectObject(memory, previous_font);
+        SelectObject(memory, previous_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+        return TRUE;
+    }
+
+    LRESULT OnOk(WORD, WORD, HWND, BOOL&) {
+        if (verdict_ != hotkey::Verdict::Acceptable || taken_) {
+            MessageBeep(MB_ICONWARNING);
+            return 0;
+        }
+        hotkey_ = capture_.Shown();
+        EndDialog(IDOK);
+        return 0;
+    }
+
+    LRESULT OnCancel(WORD, WORD, HWND, BOOL&) {
+        EndDialog(IDCANCEL);
+        return 0;
+    }
+
+    LRESULT OnDefault(WORD, WORD, HWND, BOOL&) {
+        capture_.Show(settings::kDefaultOverlayHotkey);
+        Refresh();
+        return 0;
+    }
+
+    // One modal dialog at a time; the hook has no other way to find it.
+    inline static OverlayHotkeyDialog* active_{nullptr};
+    settings::OverlayHotkey hotkey_;
+    hotkey::Capture capture_;
+    hotkey::Verdict verdict_{hotkey::Verdict::Empty};
+    settings::OverlayHotkey probed_{};
+    bool probed_taken_{};
+    bool taken_{};
+    HHOOK hook_{nullptr};
+    DWORD hook_error_{};
+};
+
 }  // namespace
 
 LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     localization::SetCurrent(settings::LoadUiLanguagePreference());
+    ui_theme_ = settings::LoadUiThemePreference();
+    overlay_hotkey_ = settings::LoadOverlayHotkey();
+    // Configured before any control paints, so a dark window never flashes
+    // light first.
+    (void)theme::Configure(ui_theme_);
     (void)EnableThemeDialogTexture(m_hWnd, ETDT_ENABLE);
     SetIcon(static_cast<HICON>(LoadImageW(ATL::_AtlBaseModule.GetResourceInstance(),
         MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR)), TRUE);
@@ -180,9 +599,46 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
                    settings::LoadCloseToTrayPreference() ? BST_CHECKED : BST_UNCHECKED);
     history_chart_.SubclassWindow(GetDlgItem(IDC_HISTORY));
     history_chart_.SetHistory(&telemetry_history_);
+    // After every control exists and after the chart's own subclass, as in the
+    // theme lab. The reading subclass goes on last so it runs first.
+    theme::AttachDialog(m_hWnd);
+    ::SetWindowSubclass(m_hWnd, ReadingColorSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+    CheckDlgButton(IDC_OVERLAY_ENABLED,
+                   settings::LoadOverlayEnabled() ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(IDC_OVERLAY_AUTO_SDR,
+                   settings::LoadOverlayAutoSdr() ? BST_CHECKED : BST_UNCHECKED);
+    tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                               WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
+                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, m_hWnd, nullptr,
+                               ATL::_AtlBaseModule.GetModuleInstance(), nullptr);
+    if (tooltip_ != nullptr) {
+        SendMessageW(tooltip_, TTM_SETMAXTIPWIDTH, 0, 360);
+        for (const int id : {IDC_OVERLAY_ENABLED, IDC_OVERLAY_HOTKEY, IDC_OVERLAY_AUTO_SDR}) {
+            TTTOOLINFOW tool{sizeof(tool)};
+            tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            tool.hwnd = m_hWnd;
+            tool.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(id).m_hWnd);
+            tool.lpszText = LPSTR_TEXTCALLBACKW;
+            SendMessageW(tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+        }
+    }
+    ApplyUiTheme();
+    // Everything that decides the dashboard's width is in place before the
+    // saved position is applied. Restored with the default single row first,
+    // a saved single column docked on a right edge was clamped left to fit a
+    // row eight cells wide, and narrowing to the column afterwards kept the
+    // clamped X: the compact window reopened with Y right and X wrong.
+    // Before Initialize these setters only record state.
+    saved_compact_layout_ = compact::PackLayout(
+        compact::SanitizeLayout(settings::LoadCompactLayout()));
+    osd_overlay_.SetFpsEnabled(settings::LoadFpsEnabled());
+    osd_overlay_.SetNetEnabled(settings::LoadNetEnabled());
+    osd_overlay_.SetRamEnabled(settings::LoadRamEnabled());
+    osd_overlay_.SetCompactLayout(compact::SanitizeLayout(saved_compact_layout_));
     settings::OsdPreference osd_preference;
     osd_ready_ = RestoreOsdWindowPosition(
         m_hWnd, &telemetry_history_, osd_overlay_, osd_preference);
+    RefreshOsdScaleChoices();
     CheckDlgButton(IDC_OSD_ENABLED,
                    osd_ready_ && osd_preference.enabled ? BST_CHECKED : BST_UNCHECKED);
     show_fps_ = settings::LoadFpsEnabled();
@@ -209,14 +665,18 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     if (osd_ready_) osd_overlay_.SetRamEnabled(show_ram_);
     // The stored arrangement is validated before use: a value that is not a
     // permutation of every record is discarded whole for the default, so no
-    // registry content can hide a record.
-    saved_compact_layout_ = compact::PackLayout(
-        compact::SanitizeLayout(settings::LoadCompactLayout()));
+    // registry content can hide a record. Loaded above, before the OSD was
+    // placed.
     saved_compact_locked_ = settings::LoadCompactLocked();
     if (osd_ready_) {
         osd_overlay_.SetCompactLayout(
             compact::SanitizeLayout(saved_compact_layout_));
         osd_overlay_.SetCompactLocked(saved_compact_locked_);
+        // The placement the reader actually sees once startup has applied
+        // every setting; it must equal the "applied" position logged above.
+        const POINT settled = osd_overlay_.Position();
+        logging::Info(std::format(L"OSD placement settled; position=({}, {})",
+                                  settled.x, settled.y));
     }
     taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
     activate_message_ = RegisterWindowMessageW(L"GpuThermalGuard.Activate.v1");
@@ -246,15 +706,35 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
         logging::Path().wstring()));
     RefreshSnapshot();
     if (osd_ready_ && osd_preference.enabled) osd_overlay_.SetVisible(true);
+#ifdef GTG_FEATURE_OVERLAY
+    if (!OverlayDllPresent()) {
+        HideOverlayControls(m_hWnd);
+        logging::Info(L"overlay unavailable: gtg_overlay.dll is not beside the executable; "
+                      L"overlay controls hidden, no hotkey registered");
+    } else if (!overlay::integration::Configure(settings::LoadOverlayEnabled(),
+                                                overlay_hotkey_.modifiers, overlay_hotkey_.key)) {
+        CheckDlgButton(IDC_OVERLAY_ENABLED, BST_UNCHECKED);
+        logging::Warning(L"Overlay unavailable: OSD initialization or hotkey registration failed");
+        SetStatus(localization::Select(L"Overlay 熱鍵無法註冊；請更換組合鍵。",
+                                       L"Overlay hotkey unavailable; choose another shortcut."),
+                  StatusVisual::Warning);
+    }
+#else
+    HideOverlayControls(m_hWnd);
+#endif
     if (!loaded_settings.warning.empty()) {
         SetStatus(loaded_settings.warning, StatusVisual::Warning);
     }
     SetTimer(kRefreshTimer, kRefreshIntervalMs);
     PostMessageW(kInitializeTrayMessage);
+#ifdef GTG_FEATURE_OVERLAY
+    PostMessageW(kFeatureNoticeMessage);
+#endif
     return TRUE;
 }
 
 LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
+    timing::SlowUiScope timer_phase(L"main.timer");
     PollApplyCompletion();
     if (id == kRefreshTimer) {
         const auto now = static_cast<std::uint64_t>(GetTickCount64());
@@ -264,6 +744,7 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
         RefreshSnapshot();
         UpdateWallTime();
         if (now - last_fps_refresh_ms_ >= 500) {
+            timing::SlowUiScope fps_phase(L"main.fps.refresh");
             last_fps_refresh_ms_ = now;
             if (show_fps_) {
                 const auto target = fps::ForegroundCandidate();
@@ -284,8 +765,16 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
                 const auto matched = target && observed.identity == *target
                     ? observed : fps::Snapshot{};
                 fps_history_.Record(now, target, matched);
+                // Only a stable reading counts as play time (play_clock.hpp).
+                fps_history_.TickPlayClock(now,
+                    matched.status == fps::Status::Ready ? ProgramKey(matched.identity)
+                                                         : std::nullopt);
                 history_chart_.NotifyDataChanged();
-                if (osd_ready_ && osd_overlay_.Visible())
+                if (osd_ready_ && (osd_overlay_.Visible()
+#ifdef GTG_FEATURE_OVERLAY
+                                  || overlay::integration::GetStatus().enabled
+#endif
+                                  ))
                     osd_overlay_.SetFpsSnapshot(matched);
             } else {
                 fps_observer_.SetTarget(std::nullopt);
@@ -303,6 +792,7 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
         // a duty cycle of 0.01 % here and nothing at all on the protection
         // worker, which this timer is not.
         if (show_net_ && now != last_net_sample_ms_) {
+            timing::SlowUiScope phase(L"main.net.refresh");
             last_net_sample_ms_ = now;
             if (const auto counters = net_sampler_.Read(now)) {
                 net_history_.Record(now, *counters);
@@ -314,6 +804,7 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
             }
         }
         if (show_ram_ && now != last_ram_sample_ms_) {
+            timing::SlowUiScope phase(L"main.ram.refresh");
             last_ram_sample_ms_ = now;
             ram_history_.Record(now, sysmem::Query());
             // Windows decides what "low" means; we only pass its answer on.
@@ -381,6 +872,7 @@ LRESULT MainDialog::OnDestroy(UINT, WPARAM, LPARAM, BOOL&) {
 LRESULT MainDialog::OnThemeChanged(UINT, WPARAM, LPARAM, BOOL&) {
     (void)EnableThemeDialogTexture(m_hWnd, ETDT_ENABLE);
     RedrawWindow(nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    PostMessageW(kReloadSnapshotIconMessage);
     return 0;
 }
 
@@ -421,6 +913,7 @@ LRESULT MainDialog::OnDpiChanged(UINT, const WPARAM dpi, const LPARAM suggested,
 }
 
 LRESULT MainDialog::OnDisplayConfigurationChanged(UINT, WPARAM, LPARAM, BOOL&) {
+    timing::SlowUiScope phase(L"main.display-change");
     // The other half of the picture: a mode change that produced no
     // WM_DPICHANGED at all would show up here and nowhere else.
     RECT bounds{};
@@ -471,10 +964,54 @@ LRESULT MainDialog::OnCtlColorStatic(UINT, WPARAM wparam, LPARAM lparam, BOOL& h
     }
 
     HDC dc = reinterpret_cast<HDC>(wparam);
-    SetTextColor(dc, text_color);
-    SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
+    // Neutral is the theme's text; every accent is lifted for a dark
+    // background. In classic both are exactly the colours above.
+    SetTextColor(dc, theme::IsDark() && status_visual_ == StatusVisual::Neutral &&
+                             control_id == IDC_STATUS
+                         ? theme::Text()
+                         : theme::Accent(text_color));
+    SetBkColor(dc, theme::DialogBackground());
     SetBkMode(dc, OPAQUE);
-    return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+    return reinterpret_cast<LRESULT>(theme::DialogBackgroundBrush());
+}
+
+LRESULT CALLBACK MainDialog::ReadingColorSubclass(HWND window, const UINT message,
+                                                  const WPARAM wparam, const LPARAM lparam,
+                                                  const UINT_PTR id, const DWORD_PTR data) {
+    auto* dialog = reinterpret_cast<MainDialog*>(data);
+    // Only while dark: in classic darkmodelib passes the message through and
+    // the dialog's own map answers it as it always has.
+    if (message == WM_CTLCOLORSTATIC && theme::IsDark()) {
+        BOOL handled = TRUE;
+        const LRESULT brush = dialog->OnCtlColorStatic(message, wparam, lparam, handled);
+        if (handled) return brush;
+    } else if (message == WM_NOTIFY &&
+               reinterpret_cast<const NMHDR*>(lparam)->code == TTN_GETDISPINFOW) {
+        // The overlay controls' tooltip, built when shown so it names the
+        // current hotkey in the current language.
+        auto* info = reinterpret_cast<NMTTDISPINFOW*>(lparam);
+        if (info->hdr.idFrom == reinterpret_cast<UINT_PTR>(dialog->GetDlgItem(IDC_OVERLAY_AUTO_SDR).m_hWnd)) {
+            dialog->tooltip_text_ = localization::Select(
+                L"勾選：新 Overlay 工作階段以 SDR 解讀，不詢問。取消：顯示色彩策略選擇器。HDR 支援有限；這不是 HDR 偵測，錯誤解讀可能影響亮度與顏色。已注入的工作階段不會改變。",
+                L"Checked: new overlay sessions assume SDR without asking. Unchecked: show the color selector. HDR support is limited; this is not HDR detection and may give incorrect brightness/colors. Existing injected sessions are unchanged.");
+            info->lpszText = dialog->tooltip_text_.data();
+            return 0;
+        }
+        dialog->tooltip_text_ = localization::Format(
+#ifdef GTG_FEATURE_OVERLAY
+            L"遊戲內 Overlay（D3D11／D3D12）。熱鍵：{}。對前景程式啟用／隱藏；DLL 留存至遊戲退出。",
+            L"In-game overlay (D3D11/D3D12). Hotkey: {}. Attaches to or toggles the foreground game; the DLL stays until the game exits.",
+#else
+            L"遊戲內 Overlay 尚未包含在這個版本；設定會先保存。熱鍵：{}",
+            L"The in-game overlay is not in this build yet; the setting is saved. Hotkey: {}",
+#endif
+            HotkeyText(dialog->overlay_hotkey_));
+        info->lpszText = dialog->tooltip_text_.data();
+        return 0;
+    } else if (message == WM_NCDESTROY) {
+        ::RemoveWindowSubclass(window, ReadingColorSubclass, id);
+    }
+    return ::DefSubclassProc(window, message, wparam, lparam);
 }
 
 LRESULT MainDialog::OnDrawItem(UINT, WPARAM, const LPARAM lparam, BOOL& handled) {
@@ -486,18 +1023,27 @@ LRESULT MainDialog::OnDrawItem(UINT, WPARAM, const LPARAM lparam, BOOL& handled)
     }
 
     const bool selected = (item->itemState & ODS_SELECTED) != 0;
+    timing::SlowUiScope phase(L"main.save-button.draw");
+    const int saved_dc = SaveDC(item->hDC);
+    if (!saved_dc) { handled = FALSE; return 0; }
+    // Owner draw must also repaint the pixels outside its rounded outline.
+    FillRect(item->hDC, &item->rcItem, theme::DialogBackgroundBrush());
+    const auto font = reinterpret_cast<HFONT>(::SendMessageW(item->hwndItem, WM_GETFONT, 0, 0));
+    if (font) SelectObject(item->hDC, font);
     const bool disabled = (item->itemState & ODS_DISABLED) != 0;
+    // The dirty state is the same orange in both themes: it is a warning,
+    // and it reads on either background. Clean follows the theme.
     const COLORREF fill = settings_dirty_
         ? (selected ? RGB(205, 132, 18) : RGB(244, 172, 54))
-        : (selected ? GetSysColor(COLOR_3DSHADOW) : GetSysColor(COLOR_BTNFACE));
-    const COLORREF border = settings_dirty_ ? RGB(176, 104, 0)
-                                            : GetSysColor(COLOR_BTNSHADOW);
+        : (selected ? theme::HotBackground() : theme::ControlBackground());
+    const COLORREF border = settings_dirty_ ? RGB(176, 104, 0) : theme::Edge();
     HBRUSH brush = CreateSolidBrush(fill);
     HPEN pen = CreatePen(PS_SOLID, 1, border);
     const HGDIOBJ previous_brush = SelectObject(item->hDC, brush);
     const HGDIOBJ previous_pen = SelectObject(item->hDC, pen);
+    const int diameter = ButtonCornerDiameter(GetDpiForWindow(item->hwndItem));
     RoundRect(item->hDC, item->rcItem.left, item->rcItem.top,
-              item->rcItem.right, item->rcItem.bottom, 6, 6);
+              item->rcItem.right, item->rcItem.bottom, diameter, diameter);
     SelectObject(item->hDC, previous_pen);
     SelectObject(item->hDC, previous_brush);
     DeleteObject(pen);
@@ -506,18 +1052,20 @@ LRESULT MainDialog::OnDrawItem(UINT, WPARAM, const LPARAM lparam, BOOL& handled)
     wchar_t label[128]{};
     ::GetWindowTextW(item->hwndItem, label, static_cast<int>(_countof(label)));
     SetBkMode(item->hDC, TRANSPARENT);
-    SetTextColor(item->hDC, disabled ? GetSysColor(COLOR_GRAYTEXT)
-                                    : (settings_dirty_ ? RGB(45, 31, 8)
-                                                       : GetSysColor(COLOR_BTNTEXT)));
+    SetTextColor(item->hDC, disabled ? theme::DisabledText()
+                                    : (settings_dirty_ ? RGB(45, 31, 8) : theme::Text()));
     RECT text_rect = item->rcItem;
     if (selected) OffsetRect(&text_rect, 1, 1);
+    // Prefix processing on, as a push button does it: the label is written
+    // "Save && Apply" so both of its looks show one ampersand.
     DrawTextW(item->hDC, label, -1, &text_rect,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_HIDEPREFIX);
     if ((item->itemState & ODS_FOCUS) != 0) {
         RECT focus = item->rcItem;
         InflateRect(&focus, -3, -3);
         DrawFocusRect(item->hDC, &focus);
     }
+    RestoreDC(item->hDC, saved_dc);
     return TRUE;
 }
 
@@ -528,6 +1076,28 @@ LRESULT MainDialog::OnTrayMessage(UINT, WPARAM, LPARAM event, BOOL&) {
     case WM_RBUTTONUP: ShowTrayMenu(); break;
     default: break;
     }
+    return 0;
+}
+
+LRESULT MainDialog::OnFeatureNotice(UINT, WPARAM, LPARAM, BOOL&) {
+#ifdef GTG_FEATURE_OVERLAY
+    if (!OverlayDllPresent()) return 0;   // nothing to announce without the DLL
+    if (feature_notice_attempted_) return 0;
+    feature_notice_attempted_ = true;
+    std::uint32_t seen{};
+    const bool valid = settings::LoadFeatureNoticeSerial(seen);
+    if (!settings::NeedsFeatureNotice(valid, seen)) return 0;
+    const int result = MessageBoxW(localization::Select(
+        L"新增遊戲 Overlay 與可自訂熱鍵。\n\nOverlay 預設啟用（保留已儲存的關閉選擇），不會自動注入。遊戲在前景時按預設 ALT+F10。自動 SDR 預設勾選，不詢問；取消勾選才顯示色彩策略選擇器。同一行程後續按熱鍵切換顯示。\n\nSDR 解讀不是 HDR 偵測；HDR 支援有限，錯誤解讀可能影響亮度與顏色。已注入的策略不會改變。DLL 留到遊戲退出；隱藏不會卸載。GTG 溫度保護核心獨立運作。\n\n按確定記錄已讀；取消則下次啟動再提示。",
+        L"New: game overlay and a customizable hotkey.\n\nOverlay is enabled by default (saved Off choices are respected); there is no automatic injection. Foreground the game and press default ALT+F10. Auto SDR is checked by default and skips the prompt; uncheck it to show the color selector. Later presses toggle visibility for that process.\n\nSDR interpretation is not HDR detection. HDR support is limited; incorrect interpretation may affect brightness/colors. Existing injected policies are unchanged. The DLL stays until game exit; hiding does not unload it. Thermal protection remains independent.\n\nOK acknowledges this feature notice; Cancel leaves it for the next startup.").data(),
+        localization::Select(L"GPU Thermal Guard — 新功能", L"GPU Thermal Guard — What's new").data(),
+        MB_OKCANCEL | MB_ICONINFORMATION);
+    if (result == IDOK) {
+        std::wstring error;
+        if (!settings::SaveFeatureNoticeSerial(settings::kFeatureNoticeSerial, error))
+            logging::Warning(error);
+    }
+#endif
     return 0;
 }
 
@@ -593,10 +1163,12 @@ LRESULT MainDialog::OnCaptureSnapshot(UINT, WPARAM, LPARAM, BOOL&) {
 
 LRESULT MainDialog::OnReloadSnapshotIcon(UINT, WPARAM, LPARAM, BOOL&) {
     ReloadSnapshotIcon();
+    AlignSettingsEdits(m_hWnd);
     return 0;
 }
 
 LRESULT MainDialog::OnRepairMainPlacement(UINT, WPARAM, LPARAM, BOOL&) {
+    timing::SlowUiScope phase(L"main.placement.repair");
     if (FitMainWindowToWorkArea()) {
         SaveMainWindowPosition();
         logging::Info(L"main window placement repaired to a visible monitor work area");
@@ -987,6 +1559,54 @@ LRESULT MainDialog::OnFpsToggle(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 
+namespace {
+
+// The sizes offered, in hundredths, with 0 for "follow the display".
+//
+// It reaches below 1.0 deliberately. The case that prompted this setting was
+// 4K at 100 %, where the dashboard is 16 % of the screen width and too small;
+// but 1080p at 100 % puts the same dashboard at 32 %, and that reader needs
+// the other direction. A list that only climbs serves half of them.
+constexpr int kOsdScaleChoices[] = {0, 75, 100, 125, 150, 175, 200, 250};
+
+int OsdScaleIndexOf(const int stored) noexcept {
+    for (std::size_t i = 0; i < std::size(kOsdScaleChoices); ++i) {
+        if (kOsdScaleChoices[i] == stored) return static_cast<int>(i);
+    }
+    // A value this build does not offer -- written by a later version, or by
+    // hand -- shows as Auto, which is also how it is being drawn.
+    return 0;
+}
+
+}  // namespace
+
+LRESULT MainDialog::OnOsdScaleDropDown(WORD, WORD, HWND, BOOL&) {
+    // The overlay may have been dragged to another display since the dialog
+    // was built, so what Auto means may have changed. This is the moment it
+    // is about to be read.
+    RefreshOsdScaleChoices();
+    return 0;
+}
+
+LRESULT MainDialog::OnOsdScaleChanged(WORD, WORD, HWND, BOOL&) {
+    const LRESULT selection = SendDlgItemMessageW(IDC_OSD_SCALE, CB_GETCURSEL, 0, 0);
+    if (selection < 0 ||
+        static_cast<std::size_t>(selection) >= std::size(kOsdScaleChoices)) {
+        return 0;
+    }
+    const int chosen = kOsdScaleChoices[selection];
+    // Applied before it is stored: the overlay is on screen while this combo
+    // is in use, so the reader judges the choice by looking at it rather than
+    // by pressing Save & Apply. The other OSD controls on this row behave the
+    // same way.
+    osd_overlay_.SetScalePercent(chosen);
+    std::wstring error;
+    if (!settings::SaveOsdScale(chosen, error)) {
+        logging::Warning(error);
+    }
+    return 0;
+}
+
 LRESULT MainDialog::OnLanguageChanged(WORD, WORD, HWND, BOOL&) {
     const LRESULT selection = SendDlgItemMessageW(IDC_LANGUAGE, CB_GETCURSEL, 0, 0);
     if (selection == CB_ERR) return 0;
@@ -1226,6 +1846,7 @@ void MainDialog::RevealProtectionWithoutActivation() {
 }
 
 void MainDialog::RefreshSnapshot() {
+    timing::SlowUiScope phase(L"main.snapshot.refresh");
     if (!nvml_ready_) {
         if (!service_connected_) HandleLocalProtection();
         if (!gpu_unavailable_logged_) {
@@ -1235,7 +1856,10 @@ void MainDialog::RefreshSnapshot() {
         RenderUnavailable(Utf8ToWide(nvml_.last_error()));
         return;
     }
-    const auto devices = nvml_.ProbeDevices();
+    const auto devices = [&] {
+        timing::SlowUiScope probe_phase(L"main.nvml.probe");
+        return nvml_.ProbeDevices();
+    }();
     if (devices.empty()) {
         if (!service_connected_) HandleLocalProtection();
         if (!gpu_unavailable_logged_) {
@@ -1263,7 +1887,11 @@ void MainDialog::RefreshSnapshot() {
     }
     RenderSnapshot(*selected);
     ipc::Response service_response{};
-    if (ipc::Send(ipc::Command::Query, service_response)) {
+    const bool queried = [&] {
+        timing::SlowUiScope query_phase(L"main.service.query");
+        return ipc::Send(ipc::Command::Query, service_response);
+    }();
+    if (queried) {
         // In Service mode the supervisor observes transport availability only;
         // service recovery itself remains owned by SCM.
         supervision::ReportHealth(true, false);
@@ -1403,6 +2031,7 @@ void MainDialog::ApplyFirstRunDefaults(const nvml::DeviceSnapshot& s) {
 }
 
 void MainDialog::RenderSnapshot(const nvml::DeviceSnapshot& s) {
+    timing::SlowUiScope phase(L"main.snapshot.render");
     minimum_power_limit_mw_ = s.minimum_power_limit_mw;
     maximum_power_limit_mw_ = s.maximum_power_limit_mw;
     if (first_run_ && !first_run_defaults_applied_) ApplyFirstRunDefaults(s);
@@ -1461,6 +2090,7 @@ void MainDialog::RenderSnapshot(const nvml::DeviceSnapshot& s) {
 }
 
 void MainDialog::HandleLocalProtection() {
+    timing::SlowUiScope phase(L"main.protection.presentation");
     const auto snapshot = local_protection_.Snapshot();
     if (trigger_count_ != snapshot.trigger_count) {
         trigger_count_ = snapshot.trigger_count;
@@ -1469,6 +2099,7 @@ void MainDialog::HandleLocalProtection() {
 
     if (snapshot.trip_sequence > last_local_trip_sequence_) {
         last_local_trip_sequence_ = snapshot.trip_sequence;
+        history_chart_.AddTripMarker(GetTickCount64());
         restore_prompt_gate_.Reset();
         RequestUiSnapshot(snapshot::Reason::ThermalTrigger);
         RevealProtectionWithoutActivation();
@@ -1605,6 +2236,7 @@ void MainDialog::HandleLocalProtection() {
 
 void MainDialog::JournalSnapshot(const nvml::DeviceSnapshot& s,
                                  const ProtectionDecision* decision) {
+    timing::SlowUiScope phase(L"main.snapshot.journal");
     const auto now = static_cast<std::uint64_t>(GetTickCount64());
     if (now - last_journal_snapshot_ms_ < 5'000) return;
     last_journal_snapshot_ms_ = now;
@@ -1634,20 +2266,30 @@ void MainDialog::JournalSnapshot(const nvml::DeviceSnapshot& s,
         : (service_connected_
             ? L"ServiceOwned"
             : Utf8ToWide(ToString(local_protection_.Snapshot().state)));
-    logging::Info(std::format(
+    // Periodic telemetry must never wait on the shared sink mutex, disk or
+    // debugger. Queue-full drops this optional record, without a sync fallback.
+    (void)logging::TryInfo(std::format(
         L"snapshot temp_c={} power_w={} vram_used_gib={} vram_total_gib={} vram_pct={} "
-        L"gpu_load_pct={} cpu_load_pct={} limit_w={} state={}",
+        L"gpu_load_pct={} cpu_load_pct={} limit_w={} state={} sample_tick_ms={}",
         temperature, power, vram_used, vram_total, vram_percent, gpu_load, cpu_load,
-        limit, state));
+        limit, state, now));
 }
 
 void MainDialog::HandleServiceResponse(const ipc::Response& response) {
+    timing::SlowUiScope phase(L"main.service.presentation");
     const bool latched = (response.flags & ipc::SafeLatched) != 0;
     const bool ready = (response.flags & ipc::ReadyToRestore) != 0;
     const auto service_state = static_cast<ProtectionState>(response.protection_state);
     const bool newly_latched = previous_service_latched_.has_value() &&
                                !*previous_service_latched_ && latched;
     const bool newly_counted_trip = HasNewTriggerCount(trigger_count_, response.trigger_count);
+    // The first response can report trips the service counted while no UI was
+    // running; those happened at some earlier time, not now, so they get no
+    // marker on the curve.
+    if (previous_service_latched_.has_value() && (newly_counted_trip ||
+            (!*previous_service_latched_ && latched))) {
+        history_chart_.AddTripMarker(GetTickCount64());
+    }
     if (newly_counted_trip || service_state == ProtectionState::Armed) {
         restore_prompt_gate_.Reset();
     }
@@ -1765,6 +2407,7 @@ void MainDialog::ShowProtectionAlert(const wchar_t* title, const wchar_t* messag
 }
 
 void MainDialog::SetTrayVisual(UINT icon_id, const wchar_t* tooltip) {
+    timing::SlowUiScope phase(L"main.tray.visual");
     if (!tray_added_) return;
     if (icon_id == current_tray_icon_id_ && current_tray_tooltip_ == tooltip) return;
     tray_data_.uFlags = NIF_TIP | NIF_SHOWTIP | NIF_GUID;
@@ -1779,7 +2422,10 @@ void MainDialog::SetTrayVisual(UINT icon_id, const wchar_t* tooltip) {
     }
     wcsncpy_s(tray_data_.szTip, tooltip, _TRUNCATE);
     current_tray_tooltip_ = tray_data_.szTip;
-    Shell_NotifyIconW(NIM_MODIFY, &tray_data_);
+    {
+        timing::SlowUiScope notify_phase(L"main.tray.notify-icon");
+        Shell_NotifyIconW(NIM_MODIFY, &tray_data_);
+    }
     if (old != nullptr) DestroyIcon(old);
 }
 
@@ -1834,7 +2480,8 @@ void MainDialog::ApplyLocalization() {
     const auto text = [](const std::wstring_view zh, const std::wstring_view en) {
         return localization::Select(zh, en);
     };
-    SetWindowTextW(L"GPU Thermal Guard");
+    // The version, without spending a line of the window on it.
+    SetWindowTextW(L"GPU Thermal Guard - v" GTG_VERSION_DISPLAY);
     SetControlText(IDC_STATUS_GROUP,
                    text(L"GPU 即時狀態（唯讀）", L"GPU Status (Read Only)"));
     SetControlText(IDC_GPU_LABEL, L"GPU");
@@ -1857,15 +2504,22 @@ void MainDialog::ApplyLocalization() {
                    text(L"超溫後鎖定安全功率；穩定冷卻後可手動或選擇自動恢復。",
                         L"Safe power locks after a trip; choose manual or automatic restore after cooling."));
     SetControlText(IDC_AUTO_RESTORE, text(L"自動 Restore", L"Auto Restore"));
-    SetControlText(IDC_CLOSE_TO_TRAY, text(L"[X] 隱藏到系統匣", L"[X] Hide to tray"));
-    SetControlText(IDC_OSD_ENABLED, text(L"顯示 OSD", L"Show OSD"));
-    SetControlText(IDC_SHOW_FPS, text(L"顯示 FPS", L"Show FPS"));
-    SetControlText(IDC_SHOW_RAM, text(L"顯示 RAM", L"Show RAM"));
-    SetControlText(IDC_SHOW_NET, text(L"顯示網路", L"Show Net"));
+    SetControlText(IDC_CLOSE_TO_TRAY, text(L"[X] 關閉到系統匣", L"[X] Close to Tray"));
+    SetControlText(IDC_DISPLAY_LABEL, text(L"顯示：", L"Display:"));
+    SetControlText(IDC_OSD_ENABLED, L"OSD");
+    SetControlText(IDC_SHOW_FPS, L"FPS");
+    SetControlText(IDC_SHOW_RAM, L"RAM");
+    SetControlText(IDC_SHOW_NET, text(L"網路", L"NET"));
+    SetControlText(IDC_OVERLAY_ENABLED, L"Overlay");
+    SetControlText(IDC_OVERLAY_AUTO_SDR, text(L"自動 SDR（不詢問）", L"Auto SDR (skip prompt)"));
+    SetControlText(IDC_OVERLAY_HOTKEY, text(L"Overlay 熱鍵", L"Overlay Hotkey"));
+    SetControlText(IDC_THEME_LABEL, text(L"主題", L"Theme"));
+    SetControlText(IDC_LANGUAGE_LABEL, text(L"語言", L"Language"));
+    RefreshThemeChoices();
     SetControlText(IDC_SAVE_SETTINGS,
                    apply_pending_ ? text(L"套用中…", L"Applying…")
-                   : settings_dirty_ ? text(L"保存並套用 ●", L"Save & Apply ●")
-                                   : text(L"保存並套用", L"Save & Apply"));
+                   : settings_dirty_ ? text(L"保存並套用 ●", L"Save && Apply ●")
+                                   : text(L"保存並套用", L"Save && Apply"));
     SetControlText(IDC_HIDE_TO_TRAY, text(L"隱藏到系統匣", L"Hide to Tray"));
     SetControlText(IDC_RESET_TRIGGER_COUNT, text(L"重設", L"Reset"));
     const std::uint32_t run_count =
@@ -1887,6 +2541,42 @@ void MainDialog::ApplyLocalization() {
     SendMessageW(combo, CB_SETCURSEL, selected, 0);
     SendMessageW(combo, WM_SETREDRAW, TRUE, 0);
     ::InvalidateRect(combo, nullptr, TRUE);
+
+    SetControlText(IDC_OSD_SCALE_LABEL, text(L"OSD 大小", L"OSD Size"));
+    RefreshOsdScaleChoices();
+}
+
+void MainDialog::RefreshOsdScaleChoices() {
+    HWND scale_combo = GetDlgItem(IDC_OSD_SCALE);
+    if (scale_combo == nullptr) return;
+    // Auto carries the percentage it resolves to, read from the display the
+    // OVERLAY is on -- not this dialog's, which can be a different monitor at
+    // a different scale. Without that number a reader at 100 % has no way to
+    // learn that Auto is why the dashboard is small, and therefore no way to
+    // discover the setting that fixes it.
+    //
+    // Recomputed here rather than cached, and this runs again when the list
+    // is dropped down, so the figure is read at the moment somebody looks at
+    // it. A stale percentage would be a confidently wrong number, and this
+    // project would rather show none.
+    const unsigned dpi = osd_overlay_.CurrentDpi();
+    const std::wstring automatic = dpi == 0
+        ? std::wstring(localization::Select(L"自動", L"Auto"))
+        : localization::Format(L"自動（{}%）", L"Auto ({}%)",
+                               MulDiv(static_cast<int>(dpi), 100, 96));
+    SendMessageW(scale_combo, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(scale_combo, CB_RESETCONTENT, 0, 0);
+    for (const int percent : kOsdScaleChoices) {
+        const std::wstring entry = percent == 0
+            ? automatic
+            : std::format(L"\u00d7{}.{:02}", percent / 100, percent % 100);
+        SendMessageW(scale_combo, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(entry.c_str()));
+    }
+    SendMessageW(scale_combo, CB_SETCURSEL,
+                 OsdScaleIndexOf(osd_overlay_.ScalePercent()), 0);
+    SendMessageW(scale_combo, WM_SETREDRAW, TRUE, 0);
+    ::InvalidateRect(scale_combo, nullptr, TRUE);
 }
 
 void MainDialog::RefreshSettingsDirtyState() {
@@ -1904,14 +2594,39 @@ void MainDialog::RefreshSettingsDirtyState() {
     SetSettingsDirty(dirty);
 }
 
+namespace {
+
+// Save & Apply is a plain push button whenever it has nothing to say, so the
+// system and the theme draw it exactly like its neighbours -- shape, outline,
+// hover, pressed and focus included. Only while settings are unsaved does it
+// become owner-drawn, for the orange that says so. Drawing the clean state by
+// hand never matched: in Light it came out grey where the others are near
+// white, and in Dark its outline differed.
+//
+// Owner-drawn buttons answer WM_GETDLGCODE without DLGC_*DEFPUSHBUTTON, so the
+// dialog manager leaves the style alone while it is orange; switching back to
+// a push button hands it back.
+void SetSaveButtonOwnerDrawn(const HWND button, const bool owner_drawn) noexcept {
+    if (button == nullptr) return;
+    const LONG_PTR style = ::GetWindowLongPtrW(button, GWL_STYLE);
+    const LONG_PTR type = owner_drawn ? BS_OWNERDRAW : BS_PUSHBUTTON;
+    if ((style & BS_TYPEMASK) == type) return;
+    ::SetWindowLongPtrW(button, GWL_STYLE, (style & ~static_cast<LONG_PTR>(BS_TYPEMASK)) | type);
+    ::SetWindowPos(button, nullptr, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+}  // namespace
+
 void MainDialog::SetSettingsDirty(const bool dirty) {
     if (settings_dirty_ == dirty) return;
     settings_dirty_ = dirty;
     SetControlText(IDC_SAVE_SETTINGS,
         settings_dirty_
-            ? localization::Select(L"保存並套用 ●", L"Save & Apply ●")
-            : localization::Select(L"保存並套用", L"Save & Apply"));
+            ? localization::Select(L"保存並套用 ●", L"Save && Apply ●")
+            : localization::Select(L"保存並套用", L"Save && Apply"));
     HWND button = GetDlgItem(IDC_SAVE_SETTINGS);
+    SetSaveButtonOwnerDrawn(button, settings_dirty_);
     if (button != nullptr) ::InvalidateRect(button, nullptr, TRUE);
 }
 
@@ -2028,6 +2743,143 @@ UINT MainDialog::ReadUnsignedControl(int control_id, bool& ok) const {
     const UINT value = GetDlgItemInt(control_id, &translated, FALSE);
     ok = translated != FALSE;
     return value;
+}
+
+void MainDialog::RefreshThemeChoices() {
+    HWND combo = GetDlgItem(IDC_THEME);
+    if (combo == nullptr) return;
+    SendMessageW(combo, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    // Same order as settings::UiTheme, so the index is the value.
+    for (const std::wstring_view entry : {
+             localization::Select(L"自動（跟隨 Windows）", L"Auto (follow Windows)"),
+             localization::Select(L"深色", L"Dark"),
+             localization::Select(L"淺色", L"Light")}) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(entry.data()));
+    }
+    SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(ui_theme_), 0);
+    SendMessageW(combo, WM_SETREDRAW, TRUE, 0);
+    ::InvalidateRect(combo, nullptr, TRUE);
+}
+
+// One path for every change: the reader's choice, the Windows app mode, high
+// contrast. Configure resolves what the window will actually be.
+void MainDialog::ApplyUiTheme() {
+    const auto appearance = theme::Configure(ui_theme_);
+    // The tab-texture background belongs to the light look; dark paints its
+    // own and the texture would show through behind statics.
+    (void)EnableThemeDialogTexture(
+        m_hWnd, appearance == settings::Appearance::Dark ? ETDT_DISABLE : ETDT_ENABLE);
+    history_chart_.SetPalette(theme::HistoryChartPalette());
+    theme::Repaint(m_hWnd);
+    AlignSettingsEdits(m_hWnd);
+    logging::Info(std::format(L"ui theme applied; preference={} appearance={}",
+                              settings::RegistryValue(ui_theme_),
+                              appearance == settings::Appearance::Dark ? L"dark" : L"classic"));
+}
+
+LRESULT MainDialog::OnUiThemeSelected(WORD, WORD, HWND, BOOL&) {
+    const LRESULT selection = SendDlgItemMessageW(IDC_THEME, CB_GETCURSEL, 0, 0);
+    if (selection == CB_ERR || selection > static_cast<LRESULT>(settings::UiTheme::Light))
+        return 0;
+    ui_theme_ = static_cast<settings::UiTheme>(selection);
+    std::wstring error;
+    if (!settings::SaveUiThemePreference(ui_theme_, error)) logging::Warning(error);
+    ApplyUiTheme();
+    return 0;
+}
+
+LRESULT MainDialog::OnUiSettingChange(UINT, const WPARAM wparam, const LPARAM lparam,
+                                      BOOL& handled) {
+    handled = FALSE;   // the display handler still needs to see it
+    const auto* area = reinterpret_cast<const wchar_t*>(lparam);
+    const bool color_scheme =
+        area != nullptr && std::wstring_view(area) == L"ImmersiveColorSet";
+    // High contrast overrides every choice, so it is followed whatever was
+    // chosen; the app mode only matters to Auto.
+    if (wparam == SPI_SETHIGHCONTRAST ||
+        (color_scheme && ui_theme_ == settings::UiTheme::Auto)) {
+        ApplyUiTheme();
+    }
+    return 0;
+}
+
+LRESULT MainDialog::OnOverlayToggle(WORD, WORD, HWND, BOOL&) {
+    const bool enabled = IsDlgButtonChecked(IDC_OVERLAY_ENABLED) == BST_CHECKED;
+#ifdef GTG_FEATURE_OVERLAY
+    const auto previous = overlay::integration::GetStatus();
+    if (!overlay::integration::Configure(enabled, overlay_hotkey_.modifiers, overlay_hotkey_.key)) {
+        CheckDlgButton(IDC_OVERLAY_ENABLED, previous.enabled ? BST_CHECKED : BST_UNCHECKED);
+        SetStatus(localization::Select(L"Overlay 熱鍵無法註冊；請更換組合鍵。",
+                                       L"Overlay hotkey unavailable; choose another shortcut."),
+                  StatusVisual::Warning);
+        return 0;
+    }
+#endif
+    std::wstring error;
+    if (!settings::SaveOverlayEnabled(enabled, error)) {
+#ifdef GTG_FEATURE_OVERLAY
+        if (!overlay::integration::Configure(previous.enabled, previous.modifiers, previous.key)) {
+            (void)overlay::integration::Configure(false);
+            logging::Warning(L"Overlay binding rollback failed; overlay disabled");
+        }
+#endif
+        CheckDlgButton(IDC_OVERLAY_ENABLED, enabled ? BST_UNCHECKED : BST_CHECKED);
+#ifdef GTG_FEATURE_OVERLAY
+        CheckDlgButton(IDC_OVERLAY_ENABLED,
+                       overlay::integration::GetStatus().enabled ? BST_CHECKED : BST_UNCHECKED);
+#endif
+        logging::Warning(error);
+        return 0;
+    }
+    logging::Info(std::format(
+        L"overlay preference saved; enabled={}", enabled));
+    return 0;
+}
+
+LRESULT MainDialog::OnOverlayAutoSdr(WORD, WORD, HWND, BOOL&) {
+    const bool enabled = IsDlgButtonChecked(IDC_OVERLAY_AUTO_SDR) == BST_CHECKED;
+    std::wstring error;
+    if (!settings::SaveOverlayAutoSdr(enabled, error)) {
+        CheckDlgButton(IDC_OVERLAY_AUTO_SDR, enabled ? BST_UNCHECKED : BST_CHECKED);
+        logging::Warning(error);
+        return 0;
+    }
+    logging::Info(std::format(L"overlay Auto SDR preference saved; enabled={}; new sessions only", enabled));
+    return 0;
+}
+
+LRESULT MainDialog::OnOverlayHotkey(WORD, WORD, HWND, BOOL&) {
+    OverlayHotkeyDialog dialog(overlay_hotkey_);
+    if (dialog.DoModal(m_hWnd) != IDOK) return 0;
+#ifdef GTG_FEATURE_OVERLAY
+    const auto previous = overlay::integration::GetStatus();
+    if (!overlay::integration::Configure(previous.enabled, dialog.hotkey().modifiers,
+                                         dialog.hotkey().key)) {
+        SetStatus(localization::Select(L"Overlay 熱鍵無法註冊；保留原組合鍵。",
+                                       L"Overlay hotkey unavailable; previous shortcut retained."),
+                  StatusVisual::Warning);
+        return 0;
+    }
+#endif
+    std::wstring error;
+    if (!settings::SaveOverlayHotkey(dialog.hotkey(), error)) {
+#ifdef GTG_FEATURE_OVERLAY
+        if (!overlay::integration::Configure(previous.enabled, previous.modifiers, previous.key)) {
+            (void)overlay::integration::Configure(false);
+            logging::Warning(L"Overlay binding rollback failed; overlay disabled");
+        }
+        CheckDlgButton(IDC_OVERLAY_ENABLED,
+                       overlay::integration::GetStatus().enabled ? BST_CHECKED : BST_UNCHECKED);
+#endif
+        logging::Warning(error);
+        return 0;
+    }
+    overlay_hotkey_ = dialog.hotkey();
+    logging::Info(std::format(
+        L"overlay hotkey saved; hotkey={}",
+        HotkeyText(overlay_hotkey_)));
+    return 0;
 }
 
 }  // namespace gtg::tray

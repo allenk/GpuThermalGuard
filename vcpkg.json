@@ -1,0 +1,24 @@
+{
+  "name": "gpu-thermal-guard",
+  "version": "1.0.0",
+  "description": "GpuThermalGuard: NVIDIA power-limit thermal guard with an optional in-game overlay",
+  "license": "MIT",
+  "supports": "windows & x64",
+  "builtin-baseline": "a1cae005c39be7b18ba319fced856b68d7276271",
+  "$overrides": [
+    "imgui is pinned, not left to the baseline: 1.92.9, port-version 0 (upstream",
+    "tag v1.92.9b) is the source the overlay's D3D11 path was verified against.",
+    "Only the DX11 binding is used by the product; it is compiled into",
+    "gtg_overlay.dll only (x64-windows-static), never into GpuThermalGuard.exe."
+  ],
+  "overrides": [
+    { "name": "imgui", "version": "1.92.9#0" }
+  ],
+  "dependencies": [
+    {
+      "name": "imgui",
+      "default-features": false,
+      "features": [ "dx11-binding" ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+[submodule "third_party/splice"]
+	path = third_party/splice
+	url = https://github.com/allenk/splice.git
+[submodule "third_party/darkmodelib"]
+	path = third_party/darkmodelib
+	url = https://github.com/ozone10/darkmodelib

@@ -93,6 +93,93 @@ int main(int argc, char** argv) {
             Check(osd.Initialize(nullptr, &history, true, {60, 60}, repaired), "initialize");
             osd.SetStatus(L"Monitoring", gtg::tray::OsdVisual::Armed);
             osd.SetVisible(true);
+            // The windowless render. Not an assertion that it works -- the
+            // pixels are written out so somebody can look at them, because
+            // the whole point of this entry is producing a dashboard at a
+            // size the display is not, which a capture of the window cannot.
+            auto dump_bitmap = [&](float scale, const char* name) {
+                gtg::tray::OsdOverlay::Bitmap bitmap;
+                Check(osd.RenderToBitmap(scale, 3840, 2160, GetTickCount64(),
+                          gtg::tray::OsdOverlay::AlphaMode::Straight, bitmap),
+                      "RenderToBitmap succeeds without a window of its own");
+                Check(bitmap.width > 0 && bitmap.height > 0, "bitmap has a size");
+                Check(bitmap.pixels.size() ==
+                          static_cast<std::size_t>(bitmap.width) * bitmap.height * 4,
+                      "bitmap is fully sized");
+                std::size_t opaque = 0;
+                for (std::size_t i = 3; i < bitmap.pixels.size(); i += 4)
+                    if (bitmap.pixels[i] != 0) ++opaque;
+                Check(opaque > bitmap.pixels.size() / 64,
+                      "bitmap is drawn, not blank");
+                // BITMAPV5 so the alpha survives being opened.
+                BITMAPV5HEADER header{};
+                header.bV5Size = sizeof(header);
+                header.bV5Width = bitmap.width;
+                header.bV5Height = -bitmap.height;   // top-down
+                header.bV5Planes = 1;
+                header.bV5BitCount = 32;
+                header.bV5Compression = BI_BITFIELDS;
+                header.bV5RedMask = 0x00FF0000;
+                header.bV5GreenMask = 0x0000FF00;
+                header.bV5BlueMask = 0x000000FF;
+                header.bV5AlphaMask = 0xFF000000;
+                header.bV5CSType = LCS_WINDOWS_COLOR_SPACE;
+                BITMAPFILEHEADER file{};
+                file.bfType = 0x4D42;
+                file.bfOffBits = sizeof(file) + sizeof(header);
+                file.bfSize = file.bfOffBits +
+                              static_cast<DWORD>(bitmap.pixels.size());
+                std::ofstream out(name, std::ios::binary);
+                out.write(reinterpret_cast<const char*>(&file), sizeof(file));
+                out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+                out.write(reinterpret_cast<const char*>(bitmap.pixels.data()),
+                          static_cast<std::streamsize>(bitmap.pixels.size()));
+                std::cout << name << ": " << bitmap.width << "x" << bitmap.height
+                          << " at scale " << bitmap.scale << std::endl;
+            };
+            dump_bitmap(1.0F, "osd-render-x1.bmp");
+            dump_bitmap(2.0F, "osd-render-x2.bmp");
+
+            // Every arrangement the reader can drag into, through the same
+            // entry. `breaks` is a bitmask of "end the row after this slot",
+            // so one row, two rows of four and a single column are three
+            // values of one number rather than three code paths.
+            {
+                osd.SetRamEnabled(true);
+                osd.SetFpsEnabled(true);
+                osd.SetNetEnabled(true);
+                osd.RestoreCollapsed(true);
+                struct Shape { std::uint8_t breaks; const char* name; };
+                for (const Shape shape : {
+                         Shape{0x00, "osd-render-compact-8x1.bmp"},
+                         Shape{0x08, "osd-render-compact-4x2.bmp"},
+                         Shape{0x7F, "osd-render-compact-1x8.bmp"}}) {
+                    gtg::tray::compact::Layout arrangement;
+                    arrangement.breaks = shape.breaks;
+                    Check(gtg::tray::compact::IsValidLayout(arrangement),
+                          "arrangement is valid");
+                    osd.SetCompactLayout(arrangement);
+                    dump_bitmap(1.0F, shape.name);
+                }
+                // Put everything back. This demonstration mutates the
+                // overlay -- records on, a different arrangement -- and every
+                // check after it expects the state the test set up. Leaving
+                // the mutation behind failed those checks, which is the right
+                // outcome and the reason the restore is explicit rather than
+                // assumed.
+                // Collapsed first, records after. RestoreCollapsed only sets
+                // the flag -- it is meant for startup, before a window exists
+                // -- while SetRamEnabled and its siblings re-apply the window
+                // geometry. Restoring in the other order left the window sized
+                // for the collapsed shape while the flag said expanded, and the
+                // height check caught it.
+                osd.RestoreCollapsed(false);
+                osd.SetCompactLayout(gtg::tray::compact::Layout{});
+                osd.SetRamEnabled(false);
+                osd.SetFpsEnabled(false);
+                osd.SetNetEnabled(false);
+            }
+
             auto check_size = [&](bool compact) {
                 RECT r{};
                 GetWindowRect(osd, &r);

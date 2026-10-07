@@ -20,6 +20,7 @@
 #include "core/restore_policy.hpp"
 #include "nvml/nvml_loader.hpp"
 #include "resources/resource.h"
+#include "settings/ui_preferences.hpp"
 #include "ipc/protocol.hpp"
 #include "tray/history_chart.hpp"
 #include "tray/osd_overlay.hpp"
@@ -49,12 +50,16 @@ public:
         MESSAGE_HANDLER(WM_THEMECHANGED, OnThemeChanged)
         MESSAGE_HANDLER(WM_DPICHANGED, OnDpiChanged)
         MESSAGE_HANDLER(WM_DISPLAYCHANGE, OnDisplayConfigurationChanged)
+        // First, and declines the message, so the display handler below still
+        // sees every WM_SETTINGCHANGE.
+        MESSAGE_HANDLER(WM_SETTINGCHANGE, OnUiSettingChange)
         MESSAGE_HANDLER(WM_SETTINGCHANGE, OnDisplayConfigurationChanged)
         MESSAGE_HANDLER(WM_EXITSIZEMOVE, OnExitSizeMove)
         MESSAGE_HANDLER(WM_CTLCOLORSTATIC, OnCtlColorStatic)
         MESSAGE_HANDLER(WM_DRAWITEM, OnDrawItem)
         MESSAGE_HANDLER(kTrayMessage, OnTrayMessage)
         MESSAGE_HANDLER(kInitializeTrayMessage, OnInitializeTray)
+        MESSAGE_HANDLER(kFeatureNoticeMessage, OnFeatureNotice)
         MESSAGE_HANDLER(kVerifyTrayMessage, OnVerifyTray)
         MESSAGE_HANDLER(kCaptureSnapshotMessage, OnCaptureSnapshot)
         MESSAGE_HANDLER(kReloadSnapshotIconMessage, OnReloadSnapshotIcon)
@@ -68,6 +73,12 @@ public:
         COMMAND_HANDLER(IDC_SHOW_RAM, BN_CLICKED, OnRamToggle)
         COMMAND_HANDLER(IDC_SHOW_NET, BN_CLICKED, OnNetToggle)
         COMMAND_HANDLER(IDC_LANGUAGE, CBN_SELCHANGE, OnLanguageChanged)
+        COMMAND_HANDLER(IDC_THEME, CBN_SELCHANGE, OnUiThemeSelected)
+        COMMAND_HANDLER(IDC_OVERLAY_ENABLED, BN_CLICKED, OnOverlayToggle)
+        COMMAND_HANDLER(IDC_OVERLAY_AUTO_SDR, BN_CLICKED, OnOverlayAutoSdr)
+        COMMAND_ID_HANDLER(IDC_OVERLAY_HOTKEY, OnOverlayHotkey)
+        COMMAND_HANDLER(IDC_OSD_SCALE, CBN_SELCHANGE, OnOsdScaleChanged)
+        COMMAND_HANDLER(IDC_OSD_SCALE, CBN_DROPDOWN, OnOsdScaleDropDown)
         COMMAND_HANDLER(IDC_NORMAL_POWER, EN_CHANGE, OnProtectionSettingChanged)
         COMMAND_HANDLER(IDC_SAFE_POWER, EN_CHANGE, OnProtectionSettingChanged)
         COMMAND_HANDLER(IDC_TRIGGER_TEMP, EN_CHANGE, OnProtectionSettingChanged)
@@ -100,6 +111,7 @@ private:
     static constexpr UINT kReloadSnapshotIconMessage = WM_APP + 46;
     static constexpr UINT kRepairMainPlacementMessage = WM_APP + 47;
     static constexpr UINT kDeepCleanDoneMessage = WM_APP + 48;
+    static constexpr UINT kFeatureNoticeMessage = WM_APP + 49;
 
     // Every message this window posts to itself, checked for collisions at
     // compile time.
@@ -122,6 +134,7 @@ public:
         kTrayMessage,       kInitializeTrayMessage, kVerifyTrayMessage,
         kCaptureSnapshotMessage, kReloadSnapshotIconMessage,
         kRepairMainPlacementMessage, kDeepCleanDoneMessage,
+        kFeatureNoticeMessage,
     };
     [[nodiscard]] static constexpr bool MessagesAreDistinct() noexcept {
         for (std::size_t i = 0; i < std::size(kSelfMessages); ++i)
@@ -147,6 +160,7 @@ private:
     LRESULT OnDrawItem(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnTrayMessage(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnInitializeTray(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnFeatureNotice(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnVerifyTray(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnCaptureSnapshot(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnReloadSnapshotIcon(UINT, WPARAM, LPARAM, BOOL&);
@@ -164,6 +178,22 @@ private:
     LRESULT OnDeepCleanDone(UINT, WPARAM, LPARAM, BOOL&);
     void PersistCompactArrangement();
     LRESULT OnLanguageChanged(WORD, WORD, HWND, BOOL&);
+    // AF-20261004-main-ui-redesign: theme, and the overlay settings that are
+    // stored but not yet acted on.
+    LRESULT OnUiThemeSelected(WORD, WORD, HWND, BOOL&);
+    LRESULT OnUiSettingChange(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnOverlayToggle(WORD, WORD, HWND, BOOL&);
+    LRESULT OnOverlayAutoSdr(WORD, WORD, HWND, BOOL&);
+    LRESULT OnOverlayHotkey(WORD, WORD, HWND, BOOL&);
+    void ApplyUiTheme();
+    void RefreshThemeChoices();
+    // Runs before darkmodelib's own subclass, so the coloured readings keep
+    // their colours: darkmodelib answers every WM_CTLCOLORSTATIC otherwise.
+    static LRESULT CALLBACK ReadingColorSubclass(HWND window, UINT message, WPARAM wparam,
+                                                 LPARAM lparam, UINT_PTR id, DWORD_PTR data);
+    LRESULT OnOsdScaleChanged(WORD, WORD, HWND, BOOL&);
+    LRESULT OnOsdScaleDropDown(WORD, WORD, HWND, BOOL&);
+    void RefreshOsdScaleChoices();
     LRESULT OnProtectionSettingChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnManualSnapshot(WORD, WORD, HWND, BOOL&);
     LRESULT OnResetTriggerCount(WORD, WORD, HWND, BOOL&);
@@ -227,6 +257,10 @@ private:
     std::uint32_t saved_compact_layout_{};
     bool saved_compact_locked_{true};
     HistoryChart history_chart_;
+    settings::UiTheme ui_theme_{settings::UiTheme::Auto};
+    settings::OverlayHotkey overlay_hotkey_{settings::kDefaultOverlayHotkey};
+    HWND tooltip_{nullptr};
+    std::wstring tooltip_text_;   // owned here: a tooltip keeps the pointer it is given
     OsdOverlay osd_overlay_;
     fps::DxgiObserver fps_observer_;
     ProtectionConfig config_{};
@@ -267,6 +301,7 @@ private:
     // indistinguishable from a configured install because LoadResult::loaded
     // was read and then discarded.
     bool first_run_{false};
+    bool feature_notice_attempted_{false};
     bool first_run_defaults_applied_{false};
     std::optional<unsigned int> minimum_power_limit_mw_;
     std::optional<unsigned int> maximum_power_limit_mw_;

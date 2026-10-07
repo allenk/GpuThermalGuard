@@ -15,4 +15,4 @@
 #
 # To release: change this line and add a CHANGELOG.md section. That is the
 # whole list.
-set(GTG_VERSION 0.13.0)
+set(GTG_VERSION 1.0.0)

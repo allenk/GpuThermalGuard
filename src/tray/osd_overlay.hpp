@@ -4,6 +4,7 @@
 #include <optional>
 #include <utility>
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include <atlbase.h>
@@ -14,10 +15,19 @@
 #include "telemetry/telemetry_history.hpp"
 #include "telemetry/telemetry_freshness.hpp"
 #include "tray/osd_compact.hpp"
+#include "tray/osd_placement.hpp"
 #include "fps/fps_rate.hpp"
 #include "fps/fps_history.hpp"
 #include <atomic>
 #include <thread>
+
+// Forward-declared rather than including <gdiplus.h> here. This header is
+// pulled in by the tray, the tests and the smoke harnesses; GDI+ is an
+// implementation detail of how the dashboard is drawn, and only the two
+// drawing entry points below mention it.
+namespace Gdiplus {
+class Graphics;
+}  // namespace Gdiplus
 
 #include "sysmem/host_memory.hpp"
 #include "net/action.hpp"
@@ -41,6 +51,8 @@ public:
         MESSAGE_HANDLER(WM_NCHITTEST, OnNcHitTest)
         MESSAGE_HANDLER(WM_MOUSEACTIVATE, OnMouseActivate)
         MESSAGE_HANDLER(WM_WINDOWPOSCHANGED, OnWindowPosChanged)
+        MESSAGE_HANDLER(WM_ENTERSIZEMOVE, OnEnterSizeMove)
+        MESSAGE_HANDLER(WM_MOVING, OnMoving)
         MESSAGE_HANDLER(WM_EXITSIZEMOVE, OnExitSizeMove)
         MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBackground)
     END_MSG_MAP()
@@ -51,6 +63,8 @@ private:
     LRESULT OnNcHitTest(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnMouseActivate(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnWindowPosChanged(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnEnterSizeMove(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnMoving(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnExitSizeMove(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnEraseBackground(UINT, WPARAM, LPARAM, BOOL&);
 
@@ -101,6 +115,10 @@ public:
     END_MSG_MAP()
 
     // `accent` is ARGB so this header need not reach for GDI+.
+    // The indicator's pixels, into a caller-provided surface at a caller-
+    // provided size. Does not clear and does not consult a window: see the
+    // definition.
+    void DrawInto(Gdiplus::Graphics& graphics, int width, int height) const;
     bool Begin(HWND owner, const RECT& screen_rect, std::uint32_t accent,
                float scale, std::wstring label,
                animation::Effect effect = animation::kDefaultEffect) noexcept;
@@ -180,6 +198,8 @@ public:
         MESSAGE_HANDLER(WM_SETTINGCHANGE, OnDisplayChanged)
         MESSAGE_HANDLER(WM_WTSSESSION_CHANGE, OnSessionChanged)
         MESSAGE_HANDLER(WM_POWERBROADCAST, OnPowerBroadcast)
+        MESSAGE_HANDLER(WM_ENTERSIZEMOVE, OnEnterSizeMove)
+        MESSAGE_HANDLER(WM_MOVING, OnMoving)
         MESSAGE_HANDLER(WM_EXITSIZEMOVE, OnExitSizeMove)
         MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBackground)
         MESSAGE_HANDLER(WM_TIMER, OnOverlayTimer)
@@ -194,6 +214,15 @@ public:
     // itself stays with the caller, beside the position it already saves --
     // the overlay draws, it does not own the registry.
     void RestoreCollapsed(const bool collapsed) noexcept { collapsed_ = collapsed; }
+    // Each shape's own remembered position, set before Initialize like the
+    // shape itself. Initialize still takes the position to open at; the caller
+    // passes the one for the restored shape. AF-20261004-main-ui-redesign.
+    void RestorePositions(const placement::ModePositions& positions) noexcept {
+        positions_ = positions;
+    }
+    // Both positions as they stand now: the current shape's is where the
+    // window is, the other's is what it remembers. What the caller persists.
+    [[nodiscard]] placement::ModePositions Positions() const noexcept;
     [[nodiscard]] bool Initialize(HWND notification_window,
                                   const telemetry::History* history,
                                   bool has_saved_position,
@@ -213,10 +242,93 @@ public:
         fps_history_ = history;
         RequestRefresh();
     }
+    // The GPU telemetry the lanes and curves are drawn from.
+    //
+    // Exists so the history can be attached without a window, which is what the
+    // other three already allow and this one did not: it was reachable only
+    // through Initialize(), and Initialize() is what creates the window. So a
+    // caller that wants pixels and not a window -- an in-game overlay obtaining
+    // the same dashboard the desktop draws, via RenderToBitmap -- could produce
+    // the chrome and none of the readings.
+    //
+    // AF-20260929-headless-telemetry-attach. AF-20260926-single-rasteriser
+    // separated the drawing from the window; this separates the data from it,
+    // which was the other half of the same seam.
+    //
+    // Initialize() calls this rather than assigning directly, so there is one
+    // path in and its callers are unchanged.
+    void SetTelemetryHistory(const telemetry::History* history) noexcept {
+        history_ = history;
+        RequestRefresh();
+    }
     // The reader's arrangement governs both the compact cells and the
     // expanded lanes; only the compact view can edit it.
     void SetCompactLayout(compact::Layout layout) noexcept;
     void SetCompactLocked(bool locked) noexcept;
+    // The reader's chosen size, in hundredths, or 0 to follow the display.
+    // Resolved by settings::EffectiveOsdScale, which is where the rule lives;
+    // this only carries the stored number in.
+    void SetScalePercent(int scale_percent) noexcept;
+    [[nodiscard]] int ScalePercent() const noexcept { return scale_percent_; }
+
+    // A rendered dashboard with no window behind it. 32-bit BGRA, top-down,
+    // stride = width * 4.
+    struct Bitmap {
+        int width{};
+        int height{};
+        float scale{};
+        std::vector<std::uint8_t> pixels;
+    };
+
+    // UpdateLayeredWindow requires premultiplied alpha; a GPU overlay's
+    // default blend state expects straight. Whoever consumes the pixels says
+    // which it wants rather than converting them afterwards and guessing.
+    enum class AlphaMode { Premultiplied, Straight };
+
+    // Declare a tick: it is now `now_ms`, re-evaluate whatever is derived from
+    // the clock.
+    //
+    // Exists because the derivation was reachable only from Render(), which is
+    // the window path, and RequestRefresh() is gated on Visible(). A caller
+    // without a window therefore stayed at FreshnessState::NoData for its whole
+    // life and drew every reading as stale however fresh it was.
+    //
+    // Named for what the caller is declaring rather than for what is currently
+    // derived from it. Freshness is the only thing today; a public name pinned
+    // to one internal state machine would be wrong the moment there are two.
+    //
+    // Pairs with RenderToBitmap, in this order, which is the order Render()
+    // already uses:
+    //
+    //     overlay.AdvanceTo(now);
+    //     overlay.RenderToBitmap(scale, w, h, now, AlphaMode::Straight, out);
+    //
+    // AF-20260929-headless-tick-advance.
+    void AdvanceTo(std::uint64_t now_ms) noexcept { UpdateFreshness(now_ms); }
+
+    // The dashboard as it is now, at a scale and in a space the caller
+    // chooses, with the busy indicator composited INTO it rather than left in
+    // a second window. That composite is the reason this exists: a capture of
+    // the OSD's window cannot contain the indicator, because the indicator is
+    // not in that window.
+    //
+    // Requires no window of its own. `now_ms` comes from the caller so that
+    // every output drawn from one tick agrees; this only reads state and
+    // never advances it -- UpdateFreshness does that, once per tick.
+    [[nodiscard]] bool RenderToBitmap(float scale, int available_width_dip,
+                                      int available_height_dip,
+                                      std::uint64_t now_ms, AlphaMode alpha,
+                                      Bitmap& out) const noexcept;
+
+    // The display the OVERLAY is on, which is not necessarily the one the
+    // main dialog is on. The size setting governs this window, so this is the
+    // DPI its "follow the display" entry has to report.
+    //
+    // Zero when there is no window yet, and zero means UNKNOWN rather than
+    // 96. The dialog is built before the overlay exists, so a 96 fallback
+    // here printed "Auto (100%)" on a 175 % machine -- a confidently wrong
+    // number, which is worse than no number.
+    [[nodiscard]] unsigned CurrentDpi() const noexcept;
     [[nodiscard]] compact::Layout compact_layout() const noexcept { return layout_; }
     [[nodiscard]] bool compact_locked() const noexcept { return compact_locked_; }
     void SetRamEnabled(bool enabled) noexcept;
@@ -297,6 +409,16 @@ private:
 #endif
     }
     bool collapsed_{};
+    // When the pointer was last over the window, and whether the header has
+    // gone idle since (AF-20261006-osd-idle-clock).
+    std::uint64_t last_pointer_ms_{};
+    bool header_idle_{};
+    placement::ModePositions positions_;
+    // The point of the window the cursor grabbed, set for the length of a
+    // system move loop. WM_MOVING's own rectangle cannot be snapped: it is the
+    // previous rectangle plus the mouse's movement, so a snapped window could
+    // never leave the edge. AF-20261005-osd-snap-anchor.
+    std::optional<POINT> move_grab_;
     compact::Gesture toggle_gesture_;
     compact::Gesture lock_gesture_;
     int drag_from_{-1};
@@ -305,6 +427,9 @@ private:
     // no separate boolean can disagree with what the reader can see.
     OsdBusyIndicator busy_indicator_;
     CellAction active_action_{CellAction::None};
+    // Which cell the running action belongs to, so a composite can place the
+    // indicator without a window to measure against. -1 when none.
+    int action_slot_{-1};
     std::uint64_t action_started_ms_{};
     std::uint64_t action_visible_until_ms_{};
     std::uint64_t action_result_until_ms_{};
@@ -335,22 +460,57 @@ private:
     LRESULT OnDisplayChanged(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnSessionChanged(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnPowerBroadcast(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnEnterSizeMove(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnMoving(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnExitSizeMove(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnEraseBackground(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnRefreshTimer(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnDragMove(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnDragCursor(UINT, WPARAM, LPARAM, BOOL&);
 
+    // Whether anything is still reading the dashboard. One term today; an
+    // in-game output adds a second here, and nowhere else.
+    [[nodiscard]] bool WantsFrames() const noexcept { return Visible(); }
+    void UpdateRefreshCadence() noexcept;
     [[nodiscard]] Layout CurrentLayout() const noexcept;
+    // CurrentLayout without the window: the caller supplies the scale and the
+    // space, so an output that is not a desktop window can ask for one too.
+    [[nodiscard]] Layout MakeLayout(float scale, int available_width_dip,
+                                    int available_height_dip) const noexcept;
     [[nodiscard]] bool FitToWorkArea(POINT& position, const Layout& layout) const noexcept;
     void ApplyPosition(POINT position, const Layout& layout) noexcept;
     void SynchronizeDragHandleToOverlay() noexcept;
     void HandleDragMove(int x, int y) noexcept;
     void HandleDragEnd() noexcept;
+    // Magnetic alignment for a window-move in progress. `proposed` is the
+    // moving window's rect; `body_height` is the dashboard's, which is taller
+    // than the click-through drag strip that may be the one moving.
+    void SnapMoving(RECT& proposed, int body_height) const noexcept;
+    // Records where the cursor holds the moving window, for the whole drag.
+    // Both windows share a top-left, so one grab serves either.
+    // AF-20261005-osd-snap-anchor.
+    void BeginMove(HWND moving) noexcept;
     void ScheduleTopmostRepair(std::wstring_view reason) noexcept;
     void RepairTopmost() noexcept;
     void RenderLatest() noexcept;
     void CheckZOrder() noexcept;
+    // Advances the telemetry-freshness state machine, which logs its
+    // transitions. Separate from the drawing so that producing a bitmap never
+    // has a side effect -- see the definition.
+    void UpdateFreshness(std::uint64_t now_ms) noexcept;
+    // What the header's right end shows. The desktop window shows the
+    // buttons while the pointer is near and the clock once it is idle; the
+    // in-game bitmap cannot be clicked, so it always shows the clock.
+    // AF-20261006-osd-idle-clock.
+    enum class HeaderMode { Controls, Clock };
+    // The dashboard's pixels, with no output attached. See the definition
+    // for why this is const.
+    void DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
+                     std::uint64_t now_ms, HeaderMode header) const;
+    // The pointer is over the window now: wake the header if it was idle.
+    void NotePointer() noexcept;
+    // On the refresh tick: decide whether the header is idle.
+    void UpdateHeaderIdle(std::uint64_t now_ms) noexcept;
     [[nodiscard]] bool Render() noexcept;
 
     static constexpr int kWidthDip = 388;
@@ -379,6 +539,9 @@ private:
     // Default off like FPS: MainDialog applies the stored preference.
     compact::Layout layout_{};
     bool compact_locked_{true};
+    // 0 means follow the display, which is what every install did before this
+    // existed and is still the default.
+    int scale_percent_{};
     bool ram_enabled_{false};
     bool host_memory_low_{false};
     const sysmem::History* ram_history_{nullptr};
@@ -394,7 +557,7 @@ private:
     std::optional<DWORD> display_status_;
     std::wstring topmost_repair_reason_;
     unsigned int topmost_repair_passes_remaining_{};
-    telemetry::FreshnessState freshness_state_{telemetry::FreshnessState::NoData};
+    telemetry::Freshness freshness_{};   // evaluated once per refresh
     std::uint64_t recovered_until_ms_{};
     std::uint64_t next_zorder_check_ms_{};
     std::uint64_t last_zorder_repair_ms_{};

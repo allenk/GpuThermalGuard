@@ -6,3 +6,4 @@
 *.suo
 *.VC.db
 *.VC.VC.opendb
+/vcpkg_installed/

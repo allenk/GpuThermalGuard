@@ -5,6 +5,7 @@
 
 #include "core/protection.hpp"
 #include "localization/localization.hpp"
+#include "settings/ui_preferences.hpp"
 
 namespace gtg::settings {
 
@@ -14,16 +15,54 @@ struct LoadResult {
     std::wstring warning;
 };
 
+// The range an explicit OSD scale may take. Below this a reading stops being
+// legible at any DPI; above it the dashboard cannot be arranged on a small
+// display. 0 sits outside deliberately and means "follow the display".
+inline constexpr int kMinOsdScalePercent = 50;
+inline constexpr int kMaxOsdScalePercent = 300;
+
 struct OsdPreference {
     // Matches ResolveOsdPreference: absent means on.
     bool enabled{true};
     // Absent means expanded, which is what every install does today, so no
     // reader's window changes shape on upgrade.
     bool collapsed{false};
+    // OsdX/OsdY: the expanded shape's position. Before each shape had its own
+    // it was the shape last exited in, which is why a missing compact
+    // position falls back to it (placement::FromStored).
     bool has_position{false};
     int x{};
     int y{};
+    // CompactX/CompactY: the collapsed shape's own position.
+    // AF-20261004-main-ui-redesign.
+    bool has_compact_position{false};
+    int compact_x{};
+    int compact_y{};
+    // The reader's chosen OSD size, in hundredths. 0 means follow the display
+    // scale, which is what every install did before this existed and remains
+    // the default.
+    //
+    // Absolute rather than a multiplier over the display scale: a multiplier
+    // would mean a different physical size on every monitor, which is the
+    // opposite of what somebody setting it once intends.
+    int scale_percent{};
 };
+
+// The scale the OSD should draw at, resolved from what was stored and the
+// display it is on. A pure function because it is the whole of the decision
+// and deserves to be tested without a window.
+//
+// Anything outside the accepted range resolves to the display scale rather
+// than being clamped: a number written by a later version should not silently
+// become a size nobody chose.
+[[nodiscard]] constexpr float EffectiveOsdScale(const int scale_percent,
+                                                const unsigned dpi) noexcept {
+    if (scale_percent >= kMinOsdScalePercent &&
+        scale_percent <= kMaxOsdScalePercent) {
+        return static_cast<float>(scale_percent) / 100.0F;
+    }
+    return static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
+}
 
 struct WindowPosition {
     bool has_position{false};
@@ -79,7 +118,9 @@ struct TriggerTestRun {
 [[nodiscard]] OsdPreference LoadOsdPreference() noexcept;
 [[nodiscard]] bool SaveOsdEnabled(bool enabled, std::wstring& error);
 [[nodiscard]] bool SaveOsdPosition(int x, int y, std::wstring& error);
+[[nodiscard]] bool SaveCompactPosition(int x, int y, std::wstring& error);
 [[nodiscard]] bool SaveOsdCollapsed(bool collapsed, std::wstring& error);
+[[nodiscard]] bool SaveOsdScale(int scale_percent, std::wstring& error);
 [[nodiscard]] bool LoadFpsEnabled() noexcept;
 [[nodiscard]] bool SaveFpsEnabled(bool enabled, std::wstring& error);
 [[nodiscard]] bool LoadRamEnabled() noexcept;
@@ -104,5 +145,16 @@ struct TriggerTestRun {
 [[nodiscard]] localization::UiLanguage LoadUiLanguagePreference() noexcept;
 [[nodiscard]] bool SaveUiLanguagePreference(localization::UiLanguage language,
                                             std::wstring& error);
+// AF-20261004-main-ui-redesign. The rules live in ui_preferences.hpp.
+[[nodiscard]] UiTheme LoadUiThemePreference() noexcept;
+[[nodiscard]] bool SaveUiThemePreference(UiTheme theme, std::wstring& error);
+[[nodiscard]] bool LoadOverlayEnabled() noexcept;
+[[nodiscard]] bool SaveOverlayEnabled(bool enabled, std::wstring& error);
+[[nodiscard]] bool LoadOverlayAutoSdr() noexcept;
+[[nodiscard]] bool SaveOverlayAutoSdr(bool enabled, std::wstring& error);
+[[nodiscard]] OverlayHotkey LoadOverlayHotkey() noexcept;
+[[nodiscard]] bool SaveOverlayHotkey(const OverlayHotkey& hotkey, std::wstring& error);
+[[nodiscard]] bool LoadFeatureNoticeSerial(std::uint32_t& serial) noexcept;
+[[nodiscard]] bool SaveFeatureNoticeSerial(std::uint32_t serial, std::wstring& error);
 
 }  // namespace gtg::settings

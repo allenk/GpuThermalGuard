@@ -19,8 +19,7 @@ struct ScopedGdiObject {
     ~ScopedGdiObject() { if (value != nullptr) DeleteObject(value); }
 };
 
-Gdiplus::Color SystemColor(const int index, const BYTE alpha = 255) {
-    const COLORREF color = GetSysColor(index);
+Gdiplus::Color ToColor(const COLORREF color, const BYTE alpha = 255) {
     return Gdiplus::Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color));
 }
 
@@ -56,9 +55,9 @@ void DrawOutlinedChartText(Gdiplus::Graphics& graphics, const std::wstring& text
                            const Gdiplus::RectF& bounds, Gdiplus::Font& font,
                            const Gdiplus::Color color,
                            const Gdiplus::StringAlignment alignment,
-                           const Gdiplus::REAL scale) {
+                           const Gdiplus::REAL scale, const COLORREF halo) {
     const Gdiplus::REAL offset = std::max(0.7F, 0.75F * scale);
-    const Gdiplus::Color outline(225, 255, 255, 255);
+    const Gdiplus::Color outline = ToColor(halo, 225);
     for (const auto [dx, dy] : {
              std::pair{-offset, 0.0F}, std::pair{offset, 0.0F},
              std::pair{0.0F, -offset}, std::pair{0.0F, offset}}) {
@@ -86,6 +85,12 @@ void HistoryChart::SetThresholds(const int trigger_temperature_c, const int safe
     safe_power_w_ = safe_power_w;
     maximum_power_w_ = maximum_power_w;
     Invalidate(FALSE);
+}
+
+void HistoryChart::AddTripMarker(const std::uint64_t monotonic_ms) {
+    trip_markers_.Add(monotonic_ms);
+    trip_markers_.Prune(monotonic_ms, telemetry::History::kRetainedDurationMs);
+    if (m_hWnd != nullptr) Invalidate(FALSE);
 }
 
 LRESULT HistoryChart::OnPaint(UINT, WPARAM, LPARAM, BOOL&) {
@@ -223,13 +228,14 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     }
     const HGDIOBJ old_bitmap = SelectObject(memory, bitmap.value);
     RECT client{0, 0, width, height};
-    ScopedGdiObject background_brush{CreateSolidBrush(GetSysColor(COLOR_WINDOW))};
+    const ChartPalette palette = palette_.value_or(ChartPalette::System());
+    ScopedGdiObject background_brush{CreateSolidBrush(palette.background)};
     FillRect(memory, &client, static_cast<HBRUSH>(background_brush.value));
 
     Gdiplus::Graphics graphics(memory);
     if (graphics.GetLastStatus() != Gdiplus::Ok) {
         SetBkMode(memory, TRANSPARENT);
-        SetTextColor(memory, GetSysColor(COLOR_GRAYTEXT));
+        SetTextColor(memory, palette.muted_text);
         const std::wstring unavailable(localization::Select(
             L"歷史圖表暫時不可用", L"History chart unavailable"));
         DrawTextW(memory, unavailable.c_str(), -1, &client,
@@ -288,10 +294,10 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
                              Gdiplus::UnitPoint);
     Gdiplus::Font small_font(&font_family, 7.0F, Gdiplus::FontStyleRegular,
                              Gdiplus::UnitPoint);
-    const auto muted_color = SystemColor(COLOR_GRAYTEXT);
-    const Gdiplus::Color plot_background(255, 249, 250, 252);
-    const Gdiplus::Color border_color(255, 205, 211, 219);
-    const Gdiplus::Color grid_color(150, 211, 217, 225);
+    const auto muted_color = ToColor(palette.muted_text);
+    const Gdiplus::Color plot_background = ToColor(palette.plot);
+    const Gdiplus::Color border_color = ToColor(palette.border);
+    const Gdiplus::Color grid_color = ToColor(palette.grid, 150);
     const Gdiplus::Color temperature_color(255, 224, 73, 71);
     const Gdiplus::Color power_color(255, 47, 124, 211);
     const Gdiplus::Color vram_color(255, 213, 126, 38);
@@ -310,7 +316,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     // It is still not a second record: no cell, no lane, no slot in the
     // arrangement, exactly like virtual commit behind RAM.
     const Gdiplus::Color net_color(255, 138, 176, 40);
-    const Gdiplus::Color net_sent_color(255, 62, 96, 140);
+    const Gdiplus::Color net_sent_color = ToColor(palette.net_sent);
     const Gdiplus::Color commit_color(255, 186, 148, 0);
     Gdiplus::SolidBrush plot_brush(plot_background);
     Gdiplus::Pen border_pen(border_color, 1.0F);
@@ -586,7 +592,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
             segments.push_back(std::move(points));
             draw_series(fps_plot, segments, fps_color, true);
         }
-        Gdiplus::SolidBrush gap_fill(Gdiplus::Color(95, 8, 19, 31));
+        Gdiplus::SolidBrush gap_fill(ToColor(palette.gap_shade, 95));
         Gdiplus::Pen delayed(Gdiplus::Color(230,
             static_cast<BYTE>(fps_color.GetR() * 0.45F),
             static_cast<BYTE>(fps_color.GetG() * 0.55F),
@@ -612,6 +618,28 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
             });
     }
 
+    // Protection trips: a solid line through the temperature lane at the
+    // moment it tripped, with a notch at the top so it reads as an event
+    // rather than another trace. Temperature lane only (owner, 2026-10-04).
+    {
+        Gdiplus::Pen trip_pen(Gdiplus::Color(235, 224, 73, 71), 1.5F * scale);
+        Gdiplus::SolidBrush trip_brush(Gdiplus::Color(235, 224, 73, 71));
+        const Gdiplus::REAL notch = 4.0F * scale;
+        for (const std::uint64_t time : trip_markers_.Times()) {
+            const auto fraction = MarkerFraction(time, visible_start, view_end);
+            if (!fraction) continue;
+            const Gdiplus::REAL x = temperature_plot.X +
+                static_cast<Gdiplus::REAL>(*fraction) * (temperature_plot.Width - 1.0F);
+            graphics.DrawLine(&trip_pen, x, temperature_plot.Y, x,
+                              temperature_plot.GetBottom() - 1.0F);
+            const Gdiplus::PointF triangle[] = {
+                {x - notch, temperature_plot.Y},
+                {x + notch, temperature_plot.Y},
+                {x, temperature_plot.Y + notch * 1.5F}};
+            graphics.FillPolygon(&trip_brush, triangle, 3);
+        }
+    }
+
     const auto draw_marker_label = [&](const std::wstring& label,
                                        const Gdiplus::RectF& plot,
                                        const Gdiplus::REAL y,
@@ -628,7 +656,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         DrawOutlinedChartText(graphics, label, rect, small_font, color,
                               place_left ? Gdiplus::StringAlignmentNear
                                          : Gdiplus::StringAlignmentFar,
-                              scale);
+                              scale, palette.halo);
     };
     draw_marker_label(localization::Format(L"觸發 {} °C", L"Trigger {} °C",
                                            trigger_temperature_c_),
@@ -652,7 +680,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         DrawOutlinedChartText(
             graphics, localization::Format(L"最高 {:.0f} °C", L"Max {:.0f} °C",
                                            *maximum_temperature),
-            badge, small_font, temperature_color, Gdiplus::StringAlignmentFar, scale);
+            badge, small_font, temperature_color, Gdiplus::StringAlignmentFar, scale, palette.halo);
     }
 
     std::optional<double> maximum_vram_percent;
@@ -678,7 +706,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
             : localization::Format(L"最高 {:.0f}%", L"Max {:.0f}%",
                                    *maximum_vram_percent);
         DrawOutlinedChartText(graphics, text, badge, small_font, vram_color,
-                              Gdiplus::StringAlignmentFar, scale);
+                              Gdiplus::StringAlignmentFar, scale, palette.halo);
     }
 
     const Gdiplus::REAL timeline_y = static_cast<Gdiplus::REAL>(height) - footer_height;
@@ -712,7 +740,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
         temperature_plot.X, track_y, temperature_plot.Width, 3.0F * scale);
     Gdiplus::GraphicsPath track_path;
     AddRoundedRectangle(track_path, track_rect, 1.5F * scale);
-    Gdiplus::SolidBrush track_brush(Gdiplus::Color(255, 214, 220, 228));
+    Gdiplus::SolidBrush track_brush(ToColor(palette.track));
     graphics.FillPath(&track_brush, &track_path);
 
     const Gdiplus::REAL thumb_width = std::max(
@@ -730,8 +758,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     Gdiplus::GraphicsPath thumb_path;
     AddRoundedRectangle(thumb_path, thumb_rect, 2.5F * scale);
     Gdiplus::SolidBrush thumb_brush(
-        follow_live_ ? Gdiplus::Color(255, 47, 124, 211)
-                     : Gdiplus::Color(255, 91, 104, 125));
+        follow_live_ ? ToColor(palette.thumb_live) : ToColor(palette.thumb_paused));
     graphics.FillPath(&thumb_brush, &thumb_path);
 
     graphics.Flush(Gdiplus::FlushIntentionSync);

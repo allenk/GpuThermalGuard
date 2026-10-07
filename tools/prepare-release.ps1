@@ -35,6 +35,11 @@ if ($Matches[1] -ne $baseVersion) {
     throw "Tag $Tag does not match GTG_VERSION $($Matches[1]) in version.cmake."
 }
 
+$manifestVersion = (Get-Content -LiteralPath 'vcpkg.json' -Raw | ConvertFrom-Json).version
+if ($manifestVersion -ne $baseVersion) {
+    throw "Tag $Tag does not match version $manifestVersion in vcpkg.json."
+}
+
 $cmake = Get-Content -LiteralPath 'CMakeLists.txt' -Raw
 if ($cmake -notmatch [regex]::Escape('project(GpuThermalGuard VERSION ${GTG_VERSION}')) {
     throw 'CMakeLists.txt no longer takes its project version from version.cmake.'
@@ -77,37 +82,53 @@ if ($ValidateOnly) {
 }
 
 $mainExe = Join-Path $BuildDirectory 'GpuThermalGuard.exe'
-$probeExe = Join-Path $BuildDirectory 'GpuThermalGuardProbe.exe'
-foreach ($file in @($mainExe, $probeExe)) {
+$overlayDll = Join-Path $BuildDirectory 'gtg_overlay.dll'
+foreach ($file in @($mainExe, $overlayDll)) {
     if (-not (Test-Path -LiteralPath $file)) { throw "Missing release binary: $file" }
 }
 
 if (Test-Path -LiteralPath $OutputDirectory) {
     Remove-Item -LiteralPath $OutputDirectory -Recurse -Force
 }
-$packageStem = "GpuThermalGuard-$version-windows-x64"
-if ($Unsigned) {
-    $packageStem = "GpuThermalGuard-$version-unsigned-windows-x64"
+New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+
+# Two packages around one EXE. The overlay is the DLL beside it: without the
+# DLL the EXE shows no overlay controls and registers no hotkey, so the same
+# binary is right for both. The read-only probe is a development tool and is
+# built from source, not shipped. Signing state is stated in the release notes, not
+# in the file names, so a later signed build keeps the same names.
+$documents = @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'README.zh-TW.md')
+$packages = @(
+    @{ Stem = "GpuThermalGuard-$version-windows-x64";            Files = @($mainExe, $overlayDll) },
+    @{ Stem = "GpuThermalGuard-$version-no-overlay-windows-x64"; Files = @($mainExe) }
+)
+$sums = [System.Collections.Generic.List[string]]::new()
+foreach ($package in $packages) {
+    $packageRoot = Join-Path $OutputDirectory $package.Stem
+    New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+    Copy-Item -LiteralPath ($package.Files + $documents) -Destination $packageRoot
+    $zipPath = Join-Path $OutputDirectory "$($package.Stem).zip"
+    Compress-Archive -Path "$packageRoot\*" -DestinationPath $zipPath -CompressionLevel Optimal
+    Remove-Item -LiteralPath $packageRoot -Recurse -Force
+    $hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
+    $sums.Add("$($hash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($zipPath))")
 }
-$packageRoot = Join-Path $OutputDirectory $packageStem
-New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
-Copy-Item -LiteralPath $mainExe, $probeExe, 'LICENSE', 'THIRD_PARTY_NOTICES.md',
-    'README.md', 'README.zh-TW.md' -Destination $packageRoot
-
-$zipPath = Join-Path $OutputDirectory "$packageStem.zip"
-Compress-Archive -Path "$packageRoot\*" -DestinationPath $zipPath -CompressionLevel Optimal
-Remove-Item -LiteralPath $packageRoot -Recurse -Force
-
-$hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
-"$($hash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($zipPath))" |
+($sums -join "`n") |
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Encoding utf8NoBOM
 
 $notes = [System.Collections.Generic.List[string]]::new()
 $notes.Add("# GpuThermalGuard $Tag")
 $notes.Add('')
+$notes.AddRange([string[]]@(
+    '| Download | Contents |',
+    '| --- | --- |',
+    "| ``GpuThermalGuard-$version-windows-x64.zip`` **(recommended)** | ``GpuThermalGuard.exe``, ``gtg_overlay.dll`` (in-game overlay) |",
+    "| ``GpuThermalGuard-$version-no-overlay-windows-x64.zip`` | ``GpuThermalGuard.exe`` -- the same EXE, without the overlay |",
+    ''
+))
 if ($Unsigned) {
     $notes.Add('> [!WARNING]')
-    $notes.Add('> **UNSIGNED PRERELEASE:** The executables in this archive do not have an Authenticode publisher signature. Verify the ZIP with `SHA256SUMS.txt` and the GitHub Actions build-provenance attestation before running it.')
+    $notes.Add('> **Not Authenticode-signed.** The executables and the overlay DLL carry no publisher signature. Verify each ZIP with `SHA256SUMS.txt` and the GitHub Actions build-provenance attestation (`gh attestation verify <zip> -R allenk/GpuThermalGuard`) before running it. Some antivirus products flag programs that load a DLL into another process; the overlay does that, by design and only when you press its hotkey.')
     $notes.Add('')
 }
 $notes.AddRange([string[]]@(
@@ -115,9 +136,9 @@ $notes.AddRange([string[]]@(
     '',
     "[Full changelog](https://github.com/allenk/GpuThermalGuard/blob/$Tag/CHANGELOG.md)",
     '',
-    '> Download the ZIP and verify it against `SHA256SUMS.txt`. The executable requests administrator privileges.'
+    '> The executable requests administrator privileges.'
 ))
 ($notes -join "`n") |
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'release-notes.md') -Encoding utf8NoBOM
 
-Write-Host "Prepared release package for $Tag in $OutputDirectory."
+Write-Host "Prepared release packages for $Tag in $OutputDirectory."

@@ -104,6 +104,7 @@ public:
         has_target_ = identity.pid != 0 && identity.creation_time != 0;
         measure_ = Measure::Displayed;
         last_displayed_us_ = 0;
+        ResetSparseDisplayed();
         ResetWindow(now_us);
     }
 
@@ -112,6 +113,7 @@ public:
         has_target_ = false;
         measure_ = Measure::Displayed;
         last_displayed_us_ = 0;
+        ResetSparseDisplayed();
         ResetWindow(0);
     }
 
@@ -152,11 +154,47 @@ public:
         // takes the composition token away -- drops to its presentation rate
         // after the same staleness window the surface rules use, instead of
         // going dark.
+        //
+        // ...unless the displayed stream is SPARSE: it keeps arriving, so it is
+        // never stale, but it carries almost none of the frames. Measured on
+        // a game's login screen: 42 displayed frames matched out
+        // of ~42 000 presents, every one of which PresentMon saw reach the
+        // screen. Displayed-wins then held the reading at 2 while the game ran
+        // at 120, and each burst reset the window. AF-20261001-fps-sparse-displayed.
+        //
+        // Sparse needs BOTH a long gap and presents inside it: a 1000 fps menu
+        // on a 60 Hz display has ~16 presents per displayed frame but a 16.7 ms
+        // gap, and its displayed 60 is the right number; a 5 fps program has a
+        // 200 ms gap but one present in it. Neither may be judged sparse.
         if (measure == Measure::Presented) {
-            if (last_displayed_us_ != 0 && timestamp_us >= last_displayed_us_ &&
+            if (last_displayed_us_ != 0) {
+                ++presents_since_displayed_;
+                if (!displayed_sparse_ && timestamp_us >= last_displayed_us_ &&
+                    timestamp_us - last_displayed_us_ > kSparseDisplayedGapUs &&
+                    presents_since_displayed_ >= kSparseDisplayedPresents) {
+                    displayed_sparse_ = true;
+                    dense_displayed_run_ = 0;
+                }
+            }
+            if (!displayed_sparse_ && last_displayed_us_ != 0 &&
+                timestamp_us >= last_displayed_us_ &&
                 timestamp_us - last_displayed_us_ <= kSurfaceStaleUs) return;
         } else {
+            const bool dense = last_displayed_us_ == 0 ||
+                timestamp_us < last_displayed_us_ ||
+                timestamp_us - last_displayed_us_ <= kSparseDisplayedGapUs ||
+                presents_since_displayed_ < kSparseDisplayedPresents;
             last_displayed_us_ = timestamp_us;
+            presents_since_displayed_ = 0;
+            if (displayed_sparse_) {
+                // Hysteresis. A short burst of matches is not evidence that
+                // correlation recovered; letting each burst win would flip the
+                // measure and reset the window every time -- the defect again.
+                dense_displayed_run_ = dense ? dense_displayed_run_ + 1 : 0;
+                if (dense_displayed_run_ < kDisplayedRecoveryRun) return;
+                displayed_sparse_ = false;
+                dense_displayed_run_ = 0;
+            }
         }
         if (measure != measure_) {
             ResetWindow(timestamp_us);
@@ -297,6 +335,27 @@ public:
 private:
     Measure measure_{Measure::Displayed};
     std::uint64_t last_displayed_us_{};
+
+    // Sparse-displayed state. Measure-selection state, like measure_ itself, so
+    // ResetWindow leaves it alone; only a target change clears it.
+    std::uint64_t presents_since_displayed_{};
+    std::size_t dense_displayed_run_{};
+    bool displayed_sparse_{};
+
+    void ResetSparseDisplayed() noexcept {
+        presents_since_displayed_ = 0;
+        dense_displayed_run_ = 0;
+        displayed_sparse_ = false;
+    }
+
+    // AF-20261001-fps-sparse-displayed. A displayed gap longer than this, with
+    // at least kSparseDisplayedPresents presents inside it, means the displayed
+    // stream is missing frames rather than the display being slower than the
+    // program. 100 ms is six frames at 60 Hz.
+    static constexpr std::uint64_t kSparseDisplayedGapUs = 100'000;
+    static constexpr std::uint64_t kSparseDisplayedPresents = 4;
+    // Consecutive dense displayed frames needed before displayed wins again.
+    static constexpr std::size_t kDisplayedRecoveryRun = 8;
 
     static constexpr std::uint64_t kWindowUs = 1'000'000;
     // Session warm-up alone does not make a tiny burst representative of a

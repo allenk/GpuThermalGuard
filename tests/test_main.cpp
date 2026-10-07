@@ -6,7 +6,12 @@
 #include "supervision/recovery_policy.hpp"
 #include "supervision/supervisor.hpp"
 #include "tray/window_position.hpp"
+#include "tray/control_baseline.hpp"
+#include "timing/ui_phase_timing.hpp"
 #include "tray/osd_compact.hpp"
+#include "tray/osd_placement.hpp"
+#include "tray/trip_markers.hpp"
+#include "tray/hotkey_capture.hpp"
 #include "core/working_power_apply.hpp"
 #include "core/restore_prompt_gate.hpp"
 #include "core/restore_policy.hpp"
@@ -20,6 +25,9 @@
 #include "service/pipe_server.hpp"
 #include "timing/protection_timing.hpp"
 #include "fps/fps_rate.hpp"
+#include "fps/present_path.hpp"
+#include "fps/play_clock.hpp"
+#include "fps/backend_resolution.hpp"
 #include "fps/observer_admission.hpp"
 #include "fps/fps_history.hpp"
 #include "fps/dxgi_event.hpp"
@@ -37,6 +45,7 @@
 #include <array>
 #include <cstring>
 #include <exception>
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -143,6 +152,120 @@ void TestOsdCompact() {
             }
         }
     }
+}
+
+// The backend label as AF-20260925-fps-backend-and-resolution defines it: the
+// events decide the family, the module list only names it, and a label that
+// cannot be established is the weaker claim, never a guess.
+void TestFpsBackendResolution() {
+    using gtg::fps::Backend;
+    using gtg::fps::LoadedRuntimes;
+    using gtg::fps::ResolveBackend;
+    const auto modules = [](bool d3d9, bool d3d11, bool d3d12, bool vulkan, bool opengl) {
+        LoadedRuntimes loaded{};
+        loaded.d3d9 = d3d9;
+        loaded.d3d11 = d3d11;
+        loaded.d3d12 = d3d12;
+        loaded.vulkan = vulkan;
+        loaded.opengl = opengl;
+        loaded.readable = true;
+        return loaded;
+    };
+    // Module list refused: the events alone.
+    Require(ResolveBackend(LoadedRuntimes{}, true) == Backend::DXGI,
+            "refused module list with a composition token is DX");
+    Require(ResolveBackend(LoadedRuntimes{}, false) == Backend::Unknown,
+            "refused module list without a token is no label");
+    // Within the DXGI family, one runtime loaded names it.
+    Require(ResolveBackend(modules(false, true, false, false, false), true) == Backend::D3D11,
+            "d3d11 alone under a composition token is D11");
+    Require(ResolveBackend(modules(false, false, true, false, false), true) == Backend::D3D12,
+            "d3d12 alone under a composition token is D12");
+    Require(ResolveBackend(modules(false, false, false, false, false), true) == Backend::DXGI,
+            "a composition token with neither d3d module is DX");
+    // Both loaded: the module list cannot tell which one presented. A DX11 game
+    // (2026-10-03) presents through D3D11 -- GetDevice(ID3D11Device) on the
+    // intercepted swap chain 295/295, ID3D12Device 0/295 E_NOINTERFACE --
+    // with d3d12.dll also loaded, and was labelled D12. A D3D12 game keeping
+    // d3d11 for interop is the mirror image. The label is the weaker claim.
+    Require(ResolveBackend(modules(false, true, true, false, false), true) == Backend::DXGI,
+            "d3d11 and d3d12 both loaded is DX, not a guess at either");
+    // No composition token: the DXGI modules are not the renderer.
+    Require(ResolveBackend(modules(false, true, true, false, false), false) == Backend::Unknown,
+            "d3d modules without a composition token name nothing");
+    Require(ResolveBackend(modules(false, false, false, true, true), false) == Backend::Vulkan,
+            "Vulkan outranks the opengl32 its ICD loads");
+    Require(ResolveBackend(modules(false, false, false, false, true), false) == Backend::OpenGL,
+            "opengl32 alone is GL");
+    Require(ResolveBackend(modules(true, false, false, false, false), false) == Backend::D3D9,
+            "d3d9 alone without a token is D9");
+}
+
+// AF-20261004-fps-backend-runtime-evidence: under a composition token the
+// live devices name the runtime; the module rule is the fallback.
+void TestFpsBackendFromRuntimeDevices() {
+    using gtg::fps::Backend;
+    using gtg::fps::LoadedRuntimes;
+    using gtg::fps::ResolveBackend;
+    using gtg::fps::RuntimeDevices;
+    LoadedRuntimes both{};
+    both.d3d11 = true;
+    both.d3d12 = true;
+    both.readable = true;
+    const auto devices = [](std::uint32_t d3d11, std::uint32_t d3d12) {
+        return RuntimeDevices{true, d3d11, d3d12};
+    };
+    // The four measured cases (findings, 2026-10-04).
+    Require(ResolveBackend(both, true, devices(1, 0)) == Backend::D3D11,
+            "D3D11 device only is D11, even with d3d12.dll loaded");
+    Require(ResolveBackend(both, true, devices(0, 1)) == Backend::D3D12,
+            "D3D12 device only is D12");
+    Require(ResolveBackend(both, true, devices(1, 1)) == Backend::DXGI,
+            "a device of each runtime is DX");
+    Require(ResolveBackend(both, true, devices(2, 0)) == Backend::D3D11,
+            "a DX11 game: two D3D11 devices and no D3D12 device is D11");
+    // Devices name the runtime even when the module list was refused.
+    Require(ResolveBackend(LoadedRuntimes{}, true, devices(0, 1)) == Backend::D3D12,
+            "live devices name the runtime without a module list");
+    // Fallbacks to the module rule.
+    Require(ResolveBackend(both, true, devices(0, 0)) == Backend::DXGI,
+            "no device seen falls back to the module rule");
+    Require(ResolveBackend(both, true, RuntimeDevices{false, 1, 0}) == Backend::DXGI,
+            "devices from providers that were not both enabled are not used");
+    // No composition token: the events say DXGI did not present; devices of
+    // a D3D runtime do not change that.
+    LoadedRuntimes vulkan{};
+    vulkan.vulkan = true;
+    vulkan.readable = true;
+    Require(ResolveBackend(vulkan, false, devices(1, 0)) == Backend::Vulkan,
+            "without a composition token a D3D device does not override VK");
+}
+
+void TestFpsDeviceLedger() {
+    using gtg::fps::D3DRuntime;
+    using gtg::fps::DeviceLedger;
+    DeviceLedger ledger;
+    ledger.Live(D3DRuntime::D3D11, 0x1000);
+    ledger.Live(D3DRuntime::D3D11, 0x1000);   // created, then reported: one device
+    ledger.Live(D3DRuntime::D3D11, 0x2000);
+    ledger.Live(D3DRuntime::D3D12, 0x3000);
+    Require(ledger.Count(D3DRuntime::D3D11) == 2, "a device reported twice counts once");
+    Require(ledger.Count(D3DRuntime::D3D12) == 1, "runtimes are counted apart");
+    ledger.Destroyed(D3DRuntime::D3D12, 0x3000);
+    Require(ledger.Count(D3DRuntime::D3D12) == 0,
+            "a probe device created and destroyed leaves none");
+    ledger.Destroyed(D3DRuntime::D3D11, 0x9999);
+    Require(ledger.Count(D3DRuntime::D3D11) == 2, "destroying an unknown device changes nothing");
+    // Without an identity (0) the ledger can only count, never below zero.
+    ledger.Live(D3DRuntime::D3D12, 0);
+    ledger.Live(D3DRuntime::D3D12, 0);
+    ledger.Destroyed(D3DRuntime::D3D12, 0);
+    Require(ledger.Count(D3DRuntime::D3D12) == 1, "anonymous devices are counted");
+    ledger.Destroyed(D3DRuntime::D3D12, 0);
+    ledger.Destroyed(D3DRuntime::D3D12, 0);
+    Require(ledger.Count(D3DRuntime::D3D12) == 0, "an anonymous count never goes below zero");
+    ledger.Clear();
+    Require(ledger.Count(D3DRuntime::D3D11) == 0, "Clear forgets every device");
 }
 
 void TestFpsRateIsIndependentAndHonest() {
@@ -253,6 +376,290 @@ void TestFpsRateReclaimsOldSwapchains() {
     Require(recovered.status == Status::Ready && recovered.surface == 1 &&
             recovered.displayed_fps >= 49.0 && recovered.displayed_fps <= 51.0,
         "transient capacity ambiguity must recover after one surface stabilizes");
+}
+
+// Measured 2026-10-01 on a commercial game's login screen: PresentMon saw
+// 120 presents/s, every one of them reaching the screen, while GTG's display
+// correlator matched 42 of 41 994 in ~351 s (0.1%). "Displayed wins while a
+// displayed frame is recent" then let that trickle override the complete
+// kernel-present stream, and every switch reset the window, so the indicator
+// read ~2, jumped to ~120 when a gap exceeded the stale window, and fell back.
+void TestFpsPlayClock() {
+    using gtg::fps::FormatPlayTime;
+    using gtg::fps::PlayClock;
+    constexpr std::uint64_t kGameA = 0xA, kGameB = 0xB;
+    constexpr std::uint64_t kMinute = 60'000;
+    // GTG ticks at 500 ms; `program` is whoever has a Ready FPS reading.
+    struct Run {
+        PlayClock clock;
+        std::uint64_t now{};
+        void For(const std::uint64_t ms, const std::optional<std::uint64_t> program) {
+            for (std::uint64_t end = now + ms; now < end;) {
+                now += 500;
+                clock.Tick(now, program);
+            }
+        }
+    };
+    // To the nearest minute: the first tick has no predecessor and counts nothing.
+    const auto minutes = [](const PlayClock& c) { return (c.ElapsedMs() + 30'000) / 60'000; };
+
+    {   // ALT+TAB and loading screens pause the count; they do not reset it.
+        Run r;
+        r.For(10 * kMinute, kGameA);
+        r.For(2 * kMinute, std::nullopt);
+        r.For(5 * kMinute, kGameA);
+        Require(minutes(r.clock) == 15 && r.clock.Program() == kGameA,
+                "a pause under three minutes keeps counting the same game");
+    }
+    {   // A short look at another program does not take over.
+        Run r;
+        r.For(20 * kMinute, kGameA);
+        r.For(1 * kMinute, kGameB);
+        r.For(5 * kMinute, kGameA);
+        Require(minutes(r.clock) == 25 && r.clock.Program() == kGameA,
+                "another program for a minute is not a switch");
+    }
+    {   // Switching games: after three minutes the new one takes over, and
+        // the three minutes it played meanwhile are added back.
+        Run r;
+        r.For(30 * kMinute, kGameA);
+        r.For(3 * kMinute, kGameB);
+        Require(r.clock.Program() == kGameB && minutes(r.clock) == 3,
+                "B takes over three minutes after A, with those three minutes added back");
+        r.For(2 * kMinute, kGameB);
+        Require(r.clock.Program() == kGameB && minutes(r.clock) == 5,
+                "and keeps counting from there");
+    }
+    {   // Three minutes with no FPS at all ends the count.
+        Run r;
+        r.For(45 * kMinute, kGameA);
+        r.For(3 * kMinute, std::nullopt);
+        Require(!r.clock.Program() && r.clock.ElapsedMs() == 0,
+                "three minutes without FPS ends the count");
+        r.For(2 * kMinute, kGameA);
+        Require(minutes(r.clock) == 2, "the same game afterwards starts a new count");
+    }
+    {   // A tick after sleep or a stall is not play time.
+        PlayClock clock;
+        clock.Tick(1'000, kGameA);
+        clock.Tick(1'500, kGameA);
+        clock.Tick(3'600'000, kGameA);
+        Require(clock.ElapsedMs() == 500, "a long gap between ticks is not counted");
+    }
+
+    const auto text = [](const std::uint64_t ms) { return std::wstring(FormatPlayTime(ms).data()); };
+    Require(text(0).empty() && text(59'999).empty(), "nothing under a minute");
+    Require(text(kMinute) == L"1 min" && text(59 * kMinute + 59'000) == L"59 min", "minutes");
+    Require(text(60 * kMinute) == L"1.0 hr", "an hour");
+    Require(text(7 * 60 * kMinute + 13 * kMinute) == L"7.2 hr", "tenths, rounded down");
+    Require(text(150ULL * 60 * kMinute) == L"99.9 hr", "held at 99.9 hr");
+}
+
+void TestFpsIndependentFlipKeepsCorrelatorHealthy() {
+    using gtg::fps::DisplayCorrelator;
+    using gtg::fps::PresentPath;
+    using gtg::fps::TokenKey;
+    constexpr std::uint64_t kSurface = 0x22F'00000000ULL;
+    constexpr std::uint32_t kGameThread = 100;
+    constexpr std::uint32_t kDwmThread = 200;
+
+    // One target frame as a DX11 game produced them on 2026-10-07 under
+    // independent flip: DXGI start/stop, the Win32k token, InFrame, and DWM's
+    // surface update -- and no DWM flip, ever.
+    const auto run = [&](const bool gated) {
+        DisplayCorrelator correlator;
+        PresentPath path;
+        path.NoteTargetSurface(kSurface);
+        correlator.SetDwmThread(kDwmThread);
+        for (std::uint64_t frame = 1; frame <= 200; ++frame) {
+            const std::uint64_t t = frame * 4'032;
+            const TokenKey key{kSurface, frame, 1};
+            correlator.OnPresentStart(kGameThread, 0xC0FFEE, 0, t);
+            correlator.OnPresentStop(kGameThread, 0);
+            correlator.OnToken(kGameThread, key, t);
+            path.NoteInFrame(kSurface, true);
+            if (!gated || path.ForwardsInFrame(kSurface, true)) correlator.OnInFrame(key);
+            correlator.OnSurfaceUpdate(key);
+            if (!correlator.Healthy()) return frame;
+        }
+        return std::uint64_t{0};
+    };
+    const auto failed_at = run(false);
+    Require(failed_at >= 30 && failed_at <= 40,
+            "ungated, the waiting queue overflows within ~33 frames (the field failure)");
+    Require(run(true) == 0, "gated, 200 independent-flip frames leave the correlator healthy");
+
+    PresentPath path;
+    path.NoteTargetSurface(kSurface);
+    Require(path.ForwardsInFrame(kSurface, false), "a composed target frame is correlated");
+    Require(path.ForwardsInFrame(0xBEEF, true), "another program's frames are untouched");
+}
+
+void TestFpsIndependentFlipFallsBackToPresented() {
+    using gtg::fps::Identity;
+    using gtg::fps::Measure;
+    using gtg::fps::PresentPath;
+    using gtg::fps::RateTracker;
+    using gtg::fps::Status;
+    const Identity game{84400, 999};
+    constexpr std::uint64_t kSurface = 0x297'00000000ULL;
+    constexpr std::uint64_t kEnd = 10'000'000;
+
+    // A DX11 game, measured 2026-10-07, widget not pinned: every
+    // InFrame of the game's surface independent, ~248 kernel presents/s, and
+    // ~26/s frames the DWM correlator still matched.
+    struct Event { std::uint64_t t; bool displayed; };
+    std::vector<Event> events;
+    for (std::uint64_t t = 0; t <= kEnd; t += 4'032) events.push_back({t, false});   // ~248/s
+    for (std::uint64_t t = 1'000; t <= kEnd; t += 38'461) events.push_back({t, true}); // ~26/s
+    std::sort(events.begin(), events.end(),
+              [](const Event& a, const Event& b) { return a.t < b.t; });
+    const auto feed = [&](RateTracker& tracker, const PresentPath* path) {
+        for (const auto& e : events) {
+            if (!e.displayed) tracker.RecordPresented(game, 0x10, e.t);
+            else if (path == nullptr || path->CountsAsDisplayed())
+                tracker.RecordDisplayed(game, kSurface, e.t);
+        }
+    };
+
+    // The defect, kept as a record of why the gate exists: the trickle wins.
+    {
+        RateTracker tracker;
+        tracker.SetTarget(game, 0);
+        feed(tracker, nullptr);
+        const auto r = tracker.Read(kEnd, true);
+        Require(r.status == Status::Ready && r.measure == Measure::Displayed &&
+                    r.displayed_fps < 40.0,
+                "ungated, a 26/s matched trickle out-ranks 248 presents/s (the field reading)");
+    }
+
+    // Gated by the observed path: presented, and close to what the game submits.
+    {
+        PresentPath path;
+        path.NoteTargetSurface(kSurface);
+        path.NoteInFrame(kSurface, true);
+        RateTracker tracker;
+        tracker.SetTarget(game, 0);
+        feed(tracker, &path);
+        const auto r = tracker.Read(kEnd, true);
+        Require(r.status == Status::Ready && r.measure == Measure::Presented &&
+                    r.displayed_fps > 230.0 && r.displayed_fps < 265.0,
+                "independent flip: reads the presented rate, labelled presented");
+    }
+
+    // Composed (widget pinned): displayed still counts.
+    {
+        PresentPath path;
+        path.NoteTargetSurface(kSurface);
+        path.NoteInFrame(kSurface, false);
+        Require(path.CountsAsDisplayed(), "composed: displayed counts");
+        path.NoteInFrame(kSurface, true);
+        Require(!path.CountsAsDisplayed(), "the latest InFrame decides");
+        path.NoteInFrame(kSurface, false);
+        Require(path.CountsAsDisplayed(), "back to composed, displayed counts again");
+    }
+
+    // Only the target's own surfaces move it.
+    {
+        PresentPath path;
+        path.NoteTargetSurface(kSurface);
+        path.NoteInFrame(0xBEEF, true);
+        Require(path.CountsAsDisplayed(), "another program's independent flip is ignored");
+        Require(!path.IsTarget(0), "a zero surface is never the target");
+        for (std::uint64_t s = 1; s <= 6; ++s) path.NoteTargetSurface(s);
+        Require(path.IsTarget(6) && !path.IsTarget(kSurface),
+                "bounded: the oldest surface gives way");
+        path.Reset();
+        Require(!path.IsTarget(6) && path.CountsAsDisplayed(), "reset forgets everything");
+    }
+}
+
+void TestFpsRateSparseDisplayedCannotOverridePresents() {
+    using gtg::fps::Identity;
+    using gtg::fps::RateTracker;
+    using gtg::fps::Status;
+    const Identity game{50612, 777};
+    constexpr std::uint64_t kPresentEveryUs = 8'333;   // 120 presents/s
+
+    struct Event { std::uint64_t t; bool displayed; };
+    auto feed = [&](RateTracker& tracker, std::vector<Event> events) {
+        std::sort(events.begin(), events.end(),
+                  [](const Event& a, const Event& b) { return a.t < b.t; });
+        for (const auto& e : events) {
+            if (e.displayed) tracker.RecordDisplayed(game, 0xD, e.t);
+            else tracker.RecordPresented(game, 0x10, e.t);
+        }
+    };
+    auto presents = [&](std::uint64_t until) {
+        std::vector<Event> out;
+        for (std::uint64_t t = 0; t <= until; t += kPresentEveryUs)
+            out.push_back({t, false});
+        return out;
+    };
+
+    // 1. A steady 2/s trickle of matched frames beside 120 presents/s. The
+    //    trickle never goes stale. Before the fix: Ready, 2.0 FPS -- the number
+    //    the owner saw on the login screen.
+    {
+        RateTracker tracker;
+        tracker.SetTarget(game, 0);
+        auto events = presents(10'000'000);
+        for (std::uint64_t t = 250'000; t <= 10'000'000; t += 500'000)
+            events.push_back({t, true});
+        feed(tracker, events);
+        const auto r = tracker.Read(10'000'000, true);
+        Require(r.status == Status::Ready && r.displayed_fps >= 108.0 &&
+                r.displayed_fps <= 132.0,
+            "a 2/s matched-frame trickle cannot override 120 presents/s");
+    }
+
+    // 2. Rare bursts, closer to the field shape. Each burst flips the measure and
+    //    resets the window, and the window never refills before the next one:
+    //    before the fix, all 57 reads over 30 s were Warmup -- never a number.
+    //    After it, every Ready read must be ~120, and there must be plenty.
+    {
+        RateTracker tracker;
+        tracker.SetTarget(game, 0);
+        auto events = presents(30'000'000);
+        // A burst of three matched frames every 3.5 s, 2 ms apart.
+        for (std::uint64_t b = 1'000'000; b <= 30'000'000; b += 3'500'000)
+            for (std::uint64_t k = 0; k < 3; ++k) events.push_back({b + k * 2'000, true});
+        std::sort(events.begin(), events.end(),
+                  [](const Event& a, const Event& b) { return a.t < b.t; });
+        std::size_t next = 0;
+        std::size_t checked = 0;
+        for (std::uint64_t until = 500'000; until <= 30'000'000; until += 500'000) {
+            for (; next < events.size() && events[next].t <= until; ++next) {
+                if (events[next].displayed) tracker.RecordDisplayed(game, 0xD, events[next].t);
+                else tracker.RecordPresented(game, 0x10, events[next].t);
+            }
+            if (until < 2'000'000) continue;
+            const auto r = tracker.Read(until, true);
+            if (r.status != Status::Ready) continue;
+            ++checked;
+            Require(r.displayed_fps >= 108.0 && r.displayed_fps <= 132.0,
+                "rare matched-frame bursts cannot pull the reading away from 120");
+        }
+        Require(checked >= 40,
+            "the burst scenario produced enough Ready readings to mean something");
+    }
+
+    // 3. The design must survive: when displayed frames keep pace -- every frame
+    //    a 60 Hz display can show, beside a 120/s present rate -- what reached
+    //    the screen is still the stronger claim and still wins. Passes before
+    //    the fix (59.9988) and must keep passing after it.
+    {
+        RateTracker tracker;
+        tracker.SetTarget(game, 0);
+        auto events = presents(10'000'000);
+        for (std::uint64_t t = 4'000; t <= 10'000'000; t += 16'667)
+            events.push_back({t, true});
+        feed(tracker, events);
+        const auto r = tracker.Read(10'000'000, true);
+        Require(r.status == Status::Ready && r.displayed_fps >= 57.0 &&
+                r.displayed_fps <= 63.0,
+            "displayed frames that keep pace still define the rate");
+    }
 }
 
 void TestAccessDeniedObserverProbation() {
@@ -1228,6 +1635,66 @@ void TestOsdPreferenceDefaultsOn() {
             "and a default-constructed preference agrees with the resolver");
 }
 
+void TestEffectiveOsdScale() {
+    using gtg::settings::EffectiveOsdScale;
+    // The default, and the whole of acceptance criterion 1: a stored zero has
+    // to reproduce the display scale exactly, for every display, or an
+    // upgraded install draws differently from the one it replaced.
+    Require(EffectiveOsdScale(0, 96) == 1.0F, "auto at 100% is 1.0");
+    Require(EffectiveOsdScale(0, 168) == 1.75F, "auto at 175% is 1.75");
+    Require(EffectiveOsdScale(0, 192) == 2.0F, "auto at 200% is 2.0");
+    // A missing DPI is 96 rather than zero, so a caller without a window
+    // still gets a drawable scale instead of an invisible overlay.
+    Require(EffectiveOsdScale(0, 0) == 1.0F, "an absent dpi falls back to 100%");
+
+    // An explicit choice ignores the display entirely. That is the point of
+    // the setting: the same number means the same size everywhere.
+    Require(EffectiveOsdScale(125, 96) == 1.25F, "explicit ignores a 100% display");
+    Require(EffectiveOsdScale(125, 168) == 1.25F, "explicit ignores a 175% display");
+    Require(EffectiveOsdScale(75, 192) == 0.75F, "explicit can be smaller than the display");
+
+    // Out of range resolves to the display rather than clamping. A number
+    // written by a later version becomes "follow the display", never a size
+    // nobody chose.
+    Require(EffectiveOsdScale(49, 168) == 1.75F, "below the range falls back to auto");
+    Require(EffectiveOsdScale(301, 168) == 1.75F, "above the range falls back to auto");
+    Require(EffectiveOsdScale(-100, 168) == 1.75F, "a negative falls back to auto");
+    // The boundaries themselves are accepted.
+    Require(EffectiveOsdScale(50, 168) == 0.5F, "the lower bound is usable");
+    Require(EffectiveOsdScale(300, 168) == 3.0F, "the upper bound is usable");
+
+    Require(gtg::settings::OsdPreference{}.scale_percent == 0,
+            "and a default-constructed preference means auto");
+}
+
+void TestDipPixelConversions() {
+    using gtg::tray::compact::ToPixels;
+    using gtg::tray::compact::ToDip;
+    // These replaced MulDiv, and the point of naming them was to pin the
+    // rounding. MulDiv rounds to nearest; a cast truncates, which is a pixel
+    // short on any odd dimension, and that difference already escaped into a
+    // build once before a smoke test caught it.
+    Require(ToPixels(51.0F, 1.75F) == 89, "51 dip at 175% rounds up to 89");
+    Require(ToPixels(51.0F, 1.0F) == 51, "identity at 100%");
+    Require(ToPixels(72.0F, 1.25F) == 90, "exact products are unaffected");
+    Require(ToPixels(88.0F, 1.75F) == 154, "88 dip at 175% is 154");
+    // Matches MulDiv(dip, dpi, 96) for the DPIs the OSD actually meets.
+    for (const int dip : {30, 51, 72, 88, 330, 388}) {
+        for (const int dpi : {96, 120, 144, 168, 192}) {
+            const int expected = (dip * dpi + 48) / 96;   // MulDiv, positives
+            Require(ToPixels(static_cast<float>(dip),
+                             static_cast<float>(dpi) / 96.0F) == expected,
+                    "matches MulDiv");
+        }
+    }
+    Require(ToDip(1085, 1.75F) == 620, "pixels back to dip round too");
+    Require(ToDip(620, 1.0F) == 620, "identity at 100%");
+    // A zero scale cannot divide. Returning the input unchanged keeps a
+    // caller that has not established a scale yet from getting a division
+    // fault or an absurd number.
+    Require(ToDip(620, 0.0F) == 620, "a zero scale is passed through");
+}
+
 void TestRamPreferenceDefaultsOn() {
     Require(gtg::settings::ResolveRamPreference(false, 0),
             "absent preference enables the RAM record");
@@ -2109,10 +2576,14 @@ void TestCompactLayoutStoredValueCannotHideARecord() {
     for (std::uint32_t rubbish : {0xFFFFFFFFu, 0x12345678u, 0xDEADBEEFu,
                                   0x10000000u, 0x1FFFFFFFu}) {
         const Layout safe = SanitizeLayout(rubbish);
-        int seen[7]{};
+        // kRecordCount, not a literal. This was `int seen[7]`, written before
+        // the Network record made it eight, so every sanitized layout wrote one
+        // element past the array. Release never noticed; the Debug runtime's
+        // stack check stopped on it on 2026-10-01.
+        int seen[kRecordCount]{};
         for (const Metric metric : safe.order)
             ++seen[static_cast<int>(metric)];
-        for (int i = 0; i < 7; ++i)
+        for (int i = 0; i < kRecordCount; ++i)
             Require(seen[i] == 1, "every record present exactly once after sanitizing");
         Require((safe.breaks >> kMaxBreaks) == 0, "no break bit outside the field");
     }
@@ -3212,7 +3683,345 @@ void TestHiddenWindowSnapshotCanBeEncoded() {
     Gdiplus::GdiplusShutdown(token);
 }
 
+void TestOsdModePositions() {
+    using namespace gtg::tray::placement;
+    // An older install has only OsdX/OsdY; both shapes start from it.
+    const auto upgraded = FromStored(POINT{3147, 291}, std::nullopt);
+    Require(upgraded.expanded && upgraded.collapsed &&
+                upgraded.collapsed->x == 3147 && upgraded.collapsed->y == 291,
+            "compact without its own position starts from the shared one");
+    const auto both = FromStored(POINT{100, 200}, POINT{3700, 300});
+    Require(both.expanded->x == 100 && both.collapsed->x == 3700,
+            "each shape keeps its own stored position");
+    Require(!FromStored(std::nullopt, std::nullopt).collapsed,
+            "nothing stored means nothing remembered");
+
+    // The chevron stays put: a compact column (84 px) on a right edge
+    // expands to 388 px leftwards and collapses back to exactly where it was,
+    // however many times it is clicked (owner, 2026-10-05).
+    POINT at{3756, 291};
+    for (int click = 0; click < 6; ++click) {
+        const bool collapsed = click % 2 == 0;
+        const int before = collapsed ? 84 : 388;
+        const int after = collapsed ? 388 : 84;
+        const POINT next = ToggleKeepingButton(at, before, after);
+        Require(next.x + after == at.x + before && next.y == at.y,
+                "the right edge and the top do not move");
+        at = next;
+    }
+    Require(at.x == 3756 && at.y == 291, "an even number of clicks ends where it began");
+}
+
+void TestUiThemePreference() {
+    using namespace gtg::settings;
+    Require(UiThemeFromRegistryValue(L"dark") == UiTheme::Dark, "dark round-trips");
+    Require(UiThemeFromRegistryValue(L"light") == UiTheme::Light, "light round-trips");
+    Require(UiThemeFromRegistryValue(L"auto") == UiTheme::Auto, "auto round-trips");
+    Require(UiThemeFromRegistryValue(L"") == UiTheme::Auto, "empty is auto");
+    Require(UiThemeFromRegistryValue(L"Dark") == UiTheme::Auto &&
+                UiThemeFromRegistryValue(L"sepia") == UiTheme::Auto,
+            "unrecognised is auto, never a guess");
+    for (const auto theme : {UiTheme::Auto, UiTheme::Dark, UiTheme::Light}) {
+        Require(UiThemeFromRegistryValue(RegistryValue(theme)) == theme,
+                "every value survives the registry");
+    }
+
+    // Every combination of the four inputs.
+    for (const auto preference : {UiTheme::Auto, UiTheme::Dark, UiTheme::Light}) {
+        for (const bool system_dark : {false, true}) {
+            for (const bool supported : {false, true}) {
+                for (const bool contrast : {false, true}) {
+                    const auto got = ResolveAppearance(preference, system_dark, supported, contrast);
+                    const bool want_dark =
+                        !contrast && supported &&
+                        (preference == UiTheme::Dark ||
+                         (preference == UiTheme::Auto && system_dark));
+                    Require(got == (want_dark ? Appearance::Dark : Appearance::Classic),
+                            "appearance follows the rule for every combination");
+                }
+            }
+        }
+    }
+    Require(ResolveAppearance(UiTheme::Dark, true, true, true) == Appearance::Classic,
+            "high contrast wins over an explicit dark");
+    Require(ResolveAppearance(UiTheme::Dark, true, false, false) == Appearance::Classic,
+            "unsupported dark falls back to classic, never half-dark");
+    Require(ResolveAppearance(UiTheme::Light, true, true, false) == Appearance::Classic,
+            "light ignores the system app mode");
+}
+
+void TestOverlayPreferences() {
+    using namespace gtg::settings;
+    Require(ResolveOverlayEnabled(false, 1), "absent overlay preference defaults on without automatic injection");
+    Require(ResolveOverlayEnabled(true, 1) && !ResolveOverlayEnabled(true, 0),
+            "stored overlay preference is honoured");
+
+    Require(kDefaultOverlayHotkey.modifiers == MOD_ALT && kDefaultOverlayHotkey.key == VK_F10,
+            "default hotkey is Alt+F10");
+    Require(IsAcceptableOverlayHotkey(kDefaultOverlayHotkey), "the default is acceptable");
+    Require(!IsAcceptableOverlayHotkey({MOD_ALT, VK_F12}), "F12 is reserved for debuggers");
+    Require(!IsAcceptableOverlayHotkey({0, VK_F10}), "a bare key is refused");
+    Require(!IsAcceptableOverlayHotkey({MOD_ALT | MOD_NOREPEAT, VK_F10}),
+            "only the four modifiers are stored");
+    Require(!IsAcceptableOverlayHotkey({MOD_CONTROL, VK_SHIFT}),
+            "a modifier is not a key");
+    Require(!IsAcceptableOverlayHotkey({MOD_ALT, 0}), "no key is refused");
+    Require(IsAcceptableOverlayHotkey({MOD_CONTROL | MOD_SHIFT, 'O'}), "Ctrl+Shift+O is fine");
+
+    const OverlayHotkey chosen{MOD_CONTROL | MOD_ALT, VK_F9};
+    Require(ResolveOverlayHotkey(true, PackOverlayHotkey(chosen)) == chosen,
+            "a hotkey survives the registry");
+    Require(ResolveOverlayHotkey(false, PackOverlayHotkey(chosen)) == kDefaultOverlayHotkey,
+            "absent is the default");
+    Require(ResolveOverlayHotkey(true, PackOverlayHotkey({MOD_ALT, VK_F12})) ==
+                kDefaultOverlayHotkey,
+            "a stored F12 reads as the default, not as F12");
+    Require(ResolveOverlayHotkey(true, 0xFFFFFFFFU) == kDefaultOverlayHotkey,
+            "garbage reads as the default");
+}
+
+void TestHotkeyCapture() {
+    using namespace gtg::tray::hotkey;
+    using gtg::settings::OverlayHotkey;
+    Capture capture;
+    Require(capture.Judge() == Verdict::Empty, "nothing pressed is empty");
+
+    capture.KeyDown(VK_LMENU);
+    Require(capture.Judge() == Verdict::Incomplete &&
+                capture.Shown() == OverlayHotkey{MOD_ALT, 0},
+            "a held modifier shows on its own");
+    capture.KeyDown(VK_LMENU);   // auto-repeat
+    capture.KeyDown(VK_F10);
+    Require(capture.Judge() == Verdict::Acceptable &&
+                capture.Shown() == OverlayHotkey{MOD_ALT, VK_F10},
+            "Alt then F10 records Alt+F10");
+    capture.KeyUp(VK_F10);
+    capture.KeyUp(VK_LMENU);
+    Require(capture.Shown() == OverlayHotkey{MOD_ALT, VK_F10},
+            "releasing keeps the finished combination on screen");
+
+    capture.KeyDown(VK_RCONTROL);
+    Require(capture.Judge() == Verdict::Incomplete &&
+                capture.Shown() == OverlayHotkey{MOD_CONTROL, 0},
+            "a new modifier after a finished combination starts over");
+    capture.KeyDown(VK_LSHIFT);
+    capture.KeyDown('O');
+    Require(capture.Shown() == OverlayHotkey{MOD_CONTROL | MOD_SHIFT, 'O'},
+            "two modifiers and a letter");
+    capture.KeyUp(VK_LSHIFT);
+    capture.KeyUp(VK_RCONTROL);
+
+    capture.KeyDown(VK_F9);
+    Require(capture.Judge() == Verdict::NeedsModifier, "a bare key needs a modifier");
+    capture.KeyDown(VK_MENU);
+    capture.KeyDown(VK_F12);
+    Require(capture.Judge() == Verdict::Reserved, "F12 is reserved");
+    capture.KeyUp(VK_MENU);
+
+    capture.KeyDown(VK_LWIN);
+    capture.KeyDown('G');
+    Require(capture.Judge() == Verdict::Acceptable &&
+                capture.Shown() == OverlayHotkey{MOD_WIN, 'G'},
+            "Win counts as a modifier");
+    capture.KeyUp(VK_LWIN);
+
+    capture.Show(OverlayHotkey{MOD_ALT, VK_F10});
+    Require(capture.Judge() == Verdict::Acceptable && capture.Held() == 0,
+            "a stored combination is shown as finished");
+
+    Require(PassesThrough(VK_TAB, 0) && PassesThrough(VK_TAB, MOD_SHIFT),
+            "Tab and Shift+Tab keep moving focus");
+    Require(PassesThrough(VK_ESCAPE, 0) && PassesThrough(VK_RETURN, 0),
+            "Escape and Enter keep closing the dialog");
+    Require(!PassesThrough(VK_RETURN, MOD_ALT) && !PassesThrough(VK_TAB, MOD_CONTROL) &&
+                !PassesThrough(VK_F10, 0),
+            "with a real modifier, or any other key, it is recorded");
+}
+
+void TestTripMarkers() {
+    using gtg::tray::MarkerFraction;
+    using gtg::tray::TripMarkers;
+    Require(MarkerFraction(1'000, 1'000, 301'000) == 0.0, "view start is 0");
+    Require(MarkerFraction(301'000, 1'000, 301'000) == 1.0, "view end is 1");
+    Require(MarkerFraction(151'000, 1'000, 301'000) == 0.5, "middle is 0.5");
+    Require(!MarkerFraction(999, 1'000, 301'000), "before the view is not drawn");
+    Require(!MarkerFraction(301'001, 1'000, 301'000), "after the view is not drawn");
+    Require(!MarkerFraction(5, 10, 10), "an empty view draws nothing");
+
+    TripMarkers markers;
+    markers.Add(1'000);
+    markers.Add(2'000'000);
+    markers.Prune(3'700'000, 3'600'000);
+    Require(markers.Times().size() == 1 && markers.Times().front() == 2'000'000,
+            "a trip older than the retained hour is dropped");
+    for (std::uint64_t i = 0; i < TripMarkers::kCapacity + 5; ++i) markers.Add(3'000'000 + i);
+    Require(markers.Times().size() == TripMarkers::kCapacity &&
+                markers.Times().back() == 3'000'000 + TripMarkers::kCapacity + 4,
+            "bounded, keeping the newest");
+}
+
+void TestOsdIdleClock() {
+    using namespace gtg::tray::compact;
+    Require(!HeaderIdle(true, false, 10'000, 0), "pointer over the window is never idle");
+    Require(!HeaderIdle(false, false, 11'999, 10'000), "away under two seconds is not idle");
+    Require(HeaderIdle(false, false, 12'000, 10'000), "away two seconds is idle");
+    Require(!HeaderIdle(false, true, 60'000, 10'000),
+            "unlocked is never idle: the amber lock stays visible");
+    Require(!HeaderIdle(false, false, 5, 10), "a clock that went backwards is not idle");
+    const auto text = [](const std::array<wchar_t, 9>& clock) { return std::wstring(clock.data()); };
+    Require(text(FormatWallClock(0, 0, 0)) == L"00:00:00", "midnight");
+    Require(text(FormatWallClock(9, 5, 7)) == L"09:05:07", "leading zeros");
+    Require(text(FormatWallClock(23, 59, 59)) == L"23:59:59", "last second of the day");
+}
+
+void TestOsdSnap() {
+    using gtg::tray::placement::Snap;
+    // Two 1920 monitors side by side, a taskbar on the left one.
+    const std::array<RECT, 2> areas{RECT{0, 0, 1920, 1040}, RECT{1920, 0, 3840, 1080}};
+    const auto window = [](const int x, const int y) {
+        return RECT{x, y, x + 300, y + 100};
+    };
+    const auto same = [](const RECT& a, const RECT& b) {
+        return a.left == b.left && a.top == b.top && a.right == b.right &&
+               a.bottom == b.bottom;
+    };
+    Require(same(Snap(window(500, 500), areas, 12), window(500, 500)),
+            "far from every edge nothing moves");
+    Require(same(Snap(window(8, 500), areas, 12), window(0, 500)),
+            "left work-area edge pulls");
+    Require(same(Snap(window(13, 500), areas, 12), window(13, 500)),
+            "beyond the threshold it lets go");
+    Require(same(Snap(window(3530, 500), areas, 12), window(3540, 500)),
+            "right edge pulls the window's right side");
+    Require(same(Snap(window(500, 935), areas, 12), window(500, 940)),
+            "taskbar top is a work-area edge");
+    Require(same(Snap(window(1615, 500), areas, 12), window(1620, 500)),
+            "monitor seam pulls from the left side");
+    Require(same(Snap(window(1926, 500), areas, 12), window(1920, 500)),
+            "monitor seam pulls from the right side");
+    Require(same(Snap(window(8, 4), areas, 12), window(0, 0)),
+            "a corner snaps on both axes");
+    // A line beside the window, not alongside it, is not a wall: the second
+    // monitor's bottom (1080) is 5 px from this window's bottom but no edge
+    // for a window on the first monitor.
+    Require(same(Snap(window(500, 975), areas, 12), window(500, 975)),
+            "only lines alongside the window count");
+    Require(same(Snap(window(8, 500), areas, 0), window(8, 500)),
+            "a zero threshold disables snapping");
+
+    // Work areas and monitor bounds together: the taskbar's top and the
+    // screen's bottom are both edges (owner, 2026-10-05).
+    const std::array<RECT, 2> both{RECT{0, 0, 1920, 1040}, RECT{0, 0, 1920, 1080}};
+    Require(same(Snap(window(500, 935), both, 12), window(500, 940)),
+            "near the taskbar it lands on the taskbar's top");
+    Require(same(Snap(window(500, 975), both, 12), window(500, 980)),
+            "near the screen's bottom it lands on the screen's bottom");
+
+    // The 2026-10-04 defect, reproduced. Windows' move loop hands WM_MOVING the
+    // previous rectangle plus the mouse's movement since; snapping that
+    // rectangle can never be dragged off an edge. Drag right in 4 px steps from
+    // 30 px off the left edge, 60 steps: the cursor ends 210 px off the edge.
+    using gtg::tray::placement::FromCursor;
+    RECT incremental = window(30, 500);
+    for (int step = 0; step < 60; ++step) {
+        const int move = step < 10 ? -4 : 4;   // in to the edge, then away
+        OffsetRect(&incremental, move, 0);
+        incremental = Snap(incremental, areas, 12);
+    }
+    Require(incremental.left == 0,
+            "incremental snapping is stuck at the edge (the defect this guards)");
+
+    const POINT grab{40, 10};
+    POINT cursor{30 + grab.x, 500 + grab.y};
+    RECT anchored{};
+    bool touched = false;
+    for (int step = 0; step < 60; ++step) {
+        cursor.x += step < 10 ? -4 : 4;
+        anchored = Snap(FromCursor(cursor, grab, SIZE{300, 100}), areas, 12);
+        touched = touched || anchored.left == 0;
+    }
+    Require(touched, "anchored snapping still pulls to the edge on the way in");
+    Require(anchored.left == 30 - 40 + 200 && anchored.left == cursor.x - grab.x,
+            "anchored snapping lets go and follows the cursor on the way out");
+}
+
 }  // namespace
+
+void TestFeatureNoticeSerial() {
+    using namespace gtg::settings;
+    Require(NeedsFeatureNotice(false, 0), "first use receives current feature notice");
+    Require(NeedsFeatureNotice(true, 0), "old boolean false cannot acknowledge feature serial");
+    Require(NeedsFeatureNotice(true, kFeatureNoticeSerial + 1), "different feature serial notifies");
+    Require(!NeedsFeatureNotice(true, kFeatureNoticeSerial), "acknowledged feature serial does not repeat");
+}
+
+void TestSettingsTextBaseline() {
+    Require(!gtg::timing::IsSlowUiPhase(1000, 1099) &&
+            gtg::timing::IsSlowUiPhase(1000, 1100) &&
+            gtg::timing::IsSlowUiPhase(1000, 11000) &&
+            !gtg::timing::IsSlowUiPhase(1000, 999),
+            "slow-stage timing handles threshold and backwards readings");
+    Require(gtg::tray::ButtonCornerDiameter(96) == 8 &&
+            gtg::tray::ButtonCornerDiameter(168) == 14 &&
+            gtg::tray::ButtonCornerDiameter(192) == 16,
+            "owner draw corner diameter scales with dialog DPI");
+    struct Windows {
+        HWND parent{};
+        HFONT font{};
+        ~Windows() { if (parent) DestroyWindow(parent); if (font) DeleteObject(font); }
+    } owned;
+    owned.parent = CreateWindowExW(0, L"STATIC", L"owned baseline oracle", WS_POPUP,
+        0, 0, 600, 160, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Require(owned.parent != nullptr, "owned baseline parent");
+    const auto label = CreateWindowExW(0, L"STATIC", L"Working Limit (W)", WS_CHILD,
+        10, 40, 200, 30, owned.parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    const auto edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"350",
+        WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, 220, 20, 100, 40,
+        owned.parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Require(label && edit, "native single-line controls");
+    for (int dpi : {96, 120, 144, 168, 192, 96}) {
+        const auto replacement = CreateFontW(-MulDiv(9, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+            FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        Require(replacement != nullptr, "DPI test font");
+        SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(replacement), FALSE);
+        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(replacement), FALSE);
+        if (owned.font) DeleteObject(owned.font);
+        owned.font = replacement;
+        SetWindowPos(label, nullptr, MulDiv(10, dpi, 96), MulDiv(40, dpi, 96),
+            MulDiv(200, dpi, 96), MulDiv(20, dpi, 96), SWP_NOZORDER);
+        SetWindowPos(edit, nullptr, MulDiv(220, dpi, 96), MulDiv(20, dpi, 96),
+            MulDiv(100, dpi, 96), MulDiv(24, dpi, 96), SWP_NOZORDER);
+        RECT original_label{};
+        GetWindowRect(label, &original_label);
+        Require(gtg::tray::AlignEditToLabel(owned.parent, label, edit), "baseline alignment succeeds");
+        RECT unchanged_label{};
+        GetWindowRect(label, &unchanged_label);
+        Require(EqualRect(&original_label, &unchanged_label), "correct label position and size must never change");
+        RECT text{}, label_rect{};
+        SendMessageW(edit, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&text));
+        MapWindowPoints(edit, owned.parent, reinterpret_cast<POINT*>(&text), 2);
+        GetWindowRect(label, &label_rect);
+        MapWindowPoints(nullptr, owned.parent, reinterpret_cast<POINT*>(&label_rect), 2);
+        Require(label_rect.top == text.top, "native edit and same-font label baseline aligned at every DPI");
+        RECT edit_rect{}, edit_client{};
+        GetWindowRect(edit, &edit_rect); GetClientRect(edit, &edit_client);
+        TEXTMETRICW edit_metric{};
+        Require(gtg::tray::ControlTextMetrics(edit, edit_metric), "native edit font metrics");
+        Require(edit_client.bottom >= edit_metric.tmHeight &&
+            edit_rect.bottom - edit_rect.top < MulDiv(24, dpi, 96),
+            "textbox fits a complete font line without the oversized original height");
+        Require(gtg::tray::AlignEditToLabel(owned.parent, label, edit), "alignment is repeatable");
+        RECT repeated{}; GetWindowRect(label, &repeated);
+        MapWindowPoints(nullptr, owned.parent, reinterpret_cast<POINT*>(&repeated), 2);
+        Require(repeated.top == label_rect.top, "reapplication does not drift");
+        RECT repeated_edit{}; GetWindowRect(edit, &repeated_edit);
+        Require(EqualRect(&edit_rect, &repeated_edit), "textbox bounds do not drift on reapplication");
+        wchar_t value[16]{}; GetWindowTextW(edit, value, 16);
+        Require(std::wstring(value) == L"350" && !(GetWindowLongPtrW(edit, GWL_STYLE) & ES_MULTILINE),
+            "numeric value and single-line semantics unchanged");
+    }
+}
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--supervised") {
@@ -3245,9 +4054,26 @@ int main(int argc, char** argv) {
     }
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
         {"OsdCompact", TestOsdCompact},
+        {"OsdModePositions", TestOsdModePositions},
+        {"OsdSnap", TestOsdSnap},
+        {"OsdIdleClock", TestOsdIdleClock},
+        {"TripMarkers", TestTripMarkers},
+        {"HotkeyCapture", TestHotkeyCapture},
+        {"UiThemePreference", TestUiThemePreference},
+        {"OverlayPreferences", TestOverlayPreferences},
+        {"FpsBackendResolution", TestFpsBackendResolution},
+        {"FpsBackendFromRuntimeDevices", TestFpsBackendFromRuntimeDevices},
+        {"FpsDeviceLedger", TestFpsDeviceLedger},
         {"FpsRateIsIndependentAndHonest", TestFpsRateIsIndependentAndHonest},
         {"FpsRateRejectsShortStartupBurst", TestFpsRateRejectsShortStartupBurst},
         {"FpsRateReclaimsOldSwapchains", TestFpsRateReclaimsOldSwapchains},
+        {"FpsRateSparseDisplayedCannotOverridePresents",
+         TestFpsRateSparseDisplayedCannotOverridePresents},
+        {"FpsIndependentFlipFallsBackToPresented",
+         TestFpsIndependentFlipFallsBackToPresented},
+        {"FpsIndependentFlipKeepsCorrelatorHealthy",
+         TestFpsIndependentFlipKeepsCorrelatorHealthy},
+        {"FpsPlayClock", TestFpsPlayClock},
         {"AccessDeniedObserverProbation", TestAccessDeniedObserverProbation},
         {"FpsHistoryBreaksTargetAndSurfaceTransitions",
          TestFpsHistoryBreaksTargetAndSurfaceTransitions},
@@ -3273,6 +4099,8 @@ int main(int argc, char** argv) {
         {"RainAnimationIsDeterministicAndBounded", TestRainAnimationIsDeterministicAndBounded},
         {"BusyIndicatorCoversItsCellExactly", TestBusyIndicatorCoversItsCellExactly},
         {"OsdPreferenceDefaultsOn", TestOsdPreferenceDefaultsOn},
+        {"EffectiveOsdScale", TestEffectiveOsdScale},
+        {"DipPixelConversions", TestDipPixelConversions},
         {"RamPreferenceDefaultsOn", TestRamPreferenceDefaultsOn},
         {"LowMemorySignalIsAvailable", TestLowMemorySignalIsAvailable},
         {"ReclaimPolicySkipsWhatItMust", TestReclaimPolicySkipsWhatItMust},
@@ -3358,6 +4186,8 @@ int main(int argc, char** argv) {
         {"SnapshotNamesPreserveWallTimeAndReason",
          TestSnapshotNamesPreserveWallTimeAndReason},
         {"HiddenWindowSnapshotCanBeEncoded", TestHiddenWindowSnapshotCanBeEncoded},
+        {"SettingsTextBaseline", TestSettingsTextBaseline},
+        {"FeatureNoticeSerial", TestFeatureNoticeSerial},
     };
 
     int failures = 0;

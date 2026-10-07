@@ -201,7 +201,14 @@ CaptureResult CaptureWindowToPng(HWND window, const std::filesystem::path& path)
 
         HGDIOBJ previous = SelectObject(memory_dc.get(), bitmap.get());
         RECT image_bounds{0, 0, width, height};
-        FillRect(memory_dc.get(), &image_bounds, GetSysColorBrush(COLOR_BTNFACE));
+        // The window's own background, asked of the window: a themed dialog
+        // answers WM_CTLCOLORDLG with its dark brush, an unthemed one with the
+        // system face colour it always had.
+        auto background = reinterpret_cast<HBRUSH>(SendMessageW(
+            window, WM_CTLCOLORDLG, reinterpret_cast<WPARAM>(memory_dc.get()),
+            reinterpret_cast<LPARAM>(window)));
+        if (background == nullptr) background = GetSysColorBrush(COLOR_BTNFACE);
+        FillRect(memory_dc.get(), &image_bounds, background);
         SendMessageW(window, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(memory_dc.get()),
                      PRF_CLIENT | PRF_ERASEBKGND);
         PaintChildWindows(window, memory_dc.get());

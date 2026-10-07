@@ -296,6 +296,13 @@ OsdPreference LoadOsdPreference() noexcept {
     result.collapsed = ReadDword(key, L"OsdCollapsed", collapsed) && collapsed != 0;
     result.has_position = ReadSignedDword(key, L"OsdX", result.x) &&
                           ReadSignedDword(key, L"OsdY", result.y);
+    result.has_compact_position = ReadSignedDword(key, L"CompactX", result.compact_x) &&
+                                  ReadSignedDword(key, L"CompactY", result.compact_y);
+    // Absent, malformed or out of range all mean the same thing here: follow
+    // the display. EffectiveOsdScale makes that decision; this only carries
+    // the number across.
+    int scale = 0;
+    result.scale_percent = ReadDword(key, L"OsdScalePercent", scale) ? scale : 0;
     RegCloseKey(key);
     return result;
 }
@@ -316,11 +323,32 @@ bool SaveOsdCollapsed(const bool collapsed, std::wstring& error) {
     return success;
 }
 
+bool SaveOsdScale(const int scale_percent, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(
+        key, L"OsdScalePercent",
+        scale_percent >= kMinOsdScalePercent && scale_percent <= kMaxOsdScalePercent
+            ? scale_percent : 0,
+        error);
+    RegCloseKey(key);
+    return success;
+}
+
 bool SaveOsdPosition(const int x, const int y, std::wstring& error) {
     HKEY key = nullptr;
     if (!OpenUserSettingsForWrite(key, error)) return false;
     const bool success = WriteDword(key, L"OsdX", x, error) &&
                          WriteDword(key, L"OsdY", y, error);
+    RegCloseKey(key);
+    return success;
+}
+
+bool SaveCompactPosition(const int x, const int y, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"CompactX", x, error) &&
+                         WriteDword(key, L"CompactY", y, error);
     RegCloseKey(key);
     return success;
 }
@@ -491,6 +519,117 @@ bool SaveUiLanguagePreference(const localization::UiLanguage language, std::wstr
     error = localization::Format(L"無法保存 UI 語言（Win32 {}）",
                                  L"Unable to save UI language (Win32 {})", write);
     return false;
+}
+
+namespace {
+
+// A REG_DWORD that is present and the right size; anything else is absent.
+bool ReadValidDword(const wchar_t* name, std::uint32_t& value) noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0;
+    DWORD stored = 0;
+    DWORD size = sizeof(stored);
+    const bool valid = RegQueryValueExW(key, name, nullptr, &type,
+        reinterpret_cast<BYTE*>(&stored), &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(stored);
+    RegCloseKey(key);
+    if (valid) value = stored;
+    return valid;
+}
+
+}  // namespace
+
+UiTheme LoadUiThemePreference() noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return UiTheme::Auto;
+    }
+    std::array<wchar_t, 16> value{};
+    DWORD type = 0;
+    // One short of the buffer, so the text is always terminated.
+    DWORD size = static_cast<DWORD>((value.size() - 1) * sizeof(wchar_t));
+    const LSTATUS query = RegQueryValueExW(key, L"UiTheme", nullptr, &type,
+        reinterpret_cast<BYTE*>(value.data()), &size);
+    RegCloseKey(key);
+    if (query != ERROR_SUCCESS || type != REG_SZ) return UiTheme::Auto;
+    return UiThemeFromRegistryValue(value.data());
+}
+
+bool SaveUiThemePreference(const UiTheme theme, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const std::wstring_view value = RegistryValue(theme);
+    const DWORD size = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
+    const LSTATUS write = RegSetValueExW(key, L"UiTheme", 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(value.data()), size);
+    RegCloseKey(key);
+    if (write == ERROR_SUCCESS) return true;
+    error = localization::Format(L"無法保存主題（Win32 {}）",
+                                 L"Unable to save the theme (Win32 {})", write);
+    return false;
+}
+
+bool LoadOverlayEnabled() noexcept {
+    std::uint32_t value = 0;
+    const bool valid = ReadValidDword(L"OverlayEnabled", value);
+    return ResolveOverlayEnabled(valid, value);
+}
+
+bool LoadOverlayAutoSdr() noexcept {
+    std::uint32_t value{};
+    const bool valid = ReadValidDword(L"OverlayAutoSdr", value);
+    return ResolveOverlayAutoSdr(valid, value);
+}
+
+bool SaveOverlayAutoSdr(const bool enabled, std::wstring& error) {
+    HKEY key{};
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"OverlayAutoSdr", enabled ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
+bool LoadFeatureNoticeSerial(std::uint32_t& serial) noexcept {
+    return ReadValidDword(L"FeatureNoticeSerial", serial);
+}
+bool SaveFeatureNoticeSerial(std::uint32_t serial, std::wstring& error) {
+    HKEY key{};
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const DWORD value = serial;
+    const auto result = RegSetValueExW(key, L"FeatureNoticeSerial", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+    if (result == ERROR_SUCCESS) return true;
+    error = localization::Format(L"無法保存功能通知序列號（Win32 {}）",
+                                 L"Unable to save feature notice serial (Win32 {})", result);
+    return false;
+}
+
+bool SaveOverlayEnabled(const bool enabled, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"OverlayEnabled", enabled ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
+OverlayHotkey LoadOverlayHotkey() noexcept {
+    std::uint32_t value = 0;
+    const bool valid = ReadValidDword(L"OverlayHotkey", value);
+    return ResolveOverlayHotkey(valid, value);
+}
+
+bool SaveOverlayHotkey(const OverlayHotkey& hotkey, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"OverlayHotkey",
+        static_cast<int>(PackOverlayHotkey(
+            IsAcceptableOverlayHotkey(hotkey) ? hotkey : kDefaultOverlayHotkey)),
+        error);
+    RegCloseKey(key);
+    return success;
 }
 
 }  // namespace gtg::settings

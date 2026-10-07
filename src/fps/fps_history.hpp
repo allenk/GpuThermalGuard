@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "fps/fps_rate.hpp"
+#include "fps/play_clock.hpp"
 
 namespace gtg::fps {
 
@@ -96,13 +97,25 @@ public:
         }
     }
 
-    void Clear() noexcept { samples_.clear(); }
+    // FPS switched off: the curve and the play time both go.
+    void Clear() noexcept {
+        samples_.clear();
+        play_clock_ = PlayClock{};
+    }
+
+    // Play time, ticked alongside Record. See play_clock.hpp.
+    void TickPlayClock(const std::uint64_t monotonic_ms,
+                       const std::optional<std::uint64_t> program) noexcept {
+        play_clock_.Tick(monotonic_ms, program);
+    }
+    [[nodiscard]] std::uint64_t PlayTimeMs() const noexcept { return play_clock_.ElapsedMs(); }
 
     [[nodiscard]] const std::deque<HistorySample>& Samples() const noexcept {
         return samples_;
     }
 
 private:
+    PlayClock play_clock_;
     std::deque<HistorySample> samples_;
 };
 

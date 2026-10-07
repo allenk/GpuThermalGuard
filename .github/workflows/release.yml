@@ -24,6 +24,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Validate public surface
         shell: pwsh
@@ -33,9 +34,27 @@ jobs:
         shell: pwsh
         run: ./tools/prepare-release.ps1 -Tag '${{ github.ref_name }}' -ValidateOnly
 
+      # The overlay's Dear ImGui comes from vcpkg in manifest mode (vcpkg.json).
+      # The runner's vcpkg clone may predate the manifest's builtin-baseline.
+      - name: Prepare vcpkg
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C $root cat-file -e "$baseline^{commit}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            git -C $root fetch --quiet origin
+            git -C $root cat-file -e "$baseline^{commit}"
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg baseline $baseline is not available." }
+          }
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Configure (Visual Studio 2022)
         shell: pwsh
-        run: cmake -S . -B out/build/release-ci -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+        run: >-
+          cmake -S . -B out/build/release-ci -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+          "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static
 
       - name: Build
         shell: pwsh
@@ -59,7 +78,7 @@ jobs:
           }
           if (-not $hasCertificate) {
             'signed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            Write-Warning 'No Authenticode certificate is configured. Publishing an explicitly marked unsigned prerelease.'
+            Write-Warning 'No Authenticode certificate is configured. The release notes will say the binaries are unsigned.'
             exit 0
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'release-signing.pfx'
@@ -70,7 +89,7 @@ jobs:
             if ($null -eq $signTool) { throw 'signtool.exe was not found on the runner.' }
             foreach ($file in @(
               'out/build/release-ci/Release/GpuThermalGuard.exe',
-              'out/build/release-ci/Release/GpuThermalGuardProbe.exe'
+              'out/build/release-ci/Release/gtg_overlay.dll'
             )) {
               & $signTool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD $file
               if ($LASTEXITCODE -ne 0) { throw "Signing failed for $file." }
@@ -82,7 +101,7 @@ jobs:
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Prepare package, checksums, and release notes
+      - name: Prepare packages, checksums, and release notes
         shell: pwsh
         run: |
           $parameters = @{ Tag = '${{ github.ref_name }}' }
@@ -104,26 +123,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ github.ref_name }}'
-          $signed = '${{ steps.signing.outputs.signed }}' -eq 'true'
           $version = $tag.Substring(1)
-          $assetName = if ($signed) {
-            "GpuThermalGuard-$version-windows-x64.zip"
-          } else {
-            "GpuThermalGuard-$version-unsigned-windows-x64.zip"
-          }
-          $title = if ($signed) {
-            "GpuThermalGuard $tag"
-          } else {
-            "GpuThermalGuard $tag (UNSIGNED prerelease)"
-          }
+          # Recommended package first: GitHub lists assets in upload order.
           $arguments = @(
             'release', 'create', $tag,
             '--verify-tag',
-            '--title', $title,
+            '--title', "GpuThermalGuard $tag",
             '--notes-file', 'dist/release-notes.md',
-            (Join-Path 'dist' $assetName),
+            "dist/GpuThermalGuard-$version-windows-x64.zip",
+            "dist/GpuThermalGuard-$version-no-overlay-windows-x64.zip",
             'dist/SHA256SUMS.txt'
           )
-          if (-not $signed -or $tag.Contains('-')) { $arguments += '--prerelease' }
+          # Signing state is in the notes; only a pre-release version is a prerelease.
+          if ($tag.Contains('-')) { $arguments += '--prerelease' }
           & gh @arguments
           if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed.' }

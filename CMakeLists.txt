@@ -124,6 +124,8 @@ add_executable(GpuThermalGuard WIN32
     src/tray/history_chart.hpp
     src/tray/main_dialog.cpp
     src/tray/main_dialog.hpp
+    src/tray/ui_theme.cpp
+    src/tray/ui_theme.hpp
     src/tray/osd_overlay.cpp
     src/tray/osd_overlay.hpp
     src/fps/fps_rate.hpp
@@ -165,6 +167,15 @@ endif()
 target_link_options(GpuThermalGuard PRIVATE /MANIFESTUAC:NO)
 
 include(CTest)
+# On by default (AF-20261006-overlay-default-on): the in-game overlay is part
+# of GTG. gtg_overlay.dll is built beside the EXE; the EXE shows its overlay
+# controls only when that DLL is present, so one EXE serves both downloads.
+# imgui comes from vcpkg (vcpkg.json, x64-windows-static). OFF builds need
+# neither vcpkg nor splice.
+option(GTG_FEATURE_OVERLAY "Build the in-game overlay (gtg_overlay.dll and its host in GpuThermalGuard.exe)" ON)
+if(GTG_FEATURE_OVERLAY)
+    add_subdirectory(overlay/integration)
+endif()
 if(BUILD_TESTING)
     add_executable(gtg_tests
         tests/test_main.cpp
@@ -236,4 +247,52 @@ if(MSVC)
     target_link_options(GpuThermalGuard PRIVATE
         $<$<CONFIG:Release>:/INCREMENTAL:NO /OPT:REF /OPT:ICF>
     )
+endif()
+
+# ─── darkmodelib: the main window's dark theme ─────────────────────────────
+# Static, /MT, into GpuThermalGuard.exe (AF-20261004-main-ui-redesign). MPL-2.0;
+# the sources are used as published. Only src/tray/ui_theme.cpp includes it.
+set(GTG_DMLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/darkmodelib")
+if(NOT EXISTS "${GTG_DMLIB_DIR}/src/Darkmodelib.cpp")
+    message(FATAL_ERROR
+        "third_party/darkmodelib is empty. Run: git submodule update --init third_party/darkmodelib")
+endif()
+add_library(gtg_darkmodelib STATIC
+    ${GTG_DMLIB_DIR}/src/Darkmodelib.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibColor.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibDpi.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibHook.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibIni.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibPaintHelper.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibSubclass.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibSubclassControl.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibSubclassWindow.cpp
+    ${GTG_DMLIB_DIR}/src/DmlibWinApi.cpp
+)
+target_include_directories(gtg_darkmodelib PUBLIC ${GTG_DMLIB_DIR}/include)
+# The library's own build settings (vs.proj/darkmodelib.Cpp.props).
+target_compile_definitions(gtg_darkmodelib PRIVATE
+    _WINDOWS STRICT_TYPED_ITEMIDS NOMINMAX WIN32_LEAN_AND_MEAN VC_EXTRALEAN
+    UNICODE _UNICODE _DARKMODELIB_NO_INI_CONFIG _DARKMODELIB_CUSTOM_MEM=0x002)
+target_compile_options(gtg_darkmodelib PRIVATE /W3 /utf-8 /permissive-)
+target_link_libraries(gtg_darkmodelib PUBLIC comctl32 uxtheme dwmapi gdi32 user32 shlwapi)
+target_link_libraries(GpuThermalGuard PRIVATE gtg_darkmodelib)
+
+# ─── Research: the UI theme lab ────────────────────────────────────────────
+# Off by default. The lab shows the production IDD_MAIN dialog and
+# HistoryChart with fabricated readings, themed by darkmodelib; it never
+# touches NVML, the service or settings. Kept as the tool for tuning colours.
+# See docs/ui-modernization-research-20261003.md.
+option(GTG_BUILD_UI_THEME_LAB "Build the darkmodelib UI theme lab (research)" OFF)
+if(GTG_BUILD_UI_THEME_LAB)
+    add_executable(gtg_ui_theme_lab WIN32
+        tests/ui_theme_lab.cpp
+        src/tray/history_chart.cpp
+        src/resources/GpuThermalGuard.rc
+        tests/ui_theme_lab.manifest
+    )
+    target_include_directories(gtg_ui_theme_lab PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${GTG_GENERATED_DIR}")
+    target_link_libraries(gtg_ui_theme_lab PRIVATE
+        gtg_darkmodelib gtg_telemetry gtg_build_options wtl gdiplus comctl32 uxtheme)
 endif()

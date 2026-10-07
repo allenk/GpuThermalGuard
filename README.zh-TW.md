@@ -2,33 +2,93 @@
 
 [English](README.md) | 繁體中文
 
-**以 NVML 為核心、輕量的 Windows NVIDIA GPU 溫度保護與即時監控工具。**
+**以 NVML 為核心、輕量的 Windows NVIDIA GPU 溫度保護與即時監控工具 —— 現在也能直接畫進遊戲裡。**
 
 GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上升的熱趨勢時，會套用預先設定的較低功率限制。它以原生 C++/Win32 製作，目標是在 GPU 本身可能不穩定時，依然提供小型、快速而可靠的保護層。
 
 > [!WARNING]
 > 這是獨立開發的風險緩解工具，不是 NVIDIA 產品，也不是韌體、驅動、散熱或硬體修復方案。它無法保證攔截所有 TDR；受影響或故障的顯示卡仍可能需要官方、SKU 相符的 VBIOS 更新或 RMA。
 
+![GTG 面板畫在 4K 的 Direct3D 12 遊戲畫面內：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS，頂部是時鐘，FPS 卡上顯示已玩 19 分鐘](docs/images/overlay-dx12-4k.jpg)
+
+## 1.0 新功能
+
+- **遊戲內 Overlay。** 面板直接畫在 Direct3D 11 與 Direct3D 12 遊戲的畫面裡，在獨佔全螢幕與無邊框全螢幕下也看得到，桌面視窗做不到這一點。在你按下 Overlay 熱鍵之前，不會注入任何東西。以 [Splice](https://github.com/allenk/splice) 打造。
+- **Overlay 熱鍵。** 預設 `Alt`+`F10`，錄製方式參考 PowerToys，並向 Windows 檢查是否與其他程式衝突。
+- **全新的 FPS 統計方式。** GTG 現在分得出遊戲畫面是經 Windows 合成，還是直接翻到螢幕上，並對兩種情況計算各自正確的數字。
+- **時鐘與遊戲時間。** 滑鼠離開 OSD 時，頂部顯示目前時間；FPS 卡顯示你已經玩了多久。
+- **磁吸對齊。** 拖曳 OSD 時會吸附到螢幕與工作列的邊緣。
+- **淺色與深色主題**，可跟隨 Windows 或手動選擇；主視窗重新設計。
+
+## 下載
+
+每個版本提供兩個套件。兩者裡的 EXE 是同一個檔案；overlay 就是放在它旁邊的那個 DLL。
+
+| 套件 | 內容 | 適合 |
+| --- | --- | --- |
+| `GpuThermalGuard-<version>-windows-x64.zip` **（推薦）** | `GpuThermalGuard.exe`、`gtg_overlay.dll` | 所有人；全螢幕遊戲中看得到面板的唯一方式 |
+| `GpuThermalGuard-<version>-no-overlay-windows-x64.zip` | `GpuThermalGuard.exe` | 確定用不到遊戲內 overlay 的機器 |
+
+EXE 旁邊沒有 `gtg_overlay.dll` 時，Overlay 相關設定不會顯示，也不會註冊熱鍵。之後放入 DLL 並重新啟動 GTG 即可啟用。
+
 ## 畫面
 
-| 主監控面板，八條歷史紀錄 | 展開 OSD，依自訂順序排列 |
+| 淺色 | 深色 |
 | --- | --- |
-| ![GpuThermalGuard 主面板：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS 歷史](docs/images/dashboard-zh-TW.png) | ![展開 OSD 以自訂順序顯示八列數值：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS](docs/images/osd.png) |
+| ![淺色主題的主視窗](docs/images/main-light-zh-TW.png) | ![深色主題的主視窗](docs/images/main-dark-zh-TW.png) |
 
 截圖中的設定屬於單一工作站，不是所有 GPU 的建議門檻。
 
-本版本的一分鐘操作影片，在 4K 遊戲畫面上錄製（精簡面板在一排、兩排與單欄之間重新排列、釋放主機記憶體，並在遊戲執行中讀取網路與影格率）放在
-[YouTube](https://www.youtube.com/watch?v=1urYDlP_he0)。
+## 遊戲內 Overlay
+
+| Direct3D 12 | Direct3D 11 |
+| --- | --- |
+| <img src="docs/images/overlay-dx12.gif" alt="Direct3D 12 遊戲中的 overlay，每秒更新兩次，頂部是時鐘，FPS 卡上有遊戲時間" width="240"> | <img src="docs/images/overlay-dx11.gif" alt="Direct3D 11 遊戲中的 overlay，顯示 229 FPS 與已玩 1 分鐘" width="220"> |
+
+桌面 OSD 是一個視窗，獨佔全螢幕的遊戲，或會一直把自己留在最上層的遊戲，就會直接把它蓋住。Overlay 則把同一個面板**畫進遊戲自己的影格裡**：由 GTG 繪製，遊戲行程裡的小 DLL 只負責在遊戲送出畫面前，上傳這張圖並畫上去。項目相同、排列相同、大小相同，位置對應桌面 OSD 在它所在螢幕上的位置。
+
+### 運作方式
+
+1. 主視窗的 **Overlay** 預設勾選。它只註冊熱鍵，不注入任何東西。
+2. 讓遊戲在前景，按下熱鍵。GTG 會啟動一個短命的 helper（同一支 EXE），先檢查目標：必須是你這個 session 裡原生的 64 位元行程，不是系統或關鍵行程、不在 Windows 目錄底下、也不是 GTG 自己；接著**在自己的行程裡**算出 Direct3D 的進入點，完全不碰遊戲；全部通過後，才把 `gtg_overlay.dll` 載入遊戲。我們實測時，面板在一秒內就出現。
+3. 在同一個遊戲裡再按一次熱鍵隱藏 overlay，再按一次顯示。
+4. 最多可以**同時有四個遊戲**掛著 overlay，各自是獨立的 session。
+
+DLL 會留在遊戲裡直到遊戲結束 —— 隱藏 overlay 或關閉這個功能只會停止繪製，不會從執行中的遊戲卸載程式碼。helper 行程跟著遊戲存在，遊戲結束它就結束。要替換 GTG 的檔案前，請先把遊戲關掉重開。
+
+### Overlay 熱鍵
+
+<img src="docs/images/overlay-hotkey.png" alt="Overlay 熱鍵對話框，以鍵帽顯示 Alt 與 F10" width="360">
+
+直接按下你要的組合鍵，它會以鍵帽顯示並即時檢查。組合必須含 `Ctrl`、`Alt`、`Shift` 或 `Win`；`F12` 會被拒絕，因為 Windows 保留它給偵錯工具；已被其他程式占用的組合會提示，而不會被存下來。對話框開著且在前景時，你按的鍵只會送到它，所以 `Alt` 不會打開選單、`Win` 也不會打開開始功能表。
+
+### 色彩
+
+**Auto SDR（skip prompt）** 預設勾選：overlay 直接假設遊戲是 SDR，不另外詢問。取消勾選後，每個遊戲第一次按熱鍵時會詢問要以 SDR 解讀，還是維持嚴格模式。不支援 HDR 輸出；在 HDR 遊戲上，overlay 可能偏亮或偏淡。
+
+### 支援與不支援
+
+- **支援：** 原生 64 位元的 Direct3D 11 與 Direct3D 12 遊戲，視窗、無邊框或全螢幕皆可。
+- **不支援：** Vulkan、OpenGL 與 Direct3D 9 遊戲（看得到的情況下，桌面 OSD 照樣能用）、32 位元遊戲、HDR。
+- **Anti-cheat。** GTG 不做任何躲避 anti-cheat 的事：不隱藏模組、不 manual map、不從 loader 清單移除自己。有 anti-cheat 的遊戲可能拒絕 overlay，或把它當成作弊程式。**請不要在受保護或競技類的線上遊戲中使用 overlay。** 遊戲拒絕它，就代表那款遊戲不支援。
+
+### 以 Splice 打造
+
+Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫面的路徑。Splice 是同一位作者開發的跨平台、型別安全的 C++ hook 函式庫。把 hook 安裝進一個 render thread 可能正在執行那段被替換程式碼的行程，是最困難的情況，而 Splice 1.1 大部分就是為此而做：透過鄰近 relay 達成原子性的五位元組安裝、嚴格的精確位置安裝，以及協調那些卡在被修補程式碼裡的執行緒。Splice 是本 repository 的 submodule，寫進遊戲的程式碼任何人都能檢視。
+
+## 桌面 OSD
 
 ![遊戲執行中的精簡面板：即時溫度、功率、VRAM、GPU、CPU、含上下行箭頭的網路，以及標示繪圖 API 與送出解析度的影格率](docs/images/osd-in-game.gif)
+
+舊版的一分鐘操作影片（在 4K 遊戲畫面上錄製）放在 [YouTube](https://www.youtube.com/watch?v=1urYDlP_he0)。
 
 ### Compact 精簡 OSD
 
 ![精簡 OSD：一排八項即時數值與 30 秒迷你趨勢曲線](docs/images/osd-compact.png)
 
-點擊 OSD 頂部的箭頭，可在完整圖表與 compact mode 之間切換。精簡模式將每個項目顯示為一張小卡，含即時數值與最近 30 秒的迷你曲線。勾選「顯示 RAM」或「顯示 FPS」各會增加一張卡；取消勾選後回到其餘項目的配置。
+點擊 OSD 頂部的箭頭，可在完整圖表與精簡模式之間切換。精簡模式將每個項目顯示為一張小卡，含即時數值與最近 30 秒的迷你曲線。勾選 **RAM**、**網路**、**FPS** 各會增加一張卡；取消勾選後回到其餘項目的配置。箭頭會留在你點擊的位置：視窗往左延伸或縮回，所以連續點擊會在原地展開、收合。
 
-預設會把所有啟用的項目排成一排，因此 OSD 隨項目數往兩側變寬，而不是變高。你也可以把它排成兩排：
+預設會把所有啟用的項目排成一排。你也可以把它排成兩排：
 
 ![同一個精簡 OSD 排成兩排，每排四張](docs/images/osd-compact-two-rows.png)
 
@@ -36,17 +96,15 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 <img src="docs/images/osd-compact-column.png" alt="同樣八個項目排成一欄" width="164">
 
-（上面兩張排列示意圖擷取自英文介面的錄影。）
+（上面兩張排列示意圖擷取自英文介面。）
 
-保護警報與遙測警示仍顯示於頂部；切換模式不會暫停監控或改變保護設定。頂部按鈕以外的拖曳區仍可移動 OSD；重新啟動程式後回到展開模式。
-
-此功能自 v0.9.0-beta.2 起提供。
+保護警報與遙測警示仍顯示於頂部；切換模式不會暫停監控或改變保護設定。兩種模式各自記得上次的位置。
 
 ### 調整精簡 OSD 的排列
 
 ![解鎖精簡 OSD、拖曳小卡調整順序並移到第二排，然後再次鎖定](docs/images/osd-arrange-zh-TW.gif)
 
-自 v0.11.0-beta.1 起，精簡面板可以自行調整排列。箭頭左邊的鎖圖示可切換鎖定與解鎖：鎖定時小卡不接收滑鼠，解鎖時才能拖動。鎖定是常態，因此畫得很低調；解鎖會轉為琥珀色，因為一個永遠置頂又接受拖曳的視窗，應該讓使用者知道。
+箭頭左邊的鎖圖示可切換鎖定與解鎖：鎖定時小卡不接收滑鼠，解鎖時才能拖動。鎖定是常態，因此畫得很低調；解鎖會轉為琥珀色，因為一個永遠置頂又接受拖曳的視窗，應該讓使用者知道。
 
 解鎖後，按住一張小卡，放開在你要的位置即可：
 
@@ -54,13 +112,23 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 - 放在該排下方 —— 移到第二排
 - 放回第一排 —— 移回上排
 
-每一排都可以只有一張，所以整個面板可以排成單欄。展開 OSD 也依照同一個順序。排列會被記住；托盤選單的「重設 OSD 版面」可回到預設。
+每一排都可以只有一張，所以整個面板可以排成單欄。展開 OSD 也依照同一個順序。排列會被記住；系統匣選單的「重設 OSD 版面」可回到預設。
 
-鎖只鎖小卡。不論鎖定與否，OSD 本身仍可由頂部長條拖曳移動。
+### 磁吸對齊
+
+用頂部拖曳 OSD 時，它會被吸到所在螢幕的邊緣 —— 工作列的邊和螢幕本身的邊都會 —— 以及兩個螢幕的交界。拖過邊緣就會放開。按住 `Shift` 可以自由擺放。
+
+### 時鐘
+
+滑鼠離開 OSD 兩秒後，鎖頭和箭頭會讓出位置，改顯示目前時間 `23:59:59`；滑鼠一回來，按鈕立刻出現。排列處於解鎖狀態時按鈕會保留，因為琥珀色的鎖是你一定不能錯過的提醒。遊戲內 overlay 無法點擊，所以一律顯示時鐘。
+
+### 遊戲時間
+
+FPS 卡會顯示你玩了多久，以黃色標在曲線右下角：`42 min`，接著是 `7.2 hr`，最多 `99.9 hr`。只有在遊戲有穩定的影格率時才計時，所以 `Alt`+`Tab`、選單與載入畫面只會暫停，不會歸零。遊戲關掉重開會接著算。正在計時的遊戲超過三分鐘沒有影格率 —— 你換玩別的遊戲，或乾脆不玩了 —— 計時就交給當下正在玩的那個，並把它在這三分鐘裡累積的時間加回去。數值只存在記憶體，GTG 重新啟動就從頭算。
 
 ### 可選的主機 RAM
 
-自 v0.11.0-beta.1 起，「顯示 RAM」預設勾選，主視窗、展開 OSD 與精簡 OSD 都會加上主機記憶體項目。實體記憶體使用率為前景主角；虛擬 commit 以另一個輔色繪在其後方，兩者同時可讀而不互相搶眼。
+**RAM** 預設勾選，主視窗、展開 OSD 與精簡 OSD 都會加上主機記憶體項目。實體記憶體使用率為前景主角；虛擬 commit 以另一個輔色繪在其後方，兩者同時可讀而不互相搶眼。
 
 虛擬 commit 是以系統 commit limit 為分母，而該上限大於實體記憶體，因此 commit 曲線通常低於實體曲線。關閉後立即清除其紀錄。
 
@@ -70,7 +138,7 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 ![在 RAM 小卡上雙擊：工作進行時小卡落下方塊，結束後回報釋放了多少記憶體](docs/images/osd-ram-reclaim.gif)
 
-自 v0.12.0 起，在鎖定的精簡面板上雙擊 RAM 小卡，會請 Windows 收縮各行程的 working set 並釋放 standby list，然後回報拿回多少主機記憶體。工作在自己的執行緒上進行，小卡同時播放動畫 —— 那不是進度條，因為一次收縮要多久是由被收縮的行程決定的；它的作用是讓你看到訊息迴圈沒有被卡住。
+在鎖定的精簡面板上雙擊 RAM 小卡，會請 Windows 收縮各行程的 working set 並釋放 standby list，然後回報拿回多少主機記憶體。工作在自己的執行緒上進行，小卡同時播放動畫 —— 那不是進度條，因為一次收縮要多久是由被收縮的行程決定的；它的作用是讓你看到訊息迴圈沒有被卡住。
 
 過程中不會彈出任何視窗、不會搶走焦點，所以在遊戲前景時使用是安全的。若機器的變化小於雜訊，小卡會照實說，而不是宣稱有收穫。此動作要求面板處於鎖定狀態：解鎖是排列模式，拖曳與動作不能搶同一個手勢。
 
@@ -78,7 +146,7 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 ### 可選的網路流量
 
-自 v0.12.0 起，「顯示 Net」預設勾選，面板增加網路項目。單一小卡以兩條曲線同時呈現雙向流量，下方填入半透明漸層：上為接收，下為傳送。
+**網路** 預設勾選，面板增加網路項目。單一小卡以兩條曲線同時呈現雙向流量，下方填入半透明漸層：上為接收，下為傳送。
 
 取用的介面是「預設路由實際使用的那一張」，每三秒重新確認一次，所以 VPN 連上或網線被拔掉時，它跟著流量走，而不是跟著開機時選定的名字走。計數來自現有顯示節拍上的 `GetIfEntry2`；只要讀值不可信就拒絕輸出而不是猜測 —— 計數倒退、間隔超過五秒、介面在中途換掉、或速率高於該連線的實體上限。
 
@@ -105,15 +173,26 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 評價取的是所有量到的連線中**最差**的那條，而不是平均 —— 一個遊戲有一條連線健康、另一條在逾時，並不等於「還好一半」。這條規則對遊戲是對的（少數幾條、全都連到遊戲伺服器），對持有大量不相干連線的瀏覽器則過於悲觀。
 
-### 可選的遊戲 FPS
+## 影格率
 
-自 v0.10.0-beta.1 起，「顯示 FPS」預設勾選，主視窗增加第六條獨立 FPS 歷史，OSD 增加一列／一張 FPS 卡。它跟隨目前前景程式；切換遊戲時，讀值會共用同一條時間軸。關閉後停止 FPS 觀測並清除其紀錄，原本五條溫度／硬體紀錄不變。FPS 收集器不參與獨立的 200 ms 保護迴圈。
+**FPS** 預設勾選，主視窗增加一條 FPS 歷史，OSD 增加一張 FPS 卡。它跟隨目前前景程式，讀值來自 Windows 自己的事件追蹤（ETW）—— 量測不注入任何東西，有沒有 overlay 都能用。FPS 收集器不參與獨立的 200 ms 保護迴圈。
 
-自 v0.13.0 起，量測涵蓋所有繪圖 API，不再只有 DXGI。在 Windows 能夠確認影格已上屏的路徑（DXGI），計的就是已上屏影格；無法確認的路徑（Vulkan 與 OpenGL 即是如此），計的是程式送出的 present 次數，由 graphics kernel 統計。兩者都是對程式本身工作的實際量測；都不是螢幕刷新率，也都不是在引擎內部取得的 frame time。
+**計算什麼，取決於畫面怎麼上屏**，而 GTG 現在分得出這兩種情況：
 
-在能夠判斷的情況下，卡片同時標示產生這個數字的來源：`D9`、`D11`、`D12`、`VK` 或 `GL`，以及程式實際送出的解析度。若無法辨識繪圖 API，或無法確認尺寸，該部分就不顯示 —— 不做任何猜測。這裡的解析度是程式送上畫面的 swapchain；對使用 DLSS 或 FSR 放大的遊戲而言就是它的輸出尺寸：引擎內部的 render target 不會離開該行程，因此任何在行程外的量測都看不到它。
+- **合成（composed）** —— 由 Windows 的合成器（DWM）把遊戲畫面放上螢幕。GTG 計算真正上屏的影格，所以在 120 Hz 螢幕上每秒算圖 240 格的遊戲，讀值是 120。
+- **Independent flip** —— 畫面跳過合成器，直接翻到螢幕上；大多數全螢幕或無邊框遊戲在上方沒有東西蓋著時都是這樣。Windows 不會為這條路徑提供逐格的上屏確認，所以 GTG 計算遊戲送出的影格，由 graphics kernel 統計。
 
-暖機、切換焦點，以及前景程式根本沒有在上屏的時候會顯示 `-` —— 閒置的程式沒有影格率。曲線上的暗色連接僅維持視覺連續，**不代表該段量到了 FPS**。本版尚不包含獨佔全螢幕的遊戲內 overlay；桌面 TOPMOST OSD 不保證蓋住獨佔全螢幕。
+遊戲在執行中可能在兩者之間切換 —— 上方蓋了 overlay 或通知時，Windows 就得合成它 —— 讀值會跟著變。舊版只處理合成路徑，遇到走 independent flip 的遊戲，可能只顯示真實數字的一小部分，甚至完全沒有讀值；1.0 兩者都修正了。
+
+Vulkan 與 OpenGL 不會產生 composition token，讀值是送出的影格率，自 0.13 起就是如此。
+
+在能夠判斷的情況下，卡片同時標示產生這個數字的來源：`D9`、`D11`、`D12`、`VK` 或 `GL`，以及程式實際送出的解析度。無法辨識的部分就不顯示 —— 不做任何猜測。這裡的解析度是程式送上畫面的 swapchain；對使用 DLSS 或 FSR 放大的遊戲而言就是它的輸出尺寸。
+
+暖機、切換焦點，以及前景程式根本沒有在上屏的時候會顯示 `-` —— 閒置的程式沒有影格率。曲線上的暗色連接僅維持視覺連續，**不代表該段量到了 FPS**。
+
+## 主題
+
+**主題**清單提供 **自動**（跟隨 Windows 的應用程式模式，GTG 執行中切換也會跟著變）、**深色** 與 **淺色**。淺色就是傳統的 Windows 外觀。高對比模式一律使用系統自己的配色；無法繪製深色控制項的 Windows 版本會退回淺色，不會出現一半深一半淺。深色主題以 [darkmodelib](https://github.com/ozone10/darkmodelib) 繪製，編譯在 EXE 內。
 
 ## 為什麼打造這個工具
 
@@ -140,15 +219,15 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 ## 設計理念
 
-- **原生、小型**：C++20、Win32、WTL、GDI/GDI+；沒有瀏覽器 runtime 或 GPU UI backend。
-- **獨立保護迴圈**：專用高優先權 worker 以 200 ms 為目標節拍；保護排程不依賴 UI repaint 或訊息迴圈。驅動呼叫仍可能阻塞，因此不是硬即時保證。
+- **原生、小型**：C++20、Win32、WTL、GDI/GDI+；主程式沒有瀏覽器 runtime 或 GPU UI backend。
+- **獨立保護迴圈**：專用高優先權 worker 以 200 ms 為目標節拍；UI repaint、OSD、FPS 與 overlay 都不會影響保護排程。驅動呼叫仍可能阻塞，因此不是硬即時保證。
 - **Fail-safe 狀態機**：硬溫度門檻不會被 debounce 或平滑化掩蓋。
 - **寫入必須驗證**：功率限制寫入後必須讀回，否則不宣稱保護成功。
 - **安全鎖定**：觸發後維持安全功率；穩定冷卻後才允許人工或明確啟用的自動恢復。
 - **立即重新武裝**：自動恢復不會停止或放寬監控；重新過熱可立即再次觸發。
-- **保存事故證據**：歷史 telemetry、log、觸發次數、wall-time 與自動／手動 PNG snapshot。
-- **Standalone 部署**：MSVC runtime 靜態連結，單一 EXE，不需要旁置 runtime；仍需要 Windows 系統 DLL 與 NVIDIA driver 的 `nvml.dll`。
-- **CPU 繪製 UI**：程式不使用 GPU rendering backend；Windows 桌面合成仍可能受到繁忙或恢復中的顯示驅動影響。
+- **保存事故證據**：歷史 telemetry、log、觸發次數與溫度歷史上的觸發標記、wall-time 與自動／手動 PNG snapshot。
+- **注入只在你決定時發生**：桌面 OSD 與 FPS 都不注入、不 hook。只有 overlay 會寫進遊戲，而且只寫進前景那個遊戲，只在你按下熱鍵時。
+- **Standalone 部署**：MSVC runtime 靜態連結，不需安裝程式、不需安裝 runtime。`GpuThermalGuard.exe` 只需要 Windows 系統 DLL 與 NVIDIA driver 的 `nvml.dll`；`gtg_overlay.dll` 只需要 Windows 系統 DLL。
 
 ## 監控內容
 
@@ -159,26 +238,28 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 - CPU Loading
 - 可選的主機 RAM 使用率，並在其後方顯示虛擬 commit
 - 可選的網路流量，取預設路由介面，雙向合併於同一張小卡
+- 可選的前景遊戲 FPS：合成時計上屏影格，independent flip 時計送出影格，也支援 Vulkan 與 OpenGL
+- FPS 卡上的遊戲時間
 - 保留一小時 telemetry、可拖曳的固定五分鐘主面板視野
-- 精簡、不搶 focus 的 30 秒 always-on-top OSD
+- 精簡、不搶 focus 的 30 秒 always-on-top OSD，以及畫在 Direct3D 11／12 遊戲內的同一個面板
 
 ## 保護流程
 
 1. 每 200 ms 讀取 NVML telemetry。
 2. 達到設定溫度立即觸發；或由經確認的升溫預測規則判斷即將跨越門檻。
 3. 寫入安全功率並讀回驗證。
-4. 鎖定保護狀態、保存觸發次數、寫入事件紀錄並擷取主面板快照。
+4. 鎖定保護狀態、保存觸發次數、寫入事件紀錄、在溫度歷史上標出觸發點，並擷取主面板快照。
 5. 冷卻期間持續維持安全功率。
 6. 穩定冷卻完成後，只允許人工恢復，或在使用者明確勾選 **Auto Restore** 時自動恢復。
 7. 恢復正常功率後讀回驗證，並立即重新武裝保護迴圈。
 
 累計觸發總數會跨越重啟、人工／自動恢復與 **保存並套用** 持續保留。使用 **本輪觸發** 旁的 **重設** 開始新一輪測試，不會中斷保護或清除累計總數。
 
-**工作功率上限 (W)** 是運作時的功耗牆。**保存並套用** 會透過保護 worker，在安全條件允許時要求套用；不會強行把已鎖定或高溫中的 GPU 恢復到工作功率。啟動程式本身不會提交 Apply。未套用的編輯會有醒目提示；請以目前功率限制與狀態欄確認驗證結果。
+**工作功率上限 (W)** 是運作時的功耗牆。**保存並套用** 會透過保護 worker，在安全條件允許時要求套用；不會強行把已鎖定或高溫中的 GPU 恢復到工作功率。啟動程式本身不會提交 Apply。未套用的編輯會讓按鈕變成橘色；請以目前功率限制與狀態欄確認驗證結果。
 
 ### 首次執行：先只監控，直到你自己決定
 
-自 v0.12.0 起，初始功率設定改為從卡片讀出，而不是寫死的常數。350 W 這個常數在 320 W 的卡上根本寫不進去，在 600 W 的卡上則是砍掉 42%。因此首次執行時：
+初始功率設定從卡片讀出，而不是寫死的常數。350 W 這個常數在 320 W 的卡上根本寫不進去，在 600 W 的卡上則是砍掉 42%。因此首次執行時：
 
 - **工作功率上限** 取「目前已經生效的那個限制」。若改用卡片的預設值推導，等於在沒有問過使用者的情況下，把一個刻意調低過的人的限制**往上調**。
 - **安全功率** 取「卡片預設限制」與「目前限制」兩者中較低的那個。
@@ -194,19 +275,19 @@ OSD 在安全功率鎖定期間顯示 **ALERT**，包含等待恢復的階段。
 
 ## 語言與設定
 
-首次執行預設 English；可從視窗底部切換正體中文。兩種語言都內嵌在 EXE，選擇保存在目前使用者：
+首次執行預設 English；可從 **語言** 清單切換正體中文。兩種語言都內嵌在 EXE，選擇保存在目前使用者：
 
 ```text
 HKCU\SOFTWARE\GpuThermalGuard\UiLanguage
 ```
 
-保護參數與持久化狀態位於：
+主題、OSD 位置、overlay 與熱鍵的選擇也存在 `HKCU\SOFTWARE\GpuThermalGuard` 底下。保護參數與持久化狀態位於：
 
 ```text
 HKLM\SOFTWARE\GpuThermalGuard
 ```
 
-程式需要系統管理員權限，因為修改 NVIDIA power limit 與寫入機器層級保護設定都需要 elevation。
+程式需要系統管理員權限，因為修改 NVIDIA power limit 與寫入機器層級保護設定都需要 elevation。版本號顯示在主視窗的標題列。
 
 ## 執行模式
 
@@ -217,7 +298,7 @@ HKLM\SOFTWARE\GpuThermalGuard
 .\GpuThermalGuard.exe --tray
 ```
 
-預設／Tray 啟動會由不載入 NVML 的 supervisor 管理監控子程序，兩者使用同一支 EXE。子程序異常失敗後會採退避重試與保守的恢復檢查；使用者明確 Exit 則結束程式。這可縮短中斷，但無法保證驅動故障期間完全沒有保護空窗；不需要另外安裝 supervisor service。
+預設／Tray 啟動會由不載入 NVML 的 supervisor 管理監控子程序，兩者使用同一支 EXE。子程序異常失敗後會採退避重試與保守的恢復檢查；使用者明確 Exit 則結束程式。這可縮短中斷，但無法保證驅動故障期間完全沒有保護空窗；不需要另外安裝 supervisor service。遊戲掛著 overlay 時，會多一個 overlay helper 行程，遊戲結束它就結束。
 
 同一支 EXE 也包含 SCM service entry point：
 
@@ -225,11 +306,15 @@ HKLM\SOFTWARE\GpuThermalGuard
 GpuThermalGuard.exe --service
 ```
 
-`--service` 必須由 Windows Service Control Manager 啟動，不能當成一般互動命令使用。目前 preview 尚未提供 installer，建議先以 Tray 模式進行受監看的驗證。
+`--service` 必須由 Windows Service Control Manager 啟動，不能當成一般互動命令使用。目前不提供 installer，建議以 Tray 模式執行。
 
 ## 從原始碼建置
 
-需求：Windows 10/11 x64、Visual Studio 2022 Desktop C++、CMake 3.24+、Ninja，以及執行時提供 NVML 的 NVIDIA driver。
+需求：Windows 10/11 x64、Visual Studio 2022 Desktop C++、CMake 3.24+、Ninja、[vcpkg](https://github.com/microsoft/vcpkg)（需設定 `VCPKG_ROOT`；overlay 用的 Dear ImGui 由 `vcpkg.json` 取得），以及執行時提供 NVML 的 NVIDIA driver。
+
+```powershell
+git clone --recurse-submodules https://github.com/allenk/GpuThermalGuard.git
+```
 
 在 Visual Studio 2022 Developer PowerShell 中：
 
@@ -243,10 +328,11 @@ ctest --preset windows-x64-release --output-on-failure
 
 ```text
 out\build\windows-x64-release\GpuThermalGuard.exe
+out\build\windows-x64-release\gtg_overlay.dll
 out\build\windows-x64-release\GpuThermalGuardProbe.exe
 ```
 
-Probe 完全唯讀，不會呼叫任何 NVML setter。
+加上 `-DGTG_FEATURE_OVERLAY=OFF` 可建置不含 overlay 的版本，不需要 vcpkg 與 Splice。`GpuThermalGuardProbe.exe` 是開發用工具，只從原始碼建置，不放進下載檔；它完全唯讀，不會呼叫任何 NVML setter。
 
 ## Log 與 Snapshot
 
@@ -258,7 +344,7 @@ Probe 完全唯讀，不會呼叫任何 NVML setter。
 %PROGRAMDATA%\GpuThermalGuard\logs     (Service)
 ```
 
-Snapshot 可由主視窗與 Tray 選單建立，也會在溫度保護觸發後自動保存。即使視窗隱藏，仍會在不搶 focus 的情況下繪製並保存主面板 client area。
+Snapshot 可由主視窗與系統匣選單建立，也會在溫度保護觸發後自動保存。即使視窗隱藏，仍會在不搶 focus 的情況下繪製並保存主面板 client area。
 
 ## 桌面以外：私人 System Monitor 延伸實驗
 
@@ -285,20 +371,24 @@ GTG 維持本機、standalone 設計。獨立 collector 把 GTG log 當作其中
 - 現行版本保護單一選定／預設 GPU；多 GPU policy 尚未完成。
 - 尚未提供 installer 或 service 管理 UI。
 - 無法保證攔截所有 TDR、driver reset、感測器突然失效或硬體故障。
-- OSD 不注入、不使用 graphics hook，因此不保證覆蓋 exclusive fullscreen。
+- 遊戲內 overlay 只支援原生 64 位元的 Direct3D 11 與 12 遊戲；不支援 Vulkan、OpenGL、Direct3D 9、32 位元遊戲與 HDR。有 anti-cheat 的遊戲可能拒絕它。
 - 安全功率與觸發溫度必須依實際硬體審慎設定。
 
 ## 發佈完整性
 
-Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt` 與 build-provenance attestation。有設定 Authenticode 憑證時，EXE 會先簽章並驗證再封裝；尚無憑證時，只會發布清楚標示的 **unsigned prerelease**，壓縮檔名稱包含 `unsigned`，Release Notes 也會顯示警告。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
+Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt`，並為兩個套件都發佈 build-provenance attestation。有設定 Authenticode 憑證時，EXE 與 overlay DLL 會先簽章並驗證再封裝。**1.0.0 沒有 Authenticode 簽章**；Release Notes 會說明，壓縮檔改以 checksum 與 attestation 驗證。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
 
 下載 Release 壓縮檔後，可驗證該檔案是否確實由本 Repository 的 GitHub Actions workflow 產生：
 
 ```powershell
-gh attestation verify .\GpuThermalGuard-<version>-unsigned-windows-x64.zip -R allenk/GpuThermalGuard
+gh attestation verify .\GpuThermalGuard-<version>-windows-x64.zip -R allenk/GpuThermalGuard
 ```
 
-Provenance 驗證不能取代 Authenticode 發行者身分或惡意程式掃描；Windows SmartScreen 仍可能警告尚未簽章的 prerelease EXE。
+Provenance 驗證不能取代 Authenticode 發行者身分或惡意程式掃描。Windows SmartScreen 可能警告未簽章的 EXE；部分防毒軟體會標記任何把 DLL 載入其他行程的程式 —— overlay 正是這樣做的，這是設計，而且只在你按下熱鍵時發生。
+
+## 貢獻與安全性
+
+開發準則請見 [CONTRIBUTING.md](CONTRIBUTING.md)。涉及安全性的問題請依 [SECURITY.md](SECURITY.md) 私下回報。
 
 ## 作者
 
@@ -306,4 +396,4 @@ Provenance 驗證不能取代 Authenticode 發行者身分或惡意程式掃描�
 
 ## 授權
 
-GpuThermalGuard 採用 [MIT License](LICENSE)。內附 WTL headers 採用 Microsoft Public License；NVIDIA NVML header 保留 NVIDIA 原始授權聲明。詳見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+GpuThermalGuard 採用 [MIT License](LICENSE)。第三方元件保留各自的授權：WTL（Microsoft Public License）、NVIDIA NVML header（NVIDIA 原始聲明）、darkmodelib（Mozilla Public License 2.0，部分程式碼為 MIT）、Dear ImGui（MIT）與 Splice（MIT）。詳見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
