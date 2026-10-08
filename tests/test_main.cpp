@@ -1495,6 +1495,25 @@ void TestMonitorOnlyWatchesAndNeverWrites() {
             "and still applies safe power at the trigger temperature");
 }
 
+// AF-20261008-overlay-o-installing: the O turns once a second and warms
+// towards yellow without ever claiming to be done.
+void TestOverlaySpinTurnsAndNeverFinishesEarly() {
+    using namespace gtg::tray::animation;
+    Require(SpinAngle(0) == 0.0F, "spin starts at rest");
+    Require(SpinAngle(250) == 90.0F, "a quarter turn at 250 ms");
+    Require(SpinAngle(1000) == 0.0F, "one turn a second");
+    Require(SpinWarmth(0) == 0.0F, "starts in the accent");
+    float previous = 0.0F;
+    for (std::uint64_t t = 100; t <= 600'000; t += 997) {
+        const float w = SpinWarmth(t);
+        Require(w >= previous, "warmth only rises");
+        Require(w < kSpinWarmthCeiling, "never reaches the ceiling");
+        previous = w;
+    }
+    Require(previous < 1.0F, "never full yellow while turning");
+    Require(IntensityAt(Effect::Spin, 0, 0, 4, 4, 500) == 0.0F, "spin draws no blocks");
+}
+
 void TestRainAnimationIsDeterministicAndBounded() {
     using namespace gtg::tray::animation;
     constexpr int kColumns = 18;
@@ -4097,6 +4116,7 @@ int main(int argc, char** argv) {
         {"PowerDefaultsComeFromTheCard", TestPowerDefaultsComeFromTheCard},
         {"MonitorOnlyWatchesAndNeverWrites", TestMonitorOnlyWatchesAndNeverWrites},
         {"RainAnimationIsDeterministicAndBounded", TestRainAnimationIsDeterministicAndBounded},
+        {"OverlaySpinTurnsAndNeverFinishesEarly", TestOverlaySpinTurnsAndNeverFinishesEarly},
         {"BusyIndicatorCoversItsCellExactly", TestBusyIndicatorCoversItsCellExactly},
         {"OsdPreferenceDefaultsOn", TestOsdPreferenceDefaultsOn},
         {"EffectiveOsdScale", TestEffectiveOsdScale},

@@ -15,6 +15,9 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 - **In-game overlay.** The dashboard is drawn inside Direct3D 11 and Direct3D 12 games, so it stays visible in exclusive and borderless fullscreen where a desktop window cannot. Nothing is injected until you press the overlay hotkey with a game in front. Built on [Splice](https://github.com/allenk/splice).
 - **Overlay hotkey.** `Alt`+`F10` by default, recorded the way PowerToys records shortcuts, checked against Windows for conflicts.
+- **The overlay stands in for the desktop OSD.** With **Hide desktop OSD in game** checked (the default), the always-on-top OSD steps aside while a game with the overlay is in front, and comes back the moment you leave it.
+- **The O.** A small ring beside the status dot shows the overlay's state and works like the hotkey: indigo, press to attach; yellow, the game in front has the overlay; turning, attaching; a brief red, that program cannot take one.
+- **Drag from anywhere in the header**, its buttons included; the outline lights up while the OSD moves.
 - **A new way of measuring FPS.** GTG now tells whether a game's frames are composed by Windows or flipped straight to the screen, and counts the right thing for each.
 - **Wall clock and play time.** The OSD header shows the time when the pointer is away; the FPS card shows how long you have been playing.
 - **Magnetic alignment.** The OSD snaps to screen and taskbar edges while you drag it.
@@ -50,11 +53,33 @@ A desktop OSD is a window, and a game in exclusive fullscreen -- or one that kee
 ### How it works
 
 1. **Overlay** in the main window is checked by default. It registers the hotkey; it injects nothing.
-2. Bring a game to the front and press the hotkey. GTG starts a short-lived helper (the same EXE), which checks the target -- a native 64-bit process in your session, not a system or critical process, not under the Windows directory, not GTG itself -- works out the Direct3D entry points **in its own process** without touching the game, and only then loads `gtg_overlay.dll` into the game. In our tests the dashboard appears in well under a second.
+2. Bring a game to the front and press the hotkey (or click the O on the desktop OSD). GTG starts a short-lived helper (the same EXE), which checks the target -- a native 64-bit process in your session, not a system or critical process, not under the Windows directory, not GTG itself -- works out the Direct3D entry points **in its own process** without touching the game, and only then loads `gtg_overlay.dll` into the game. In our tests the dashboard appears in well under a second.
 3. Press the hotkey again in that game to hide the overlay, and again to show it.
 4. Up to **four games** can carry the overlay at the same time; each has its own session.
+5. If the program in front cannot take the overlay, the O flashes red. That program is not tried again while it runs, and it does not use up one of the four places.
 
 The DLL stays loaded until the game exits -- hiding the overlay or switching the feature off stops drawing, it does not unload code from a running game. The helper process lives as long as the game does and ends with it. Restart a game before replacing GTG's files.
+
+### The O
+
+| Clock | Buttons | Overlay live |
+| --- | --- | --- |
+| <img src="docs/images/compact-clock.png" alt="The compact dashboard as one column, its header showing the green status dot, an indigo O and the time" width="148"> | <img src="docs/images/compact-buttons.png" alt="The same header with the pointer over it: the indigo O, the lock and the chevron" width="148"> | <img src="docs/images/compact-overlay-live.png" alt="The same header while the game in front has the overlay: the O is yellow" width="148"> |
+
+The ring beside the status dot is the overlay's state, and a button that does what the hotkey does:
+
+- **Indigo** -- the program in front does not have the overlay; click to attach it, or to show it again.
+- **Yellow** -- the program in front has the overlay; click to hide it. The overlay's own copy always shows a yellow O.
+- **Turning** -- attaching. The ring turns and warms towards yellow until the overlay draws; clicks are ignored meanwhile. Some games take several seconds.
+- **A brief red** -- that program cannot take the overlay. The hotkey gives the same signal, so a press is never silent.
+
+The OSD never takes the keyboard focus, so a click on the O acts on the program you were using -- the same one the hotkey would.
+
+### Hiding the desktop OSD in game
+
+**Hide desktop OSD in game** (bottom left of the main window, checked by default) lets the overlay stand in for the desktop OSD: while a game with the overlay is in front, the always-on-top OSD is hidden, so nothing is drawn twice and Windows has no extra window to compose over the game.
+
+The OSD comes back as soon as you leave the game -- `Alt`+`Tab`, the Start menu, Task Manager, `Ctrl`+`Alt`+`Del`, the hotkey, or the game exiting -- with its buttons showing instead of the clock, so you can move it straight away. Going back into the game hides it again after half a second, so a quick `Alt`+`Tab` does not make it flash. With several games carrying the overlay, whichever is in front decides. Uncheck the option to keep both.
 
 ### Overlay hotkey
 
@@ -70,6 +95,7 @@ Press the combination you want; it is shown as keycaps and checked as you type. 
 
 - **Supported:** native 64-bit Direct3D 11 and Direct3D 12 games, windowed, borderless or fullscreen.
 - **Not supported:** Vulkan, OpenGL and Direct3D 9 games (the desktop OSD still works over them where it can be seen), 32-bit games, HDR.
+- **Not a target:** programs that redraw only part of their window or present without a window of their own -- terminals, browsers, most desktop applications. The overlay is for games; on such a program the O turns for up to ten seconds and then flashes red.
 - **Anti-cheat.** GTG does nothing to hide from anti-cheat: no hidden modules, no manual mapping, no unlinking. A game with anti-cheat may refuse the overlay or treat it as a cheat. **Do not use the overlay in protected or competitive online games.** Where a game refuses it, that game is unsupported.
 
 ### Built on Splice
@@ -78,9 +104,15 @@ The overlay hooks the game's present path with [Splice](https://github.com/allen
 
 ## The desktop OSD
 
-![The compact dashboard over a running game: live temperature, power, VRAM, GPU, CPU, network with per-direction arrows, and frame rate with its graphics API and presented resolution](docs/images/osd-in-game.gif)
+<img src="docs/images/overlay-arrange.gif" alt="Over a game at 4K: unlocking the compact dashboard, dragging its cards from two rows into one column, then double-clicking the RAM and NET cards" width="480">
 
 A one-minute walkthrough of an earlier release, recorded over a game at 4K, is on [YouTube](https://www.youtube.com/watch?v=1urYDlP_he0).
+
+### Expanded OSD
+
+<img src="docs/images/osd-expanded.png" alt="The expanded OSD: a full-width curve for each record, with the frame rate's graphics API and resolution and play time on the FPS lane" width="560">
+
+Each record gets a full-width curve of the last 30 seconds, with its value on the right.
 
 ### Compact OSD
 
@@ -116,9 +148,11 @@ Any row can hold a single card, so the whole dashboard can be one column. The ex
 
 Dragging the OSD by its header pulls it onto the edges of the screen it is on -- the taskbar's edge and the screen's own edge both -- and onto the seam between two monitors. Drag past the edge and it lets go. Hold `Shift` to place it freely.
 
+The whole header is a handle, its buttons included: a press that moves is a drag, a press that stays put is a click. While the OSD is moving, its outline lights up.
+
 ### Wall clock
 
-Two seconds after the pointer leaves the OSD, the lock and the chevron give their place to the time, `23:59:59`; they come back the moment the pointer returns. While the arrangement is unlocked they stay, because the amber lock is the one thing you must not miss. The in-game overlay cannot be clicked, so it always shows the clock.
+Two seconds after the pointer leaves the OSD, the lock and the chevron give their place to the time, `23:59:59`; they come back the moment the pointer returns. The O stays. While the arrangement is unlocked the buttons stay too, because the amber lock is the one thing you must not miss. When the OSD comes back from behind the overlay, it shows its buttons until the pointer has been over it once. The in-game overlay cannot be clicked, so it always shows the clock.
 
 ### Play time
 

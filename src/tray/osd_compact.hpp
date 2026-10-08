@@ -802,17 +802,76 @@ constexpr bool LockHit(int x, int y, int width, int header_height) noexcept {
            y >= 0 && y < header_height;
 }
 
+// The status dot and the overlay's O beside it (AF-20261008-overlay-o-button).
+// The dot is 6 dip; it moves right under a title. The O is a 9-dip ring with
+// two gaps, no frame -- the owner's choice B of three in the O icon
+// comparison under design/arts/ -- 5 dip after the dot and centred on it.
+inline constexpr float kStatusDotDip = 6.0F;
+inline constexpr float kOverlayMarkGapDip = 5.0F;
+inline constexpr float kOverlayMarkWidthDip = 9.0F;
+inline constexpr float kOverlayMarkHeightDip = 9.0F;
+// The press area reaches this far past the drawn O on each side; the whole
+// band height counts, as it does for the lock and the chevron.
+inline constexpr float kOverlayMarkHitPadDip = 2.0F;
+
+[[nodiscard]] constexpr float StatusDotLeftDip(bool title_shown) noexcept {
+    return title_shown ? 46.0F : 11.0F;
+}
+[[nodiscard]] constexpr float OverlayMarkLeftDip(bool title_shown) noexcept {
+    return StatusDotLeftDip(title_shown) + kStatusDotDip + kOverlayMarkGapDip;
+}
+[[nodiscard]] constexpr bool OverlayMarkHit(int x, int y, float scale, bool title_shown,
+                                            int header_height) noexcept {
+    const float left = (OverlayMarkLeftDip(title_shown) - kOverlayMarkHitPadDip) * scale;
+    const float right = (OverlayMarkLeftDip(title_shown) + kOverlayMarkWidthDip +
+                         kOverlayMarkHitPadDip) * scale;
+    return static_cast<float>(x) >= left && static_cast<float>(x) < right && y >= 0 &&
+           y < header_height;
+}
+
+// The one-column window is where the O is tightest: the wall clock is drawn
+// right-aligned with a 4-dip margin, and the lock plate begins two buttons
+// from the right edge. "23:59:59" in the 10 px bold title face measures 39.9
+// dip, plus GDI+'s 1/6-em pad (1.7 dip); measured 2026-10-08, the same at
+// every scale from 100 to 250 %. `OVL` ended at 38.5 dip and touched it.
+inline constexpr float kOneColumnWidthDip = 84.0F;
+inline constexpr float kWallClockTextDip = 39.9F + 10.0F / 6.0F;
+static_assert(OverlayMarkLeftDip(false) + kOverlayMarkWidthDip + 2.0F <=
+                  kOneColumnWidthDip - 4.0F - kWallClockTextDip,
+              "the O must end 2 dip before the wall clock in a one-column window");
+static_assert(OverlayMarkLeftDip(false) + kOverlayMarkWidthDip + kOverlayMarkHitPadDip <=
+                  kOneColumnWidthDip - 2.0F * kHeaderButtonDip,
+              "the O's press area must end before the lock's");
+
+// A press on a header button. It is a click if it is released on the button
+// without having travelled; once it travels past the system drag distance it
+// is a window move instead, so the buttons are as good a handle as the strip
+// between them (owner, 2026-10-08: the O made the one-column header hard to
+// grab). Within the distance a shaky click is still a click.
 class Gesture {
 public:
-    void Press(bool inside) noexcept { pressed_ = inside; }
+    void Press(bool inside, int x = 0, int y = 0) noexcept {
+        pressed_ = inside;
+        x_ = x;
+        y_ = y;
+    }
     void Cancel() noexcept { pressed_ = false; }
     bool Release(bool inside) noexcept {
         const bool activate = pressed_ && inside;
         pressed_ = false;
         return activate;
     }
+    [[nodiscard]] bool Pressed() const noexcept { return pressed_; }
+    // SM_CXDRAG / SM_CYDRAG for the window's DPI.
+    [[nodiscard]] bool Travelled(int x, int y, int drag_x, int drag_y) const noexcept {
+        const int dx = x > x_ ? x - x_ : x_ - x;
+        const int dy = y > y_ ? y - y_ : y_ - y;
+        return pressed_ && (dx > drag_x || dy > drag_y);
+    }
 private:
     bool pressed_{};
+    int x_{};
+    int y_{};
 };
 
 enum class Status { Fault, Protected, Unavailable, Delayed, Warning, Monitoring, Initializing };

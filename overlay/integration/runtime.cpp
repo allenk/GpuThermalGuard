@@ -9,6 +9,8 @@
 #include "../ipc/osd_section.hpp"
 #include "../publisher/osd_geometry.hpp"
 #include "target_admission.hpp"
+#include "embed_policy.hpp"
+#include "refused_targets.hpp"
 #include "tray/osd_overlay.hpp"
 #include "settings/settings.hpp"
 #include "logging/logger.hpp"
@@ -23,6 +25,7 @@
 #include <format>
 #include <memory>
 #include <stdexcept>
+#include <span>
 #include <string>
 
 namespace gtg::overlay::integration {
@@ -93,6 +96,13 @@ struct Runtime {
     int hotkey{};
     unsigned modifiers{}, key{};
     std::array<std::unique_ptr<Session>, 4> sessions;
+    // AF-20261008-overlay-embedded-osd: the desktop OSD steps aside while a
+    // drawing session's game is in front.
+    bool hides_osd{true};
+    ForegroundSettle settle;
+    // Failed targets, outside the four slots; see refused_targets.hpp.
+    RefusedTargets refused;
+    unsigned prune_ticks{};
 } runtime;
 
 std::uint64_t NowUs() noexcept {
@@ -196,21 +206,24 @@ ColorConsent AskColorConsent(HANDLE target, DWORD pid) {
     if (!task_dialog) return ColorConsent::Cancel;
     return SUCCEEDED(task_dialog(&config, &button, nullptr, nullptr)) ? DecodeConsent(button) : ColorConsent::Cancel;
 }
-void Press() {
-    if (!runtime.enabled || runtime.choosing) return;
+// False when the program in front cannot take an overlay, or attaching
+// was refused; the caller shows that (AF-20261008-overlay-o-button).
+bool TryPress() {
     struct ChoiceGuard {
         ChoiceGuard() { runtime.choosing = true; }
         ~ChoiceGuard() { runtime.choosing = false; }
     } choice_guard;
     DWORD pid{};
     const HWND foreground = GetForegroundWindow();
-    if (!foreground || foreground == GetDesktopWindow() || foreground == GetShellWindow()) return;
+    if (!foreground || foreground == GetDesktopWindow() || foreground == GetShellWindow()) return false;
     GetWindowThreadProcessId(foreground, &pid);
-    if (!pid || pid == GetCurrentProcessId()) return;
+    if (!pid || pid == GetCurrentProcessId()) return false;
     Handle target;
     target.value = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, pid);
     const Identity identity{pid, CreationTime(target.value)};
-    if (!identity.created || WaitForSingleObject(target.value, 0) != WAIT_TIMEOUT) return;
+    if (!identity.created || WaitForSingleObject(target.value, 0) != WAIT_TIMEOUT) return false;
+    // Failed here before: never retried while that process lives.
+    if (runtime.refused.Contains(identity)) return false;
     for (auto& slot : runtime.sessions) {
         if (!slot || !(slot->policy.Target() == identity)) continue;
         const auto action = slot->policy.Press(true, identity);
@@ -220,34 +233,35 @@ void Press() {
             // Showing waits for the next validated publisher tick as well.
             ipc::SetEnabled(*slot->bitmap, false);
         }
-        return;
+        // Still installing is not a refusal; a failed session is.
+        return action != Action::Refuse;
     }
     if (!TargetAdmitted(target.value)) {
         (void)logging::TryWarning(
             L"Overlay: foreground target failed read-only admission; no injection attempted");
-        return;
+        return false;
     }
     auto empty = std::find_if(runtime.sessions.begin(), runtime.sessions.end(),
                               [](const auto& s) { return !s; });
-    if (empty == runtime.sessions.end()) return;
+    if (empty == runtime.sessions.end()) return false;
     if (!ChoiceNamespacesClear(pid)) {
         (void)logging::TryWarning(L"Overlay: existing/uncertain hook or color-choice namespace; no new injection");
-        return;
+        return false;
     }
     const bool auto_sdr = settings::LoadOverlayAutoSdr();
     const auto choice = SelectColorConsent(auto_sdr, [&] { return AskColorConsent(target.value, pid); });
     if (!AcceptConsent(choice, identity, {pid, CreationTime(target.value)},
             WaitForSingleObject(target.value, 0) == WAIT_TIMEOUT, runtime.enabled) ||
-        !ChoiceNamespacesClear(pid) || !TargetAdmitted(target.value)) return;
+        !ChoiceNamespacesClear(pid) || !TargetAdmitted(target.value)) return false;
     // The dialog pumps messages; find a free slot again after explicit consent.
     empty = std::find_if(runtime.sessions.begin(), runtime.sessions.end(), [](const auto& s) { return !s; });
-    if (empty == runtime.sessions.end()) return;
+    if (empty == runtime.sessions.end()) return false;
     auto slot = std::make_unique<Session>();
     if (choice == ColorConsent::AssumeSdr) {
         slot->color_choice = std::make_unique<ColorChoiceMapping>();
         if (!slot->color_choice->Create(pid, identity.created)) {
             (void)logging::TryWarning(L"Overlay: session SDR choice publication refused; no injection");
-            return;
+            return false;
         }
     }
     slot->target.value = std::exchange(target.value, nullptr);
@@ -267,6 +281,11 @@ void Press() {
         : choice == ColorConsent::AssumeSdr
             ? L"Overlay color policy: explicit session SDR interpretation (not observed color)"
             : L"Overlay color policy: automatic/strict");
+    return true;
+}
+void Press() {
+    if (!runtime.enabled || runtime.choosing) return;
+    if (!TryPress() && runtime.source != nullptr) runtime.source->FlashOverlayRefusal();
 }
 bool ReadRequest(Session& s) noexcept {
     const auto serial = ipc::RequestSerial(*s.request);
@@ -380,8 +399,82 @@ void Publish(Session& s, std::uint64_t now) {
         }
     }
 }
+// Whether the overlay stands in for the desktop OSD right now, and whether any
+// game has a live overlay (the header's OVL badge). Runs on every tick; the
+// process creation time is read only when the foreground pid matches a
+// session, so the common case costs two user32 calls.
+void UpdateEmbedding() noexcept {
+    if (runtime.source == nullptr) return;
+    std::array<EmbedSession, 4> sessions{};
+    std::size_t count = 0;
+    for (const auto& s : runtime.sessions) {
+        if (!s) continue;
+        const bool visible = runtime.enabled && s->policy.Current() == State::Visible;
+        sessions[count++] = {s->policy.Target(), visible,
+                             s->first_bitmap_published && s->image_valid};
+    }
+    Identity foreground{};
+    DWORD pid = 0;
+    if (const HWND window = GetForegroundWindow();
+        window != nullptr && GetWindowThreadProcessId(window, &pid) != 0 && pid != 0) {
+        foreground.pid = pid;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (sessions[i].target.pid != pid) continue;
+            if (const HANDLE process =
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+                foreground.created = CreationTime(process);
+                CloseHandle(process);
+            }
+            break;
+        }
+    }
+    const bool settled = runtime.settle.Settled(foreground.pid, GetTickCount64());
+    const std::span<const EmbedSession> view{sessions.data(), count};
+    const bool in_game = OverlayOwnsForeground(view, foreground);
+    runtime.source->SetSuppressed(runtime.hides_osd && in_game && settled);
+    // The O: what pressing it would do for the program in front.
+    using Mark = tray::OsdOverlay::OverlayMark;
+    bool front_live = false;
+    for (const auto& s : view) front_live = front_live || (s.visible && s.target == foreground);
+    bool front_installing = false;
+    for (const auto& s : runtime.sessions)
+        front_installing = front_installing ||
+            (s && s->policy.Current() == State::Installing && s->policy.Target() == foreground);
+    runtime.source->SetOverlayMark(!runtime.enabled  ? Mark::None
+                                   : front_live       ? Mark::Live
+                                   : front_installing ? Mark::Installing
+                                                      : Mark::Attachable);
+}
+// A failed session gives its slot back. The identity is remembered so the same
+// process is not tried again; the Session destructor only disables drawing
+// and tells the helper to stop -- no waiting, no remote unload, no unhook.
+void RetireRefused(std::unique_ptr<Session>& slot) noexcept {
+    const auto target = slot->policy.Target();
+    try {
+        runtime.refused.Add(target);
+    } catch (...) {
+        // Not remembered: the pre-load Present byte check still refuses a retry.
+    }
+    slot.reset();
+    try {
+        (void)logging::TryInfo(std::format(
+            L"Overlay session failed; slot released, retry refused until target {} exits",
+            target.pid));
+    } catch (...) {}
+}
+bool StillRunning(const Identity& target) noexcept {
+    const HANDLE process =
+        OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
+    if (process == nullptr) return false;
+    const bool alive = CreationTime(process) == target.created &&
+                       WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+    CloseHandle(process);
+    return alive;
+}
 void Tick() {
     timing::SlowUiScope phase(L"overlay.timer");
+    // About every two seconds, forget failed targets that have exited.
+    if (++runtime.prune_ticks % 64 == 0) runtime.refused.Prune(StillRunning);
     for (auto& slot : runtime.sessions) {
         if (!slot) continue;
         if (WaitForSingleObject(slot->target.value, 0) != WAIT_TIMEOUT) {
@@ -398,7 +491,11 @@ void Tick() {
             continue;
         }
         auto& s = *slot;
-        if (!s.control || s.policy.Current() == State::Failed) continue;
+        if (s.policy.Current() == State::Failed) {
+            RetireRefused(slot);
+            continue;
+        }
+        if (!s.control) continue;
         const auto state =
             static_cast<HelperState>(InterlockedCompareExchange(&s.control->state, 0, 0));
         if (state == HelperState::Failed || state == HelperState::Closed ||
@@ -406,9 +503,12 @@ void Tick() {
             ipc::SetEnabled(*s.bitmap, false);
             // Retain the identity and no retry; the DLL may already be resident.
             s.policy.Fail();
+            if (state != HelperState::Closed && runtime.source != nullptr)
+                runtime.source->FlashOverlayRefusal();
             (void)logging::TryWarning(
                 L"Overlay feature: helper stopped/failed; drawing disabled, restart game before "
                 L"retry");
+            RetireRefused(slot);
             continue;
         }
         if (state == HelperState::Ready && s.policy.Current() == State::Installing) {
@@ -423,6 +523,9 @@ void Tick() {
         }
         if (runtime.enabled && s.policy.Current() == State::Visible) Publish(s, GetTickCount64());
     }
+    // Before the timer can stop below: with no session left this restores the
+    // OSD and clears the badge.
+    UpdateEmbedding();
     if (!runtime.enabled && std::none_of(runtime.sessions.begin(), runtime.sessions.end(),
                                          [](const auto& s) { return s != nullptr; }))
         KillTimer(runtime.window, kTimer);
@@ -430,7 +533,8 @@ void Tick() {
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR,
                             DWORD_PTR) {
     try {
-        if (message == WM_HOTKEY && static_cast<int>(wparam) == runtime.hotkey) {
+        if ((message == WM_HOTKEY && static_cast<int>(wparam) == runtime.hotkey) ||
+            message == tray::OsdOverlay::kOverlayPressMessage) {
             Press();
             return 0;
         }
@@ -445,6 +549,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                 s->image_valid = false;
             }
         (void)logging::TryWarning(L"Overlay feature operation failed; protection is independent");
+        if (runtime.source != nullptr) runtime.source->FlashOverlayRefusal();
     }
     return DefSubclassProc(window, message, wparam, lparam);
 }
@@ -482,8 +587,14 @@ bool Configure(bool enabled, unsigned modifiers, unsigned key) noexcept {
         KillTimer(runtime.window, kTimer);
     return true;
 }
+void SetHidesOsd(const bool hides) noexcept {
+    runtime.hides_osd = hides;
+    // Off takes effect at once; on waits for the next tick's settle time.
+    if (!hides && runtime.source != nullptr) runtime.source->SetSuppressed(false);
+}
 Status GetStatus() noexcept {
     Status status{runtime.enabled, runtime.modifiers, runtime.key};
+    status.failed = static_cast<unsigned>(runtime.refused.Size());
     for (const auto& s : runtime.sessions)
         if (s) {
             switch (s->policy.Current()) {
@@ -521,6 +632,10 @@ void Stop() noexcept {
     KillTimer(runtime.window, kTimer);
     RemoveWindowSubclass(runtime.window, WindowProc, kSubclass);
     for (auto& slot : runtime.sessions) slot.reset();
+    if (runtime.source != nullptr) {
+        runtime.source->SetSuppressed(false);
+        runtime.source->SetOverlayMark(tray::OsdOverlay::OverlayMark::None);
+    }
     runtime.source = nullptr;
     runtime.window = nullptr;
 }

@@ -94,6 +94,7 @@ private:
     LRESULT OnLButtonUp(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnCaptureChanged(UINT, WPARAM, LPARAM, BOOL&);
     void Paint(HDC target, const RECT& bounds);
+    [[nodiscard]] bool EnsureSurface(HDC target, int width, int height);
     [[nodiscard]] RECT TimelineHitRect() const;
     [[nodiscard]] std::uint64_t EffectiveViewEnd(std::uint64_t now) const;
     void UpdateViewFromThumbLeft(int thumb_left, std::uint64_t now);
@@ -113,6 +114,25 @@ private:
     std::optional<ChartPalette> palette_;
     bool dragging_timeline_{false};
     int timeline_drag_offset_px_{};
+
+    // The off-screen surface, kept between paints and rebuilt only when the
+    // client size changes. GDI+ draws straight into this DIB section's memory
+    // and WM_PAINT copies it to the window with one BitBlt; drawing through an
+    // HDC onto a fresh DDB instead round-tripped every anti-aliased primitive
+    // through the kernel. AF-20261008-history-chart-dib-surface.
+    struct Surface {
+        HBITMAP bitmap{};
+        void* bits{};
+        int width{};
+        int height{};
+        Surface() = default;
+        Surface(const Surface&) = delete;
+        Surface& operator=(const Surface&) = delete;
+        ~Surface() {
+            if (bitmap != nullptr) DeleteObject(bitmap);
+        }
+    };
+    Surface surface_;
 };
 
 }  // namespace gtg::tray

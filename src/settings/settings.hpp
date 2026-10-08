@@ -152,6 +152,9 @@ struct TriggerTestRun {
 [[nodiscard]] bool SaveOverlayEnabled(bool enabled, std::wstring& error);
 [[nodiscard]] bool LoadOverlayAutoSdr() noexcept;
 [[nodiscard]] bool SaveOverlayAutoSdr(bool enabled, std::wstring& error);
+// AF-20261008-overlay-embedded-osd.
+[[nodiscard]] bool LoadOverlayHidesOsd() noexcept;
+[[nodiscard]] bool SaveOverlayHidesOsd(bool enabled, std::wstring& error);
 [[nodiscard]] OverlayHotkey LoadOverlayHotkey() noexcept;
 [[nodiscard]] bool SaveOverlayHotkey(const OverlayHotkey& hotkey, std::wstring& error);
 [[nodiscard]] bool LoadFeatureNoticeSerial(std::uint32_t& serial) noexcept;

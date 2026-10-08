@@ -204,9 +204,12 @@ int wmain(int argc, wchar_t** argv) {
         InterlockedExchange(&s.control->stop, 1);
         Require(WaitForSingleObject(s.helper.value, 5000) == WAIT_OBJECT_0,
                 "helper observes stop without target kill");
+        // A failed session gives its slot back and its identity is refused from
+        // then on (refused_targets.hpp); `s` is gone after this tick.
         Tick();
-        Require(s.policy.Current() == State::Failed && !ipc::Enabled(*s.bitmap),
-                "helper exit fails closed");
+        Require(!runtime.sessions[0] && runtime.refused.Contains(identity) &&
+                    GetStatus().failed == 1,
+                "helper exit fails closed: slot released, target refused");
         Stop();
         Require(!runtime.source && !runtime.hotkey && !runtime.sessions[0],
                 "nonblocking teardown releases state");

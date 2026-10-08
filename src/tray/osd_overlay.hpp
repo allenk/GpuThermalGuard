@@ -231,6 +231,27 @@ public:
     void Shutdown() noexcept;
     void SetVisible(bool visible);
     [[nodiscard]] bool Visible() const noexcept;
+    // The in-game overlay is standing in for this window
+    // (AF-20261008-overlay-embedded-osd). A temporary hide, separate from the
+    // user's switch: SetVisible while suppressed only records what to restore,
+    // nothing is persisted, and the topmost watchdog leaves a hidden window
+    // alone.
+    void SetSuppressed(bool suppressed);
+    // The user's switch: Visible() unless suppressed, then what to restore.
+    [[nodiscard]] bool Wanted() const noexcept;
+    // The overlay's O beside the status dot (AF-20261008-overlay-o-button):
+    // a button that does what the hotkey does, coloured by what it would do
+    // for the program in front. None while the overlay is off.
+    // Installing: the program in front is being attached; the O turns
+    // (AF-20261008-overlay-o-installing).
+    enum class OverlayMark { None, Attachable, Installing, Live };
+    void SetOverlayMark(OverlayMark mark) noexcept;
+    // The program in front cannot take an overlay: the O turns red briefly.
+    // Clicking the O and pressing the hotkey both end up here.
+    void FlashOverlayRefusal() noexcept;
+    // Posted to this window when the O is clicked; the overlay runtime, which
+    // subclasses it, presses exactly as the hotkey does.
+    static constexpr UINT kOverlayPressMessage = WM_APP + 60;
     void RequestRefresh() noexcept;
     void SetThresholds(int trigger_temperature_c, int safe_power_w,
                        std::optional<double> maximum_power_w) noexcept;
@@ -401,6 +422,17 @@ private:
     void EndDragImage() noexcept;
     // Arranging needs pointer input on the body, which click-through builds
     // deliberately do not have, so the control is not offered there.
+    // Whether the O is offered as a button: in builds whose body takes the
+    // pointer, while the overlay is on.
+    [[nodiscard]] bool ShowsOverlayButton() const noexcept {
+#if GTG_OSD_CLICK_THROUGH
+        return false;
+#else
+        return overlay_mark_ != OverlayMark::None;
+#endif
+    }
+    [[nodiscard]] bool OverlayHit(POINT point) const noexcept;
+    [[nodiscard]] bool TitleShown() const noexcept;
     [[nodiscard]] bool ShowsLock() const noexcept {
 #if GTG_OSD_CLICK_THROUGH
         return false;
@@ -502,7 +534,9 @@ private:
     // buttons while the pointer is near and the clock once it is idle; the
     // in-game bitmap cannot be clicked, so it always shows the clock.
     // AF-20261006-osd-idle-clock.
-    enum class HeaderMode { Controls, Clock };
+    // GameClock is the in-game copy: the clock, and no OVL badge, since that
+    // copy is the overlay.
+    enum class HeaderMode { Controls, Clock, GameClock };
     // The dashboard's pixels, with no output attached. See the definition
     // for why this is const.
     void DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
@@ -528,6 +562,18 @@ private:
     static constexpr UINT kFollowupTopmostRepairDelayMs = 1'200;
 
     HWND notification_window_{nullptr};
+    // AF-20261008-overlay-embedded-osd: see SetSuppressed.
+    bool suppressed_{};
+    bool wanted_while_suppressed_{};
+    // AF-20261008-overlay-o-button.
+    OverlayMark overlay_mark_{OverlayMark::None};
+    std::uint64_t overlay_refusal_until_ms_{};
+    compact::Gesture overlay_gesture_;
+    // Set when the OSD comes back from behind the overlay: the reader has just
+    // left a game and may want to move it, so the header shows its buttons,
+    // not the clock, until the pointer has visited once.
+    bool awake_after_overlay_{};
+    static constexpr std::uint64_t kOverlayRefusalFlashMs = 600;
     const telemetry::History* history_{nullptr};
     const fps::History* fps_history_{nullptr};
     int trigger_temperature_c_{85};

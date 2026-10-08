@@ -73,10 +73,14 @@ BEGIN
     LTEXT "OSD size", IDC_OSD_SCALE_LABEL, 292, 237, 130, 9
     COMBOBOX IDC_OSD_SCALE, 292, 247, 130, 120,
              CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    // Three switches stacked in the bottom-left corner, beside the actions
+    // (owner, 2026-10-08: "checkbox 可能只能塞 左下").
+    CONTROL "Hide desktop OSD in game", IDC_OVERLAY_HIDES_OSD,
+            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 263, 150, 10
     CONTROL "Auto SDR (skip prompt)", IDC_OVERLAY_AUTO_SDR,
-            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 266, 150, 12
+            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 274, 150, 10
     CONTROL "[X] Close to Tray", IDC_CLOSE_TO_TRAY,
-            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 280, 150, 12
+            "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 285, 150, 10
     PUSHBUTTON "Overlay Hotkey", IDC_OVERLAY_HOTKEY, 166, 266, 71, 26, WS_TABSTOP
     PUSHBUTTON "Capture Snapshot", IDC_CAPTURE_SNAPSHOT, 242, 266, 24, 26, BS_ICON | WS_TABSTOP
     // A push button, so it is drawn like its neighbours. MainDialog makes it

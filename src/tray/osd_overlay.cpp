@@ -487,12 +487,53 @@ void DrawFpsSparkline(Gdiplus::Graphics& graphics,
     std::vector<Gdiplus::PointF> points;
     const fps::HistorySample* last_valid = nullptr;
     const fps::HistorySample* last_sample = nullptr;
+    const fps::HistorySample* first_sample = nullptr;
+    const fps::HistorySample* before = nullptr;  // the last one left of `start`
+    const fps::HistorySample* after = nullptr;   // the first one right of `end`
     for (const auto& sample : samples) {
-        if (sample.monotonic_ms < start || sample.monotonic_ms > end) continue;
+        if (sample.monotonic_ms < start) {
+            before = &sample;
+            continue;
+        }
+        if (sample.monotonic_ms > end) {
+            if (after == nullptr) after = &sample;
+            continue;
+        }
+        if (first_sample == nullptr) first_sample = &sample;
         last_sample = &sample;
         if (sample.displayed_fps) {
             points.push_back(point_for(sample));
             last_valid = &sample;
+        }
+    }
+    // Both ends meet the lane's edges (owner, 2026-10-08: the FPS area slid
+    // left and right). The history is recorded about every 600 ms on the UI
+    // timer, but the axis is set by the telemetry clock, so the first sample
+    // after `start` and the last before `end` sat up to one interval inside
+    // the lane -- a different distance on every render, up to ~10 px each
+    // side. Interpolate across each edge from the samples either side of it;
+    // with nothing newer, hold a fresh reading to `end`. A gap stays a gap:
+    // an edge is only drawn to where the curve is already valid.
+    const auto y_between = [&](const fps::HistorySample& a, const fps::HistorySample& b,
+                               const std::uint64_t at) {
+        const float ya = point_for(a).Y;
+        const float yb = point_for(b).Y;
+        const double span = static_cast<double>(b.monotonic_ms - a.monotonic_ms);
+        const float t = span <= 0.0 ? 1.0F
+            : static_cast<float>(static_cast<double>(at - a.monotonic_ms) / span);
+        return ya + (yb - ya) * t;
+    };
+    if (!points.empty() && first_sample != nullptr && first_sample->displayed_fps &&
+        before != nullptr && before->displayed_fps) {
+        points.insert(points.begin(),
+                      Gdiplus::PointF(bounds.X, y_between(*before, *first_sample, start)));
+    }
+    constexpr std::uint64_t kHoldFreshMs = 1'000;
+    if (!points.empty() && last_valid != nullptr && last_sample == last_valid) {
+        if (after != nullptr && after->displayed_fps) {
+            points.emplace_back(bounds.GetRight(), y_between(*last_valid, *after, end));
+        } else if (after == nullptr && end - last_valid->monotonic_ms <= kHoldFreshMs) {
+            points.emplace_back(bounds.GetRight(), point_for(*last_valid).Y);
         }
     }
     if (last_valid != nullptr && last_sample != nullptr &&
@@ -893,8 +934,92 @@ void OsdOverlay::Shutdown() noexcept {
     notification_window_ = nullptr;
 }
 
+void OsdOverlay::SetSuppressed(const bool suppressed) {
+    if (m_hWnd == nullptr || suppressed == suppressed_) return;
+    if (suppressed) {
+        const bool wanted = Visible();
+        if (wanted) SetVisible(false);
+        suppressed_ = true;
+        wanted_while_suppressed_ = wanted;
+        awake_after_overlay_ = false;
+    } else {
+        suppressed_ = false;
+        if (wanted_while_suppressed_) {
+            // Only this transition wakes the header, so idle does not flip in
+            // and out during ordinary use (AF-20261008-overlay-o-button).
+            awake_after_overlay_ = true;
+            header_idle_ = false;
+            SetVisible(true);
+        }
+        wanted_while_suppressed_ = false;
+    }
+}
+
+bool OsdOverlay::Wanted() const noexcept {
+    return suppressed_ ? wanted_while_suppressed_ : Visible();
+}
+
+void OsdOverlay::SetOverlayMark(const OverlayMark mark) noexcept {
+    const bool changed = mark != overlay_mark_;
+    const bool was_installing = overlay_mark_ == OverlayMark::Installing;
+    overlay_mark_ = mark;
+    if (mark == OverlayMark::None) overlay_gesture_.Cancel();
+    // The busy indicator is the O while an attach runs: it turns on its own
+    // 33 ms timer over the O, so the dashboard keeps its 500 ms cadence
+    // (AF-20261008-overlay-o-installing). It is shared with cell actions, so
+    // only one started here (action_slot_ < 0) is ever ended here.
+    const bool spinning = busy_indicator_.Active() && action_slot_ < 0;
+    if (mark == OverlayMark::Installing) {
+        if (!spinning && !busy_indicator_.Active() && !move_grab_ && Visible()) {
+            const Layout layout = CurrentLayout();
+            const float s = layout.scale;
+            RECT window{};
+            if (GetWindowRect(&window) != FALSE) {
+                const float left = (compact::OverlayMarkLeftDip(TitleShown()) - 1.0F) * s;
+                const float top = (12.0F - compact::kOverlayMarkHeightDip / 2.0F - 1.0F) * s;
+                const int side = static_cast<int>((compact::kOverlayMarkWidthDip + 2.0F) * s + 0.5F);
+                const int x = window.left + static_cast<int>(left + 0.5F);
+                const int y = window.top + static_cast<int>(top + 0.5F);
+                if (busy_indicator_.Begin(m_hWnd, RECT{x, y, x + side, y + side},
+                                          0xEB28BEDEU, s, std::wstring{},
+                                          animation::Effect::Spin)) {
+                    RenderLatest();  // the dashboard's own O steps aside
+                }
+            }
+        }
+    } else if (was_installing && spinning) {
+        busy_indicator_.End();
+        RenderLatest();
+    }
+    if (changed) RequestRefresh();
+}
+
+void OsdOverlay::FlashOverlayRefusal() noexcept {
+    overlay_refusal_until_ms_ = GetTickCount64() + kOverlayRefusalFlashMs;
+    if (Visible()) RenderLatest();
+}
+
+bool OsdOverlay::TitleShown() const noexcept {
+    const Layout layout = CurrentLayout();
+    const int widest_columns = layout.columns < 0 ? -layout.columns : layout.columns;
+    return !collapsed_ || compact::HeaderShowsTitle(widest_columns);
+}
+
+bool OsdOverlay::OverlayHit(const POINT point) const noexcept {
+    if (!ShowsOverlayButton()) return false;
+    const Layout layout = CurrentLayout();
+    return compact::OverlayMarkHit(point.x, point.y, layout.scale, TitleShown(),
+                                   layout.drag_height);
+}
+
 void OsdOverlay::SetVisible(const bool should_show) {
     if (m_hWnd == nullptr) return;
+    if (suppressed_) {
+        // The overlay stands in for the window; remember the user's choice
+        // and apply it when the game is left.
+        wanted_while_suppressed_ = should_show;
+        return;
+    }
     if (should_show) {
         // Reconcile placement before every show. Visibility is a two-window
         // state in click-through builds and cannot be inferred from the OSD
@@ -1090,7 +1215,7 @@ LRESULT OsdOverlay::OnNcHitTest(UINT, WPARAM, const LPARAM lparam, BOOL&) {
     ScreenToClient(&point);
     // Both header controls must be carved out of the caption band or Windows
     // turns the press into a window drag and no button message ever arrives.
-    if (ToggleHit(point) || LockHit(point)) return HTCLIENT;
+    if (ToggleHit(point) || LockHit(point) || OverlayHit(point)) return HTCLIENT;
     if (point.y >= 0 && point.y < CurrentLayout().drag_height) return HTCAPTION;
     return HTCLIENT;
 #endif
@@ -1115,6 +1240,32 @@ LRESULT OsdOverlay::OnTogglePointer(UINT message, WPARAM, LPARAM point, BOOL&) {
 
 LRESULT OsdOverlay::OnDragMove(UINT, WPARAM, const LPARAM point, BOOL& handled) {
     if (drag_from_ < 0) {
+        // A header button pressed and dragged moves the window, through the
+        // same system move loop as the strip, so it snaps the same way.
+        const bool button_held = ::GetCapture() == m_hWnd &&
+            (toggle_gesture_.Pressed() || lock_gesture_.Pressed() ||
+             overlay_gesture_.Pressed());
+        if (button_held) {
+            const UINT dpi = CurrentDpi() == 0 ? USER_DEFAULT_SCREEN_DPI : CurrentDpi();
+            const int drag_x = GetSystemMetricsForDpi(SM_CXDRAG, dpi);
+            const int drag_y = GetSystemMetricsForDpi(SM_CYDRAG, dpi);
+            const int x = GET_X_LPARAM(point);
+            const int y = GET_Y_LPARAM(point);
+            if (toggle_gesture_.Travelled(x, y, drag_x, drag_y) ||
+                lock_gesture_.Travelled(x, y, drag_x, drag_y) ||
+                overlay_gesture_.Travelled(x, y, drag_x, drag_y)) {
+                toggle_gesture_.Cancel();
+                lock_gesture_.Cancel();
+                overlay_gesture_.Cancel();
+                ::ReleaseCapture();
+                POINT screen{x, y};
+                ClientToScreen(&screen);
+                SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION,
+                             MAKELPARAM(static_cast<short>(screen.x),
+                                        static_cast<short>(screen.y)));
+                return 0;
+            }
+        }
         handled = FALSE;
         return 0;
     }
@@ -1293,6 +1444,35 @@ void OsdBusyIndicator::DrawInto(Gdiplus::Graphics& graphics, const int width,
         static_cast<BYTE>((accent_ >> 16) & 0xFF),
         static_cast<BYTE>((accent_ >> 8) & 0xFF),
         static_cast<BYTE>(accent_ & 0xFF));
+
+    if (effect_ == animation::Effect::Spin) {
+        // The O, turning, on nothing: this window sits exactly over the O and
+        // the dashboard stops drawing its own while it does. The same two
+        // arcs as the static O, rotated, warming from the accent towards the
+        // overlay's yellow (AF-20261008-overlay-o-installing).
+        const std::uint64_t elapsed = GetTickCount64() - started_ms_;
+        const float warmth = animation::SpinWarmth(elapsed);
+        const auto mix = [warmth](const BYTE from, const BYTE to) {
+            return static_cast<BYTE>(static_cast<float>(from) +
+                                     (static_cast<float>(to) - static_cast<float>(from)) *
+                                         warmth + 0.5F);
+        };
+        const Gdiplus::Color ring_color(255, mix(accent.GetR(), 255), mix(accent.GetG(), 214),
+                                        mix(accent.GetB(), 64));
+        const float stroke = 1.3F * s;
+        const float side = static_cast<float>(std::min(width, height));
+        const float inset = (side - compact::kOverlayMarkWidthDip * s) / 2.0F + stroke / 2.0F;
+        const Gdiplus::RectF ring((static_cast<float>(width) - side) / 2.0F + inset,
+                                  (static_cast<float>(height) - side) / 2.0F + inset,
+                                  side - 2.0F * inset, side - 2.0F * inset);
+        Gdiplus::Pen pen(ring_color, stroke);
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        const float turn = animation::SpinAngle(elapsed);
+        graphics.DrawArc(&pen, ring, 305.0F + turn, 150.0F);
+        graphics.DrawArc(&pen, ring, 125.0F + turn, 150.0F);
+        return;
+    }
 
     // The cell keeps its own shape and accent, so the reader sees the
     // record they clicked rather than a foreign panel appearing on top.
@@ -1517,6 +1697,9 @@ LRESULT OsdOverlay::OnCellActivate(UINT, WPARAM, const LPARAM point, BOOL& handl
 bool OsdOverlay::BeginAction(const int slot,
                              const compact::Metric metric) noexcept {
     try {
+        // The indicator is its own topmost window; never over a game that the
+        // overlay is standing in for.
+        if (!Visible()) return false;
         if (busy_indicator_.Active()) return false;
         if (action_worker_.joinable()) action_worker_.join();
 
@@ -1793,9 +1976,12 @@ void OsdOverlay::BeginDragImage(const compact::Metric metric,
         EndDragImage();
         drag_metric_ = metric;
         drag_hotspot_ = {cursor.x - cell_origin.x, cursor.y - cell_origin.y};
+        // Rounded, not truncated, as the busy indicator learned: truncation
+        // always loses on the far edge, so the right and bottom came up short.
         const int width =
-            static_cast<int>(grid.cell_width_dip * grid.scale);
-        const int height = static_cast<int>(compact::kCellHeightDip * grid.scale);
+            static_cast<int>(grid.cell_width_dip * grid.scale + 0.5F);
+        const int height =
+            static_cast<int>(compact::kCellHeightDip * grid.scale + 0.5F);
         if (width <= 0 || height <= 0) return;
 
         const DWORD ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT |
@@ -1832,8 +2018,15 @@ void OsdOverlay::BeginDragImage(const compact::Metric metric,
             graphics.SetTextRenderingHint(
                 Gdiplus::TextRenderingHintClearTypeGridFit);
             const Gdiplus::Color accent = CompactAccent(metric);
-            const Gdiplus::RectF face(0.0F, 0.0F, static_cast<float>(width),
-                                      static_cast<float>(height));
+            // Inset by half the pen. A stroke straddles its path, so a face
+            // flush with the bitmap lost the outer half of its right and
+            // bottom edges to the edge of the surface (owner, 2026-10-08:
+            // the dragged cell was not symmetric) -- the same defect the busy
+            // indicator fixed, in the same way.
+            const float pen_width = grid.scale;
+            const Gdiplus::RectF face(pen_width * 0.5F, pen_width * 0.5F,
+                                      static_cast<float>(width) - pen_width,
+                                      static_cast<float>(height) - pen_width);
             Gdiplus::GraphicsPath rounded;
             AddRoundedRectangle(rounded, face, 3.0F * grid.scale);
             Gdiplus::SolidBrush fill(Gdiplus::Color(
@@ -1841,7 +2034,7 @@ void OsdOverlay::BeginDragImage(const compact::Metric metric,
             graphics.FillPath(&fill, &rounded);
             Gdiplus::Pen border(Gdiplus::Color(220, accent.GetR(), accent.GetG(),
                                                accent.GetB()),
-                                grid.scale);
+                                pen_width);
             graphics.DrawPath(&border, &rounded);
             Gdiplus::FontFamily family(L"Segoe UI");
             Gdiplus::Font font(&family, 9.0F * grid.scale,
@@ -1903,10 +2096,16 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
         compact::ToggleHit(cursor.x, cursor.y, geometry.width, geometry.drag_height);
     const bool on_lock = ShowsLock() &&
         compact::LockHit(cursor.x, cursor.y, geometry.width, geometry.drag_height);
+    const bool on_overlay = OverlayHit(cursor);
 
     if (message == WM_LBUTTONDOWN) {
+        if (on_overlay) {
+            overlay_gesture_.Press(true, cursor.x, cursor.y);
+            ::SetCapture(input_window);
+            return 0;
+        }
         if (on_lock) {
-            lock_gesture_.Press(true);
+            lock_gesture_.Press(true, cursor.x, cursor.y);
             ::SetCapture(input_window);
             return 0;
         }
@@ -1932,7 +2131,7 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
                 return 0;
             }
         }
-        toggle_gesture_.Press(on_chevron);
+        toggle_gesture_.Press(on_chevron, cursor.x, cursor.y);
         if (on_chevron) ::SetCapture(input_window);
         return 0;
     }
@@ -1944,11 +2143,17 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
         const int from_slot = drag_from_;
         drag_from_ = -1;
         const bool lock_click = lock_gesture_.Release(on_lock && captured);
+        const bool overlay_click = overlay_gesture_.Release(on_overlay && captured);
         const bool toggle = toggle_gesture_.Release(on_chevron && captured);
         if (captured) ::ReleaseCapture();
         EndDragImage();
         if (from_slot >= 0) {
             if (captured) FinishArrangement(from_slot, cursor);
+        } else if (overlay_click) {
+            // The window never takes the foreground, so the program in front
+            // is still the one the hotkey would act on. Not while it is being
+            // attached: the turning O is not a button.
+            if (overlay_mark_ != OverlayMark::Installing) PostMessageW(kOverlayPressMessage);
         } else if (lock_click) {
             SetCompactLocked(!compact_locked_);
             RenderLatest();
@@ -2057,7 +2262,13 @@ LRESULT OsdOverlay::OnPowerBroadcast(UINT, const WPARAM event,
 }
 
 LRESULT OsdOverlay::OnEnterSizeMove(UINT, WPARAM, LPARAM, BOOL&) {
+    // The turning O is a separate popup and would be left behind.
+    if (overlay_mark_ == OverlayMark::Installing && busy_indicator_.Active() &&
+        action_slot_ < 0) {
+        busy_indicator_.End();
+    }
     BeginMove(m_hWnd);
+    if (Visible()) RenderLatest();  // the outline lights up for the move
     return 0;
 }
 
@@ -2122,6 +2333,7 @@ placement::ModePositions OsdOverlay::Positions() const noexcept {
 LRESULT OsdOverlay::OnExitSizeMove(UINT, WPARAM, LPARAM, BOOL&) {
     move_grab_.reset();
     SynchronizeDragHandleToOverlay();
+    if (Visible()) RenderLatest();
     return 0;
 }
 
@@ -2329,7 +2541,7 @@ bool OsdOverlay::RenderToBitmap(const float scale,
         // A game cannot click the header, so its copy always shows the
         // clock (AF-20261006-osd-idle-clock). Only the header differs from
         // the desktop window's pixels.
-        DrawSurface(graphics, layout, now_ms, HeaderMode::Clock);
+        DrawSurface(graphics, layout, now_ms, HeaderMode::GameClock);
 
         // The indicator, into the same surface. On the desktop it is a second
         // window laid over the cell; here there is only one surface, so it is
@@ -2577,8 +2789,12 @@ void OsdOverlay::UpdateHeaderIdle(const std::uint64_t now_ms) noexcept {
         (capture != nullptr && (capture == m_hWnd || capture == drag_handle_.m_hWnd))) {
         present = true;
     }
-    if (present) last_pointer_ms_ = now_ms;
-    header_idle_ = compact::HeaderIdle(present, Arrangeable(), now_ms, last_pointer_ms_);
+    if (present) {
+        last_pointer_ms_ = now_ms;
+        awake_after_overlay_ = false;  // visited: the ordinary rule resumes
+    }
+    header_idle_ = !awake_after_overlay_ &&
+                   compact::HeaderIdle(present, Arrangeable(), now_ms, last_pointer_ms_);
 }
 
 void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
@@ -2593,6 +2809,19 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
         Gdiplus::Color(220, 13, 28, 43), Gdiplus::Color(200, 8, 19, 31),
         Gdiplus::LinearGradientModeVertical);
     graphics.FillPath(&panel_brush, &panel_path);
+    // Being moved: the outline lights up softly, so the window reads as lifted
+    // and floating while it follows the pointer (owner, 2026-10-08). The
+    // desktop window only; the game's copy is never being dragged.
+    if (move_grab_ && header != HeaderMode::GameClock) {
+        Gdiplus::RectF edge = panel;
+        edge.Inflate(-1.0F * s, -1.0F * s);
+        Gdiplus::GraphicsPath edge_path;
+        AddRoundedRectangle(edge_path, edge, 6.0F * s);
+        Gdiplus::Pen halo(Gdiplus::Color(70, 170, 220, 255), 2.5F * s);
+        graphics.DrawPath(&halo, &edge_path);
+        Gdiplus::Pen rim(Gdiplus::Color(170, 205, 235, 255), 1.0F * s);
+        graphics.DrawPath(&rim, &edge_path);
+    }
 
     Gdiplus::FontFamily family(L"Segoe UI");
     Gdiplus::Font title_font(&family, 10.0F * s, Gdiplus::FontStyleBold,
@@ -2689,10 +2918,41 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
     Gdiplus::SolidBrush dot(Gdiplus::Color(
         compact::PulseAlpha(collapsed_ && attention, animations != FALSE, now_ms),
         status_color.GetR(), status_color.GetG(), status_color.GetB()));
-    const float dot_left = (show_title ? 46.0F : 11.0F) * s;
+    const float dot_left = compact::StatusDotLeftDip(show_title) * s;
     graphics.FillEllipse(&dot, dot_left, 9.0F * s, 6.0F * s, 6.0F * s);
-    const float status_left = 58.0F * s;
-    const bool show_clock = header == HeaderMode::Clock;
+    float status_left = 58.0F * s;
+    // The overlay's O (AF-20261008-overlay-o-button). In the game's own copy
+    // it is always yellow: that game has the overlay. On the desktop it says
+    // what pressing it would do for the program in front -- indigo, attach;
+    // yellow, live -- and flashes red when that program cannot take one.
+    // Yellow is play time's, the only yellow on the dashboard.
+    const bool in_game_copy = header == HeaderMode::GameClock;
+    const bool o_spinning = !in_game_copy && overlay_mark_ == OverlayMark::Installing &&
+                            busy_indicator_.Active() && action_slot_ < 0;
+    if ((in_game_copy || overlay_mark_ != OverlayMark::None) && !o_spinning) {
+        const float mark_left = compact::OverlayMarkLeftDip(show_title) * s;
+        const Gdiplus::RectF mark(mark_left, (12.0F - compact::kOverlayMarkHeightDip / 2.0F) * s,
+                                  compact::kOverlayMarkWidthDip * s,
+                                  compact::kOverlayMarkHeightDip * s);
+        Gdiplus::Color mark_color(235, 40, 190, 222);  // indigo: attach
+        if (in_game_copy || overlay_mark_ == OverlayMark::Live)
+            mark_color = Gdiplus::Color(255, 255, 214, 64);
+        if (!in_game_copy && now_ms < overlay_refusal_until_ms_)
+            mark_color = Gdiplus::Color(255, 255, 82, 92);
+        // A ring broken twice, point-symmetric: just right of twelve and
+        // just left of six, each gap 30 degrees (GDI+ angles run clockwise
+        // from three o'clock, so twelve is 270).
+        const float stroke = 1.3F * s;
+        Gdiplus::RectF ring = mark;
+        ring.Inflate(-stroke / 2.0F, -stroke / 2.0F);
+        Gdiplus::Pen ring_pen(mark_color, stroke);
+        ring_pen.SetStartCap(Gdiplus::LineCapRound);
+        ring_pen.SetEndCap(Gdiplus::LineCapRound);
+        graphics.DrawArc(&ring_pen, ring, 305.0F, 150.0F);
+        graphics.DrawArc(&ring_pen, ring, 125.0F, 150.0F);
+        status_left = std::max(status_left, mark.GetRight() + 5.0F * s);
+    }
+    const bool show_clock = header != HeaderMode::Controls;
     // The clock takes the buttons' place: "23:59:59" at the title font, with
     // the same right margin the buttons leave.
     const float clock_width = 50.0F * s;
@@ -2751,24 +3011,31 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
                  title_font, Gdiplus::Color(222, 237, 243, 251), Gdiplus::StringAlignmentFar);
     }
     Gdiplus::SolidBrush button_fill(Gdiplus::Color(22, 203, 215, 231));
+    // The chevron's plate sits 1.5 units left of centre in its square, so the
+    // gap between the two plates equals the margin on the right: 4.5 units
+    // each, where they were 6 and 3. That is the owner's redraw
+    // (design/compact-ui-new-design-20261008.png, measured at 175 %: 6 and 7
+    // px). Applied in both layouts so the chevron does not jump when the
+    // dashboard folds; its hit square is unchanged.
+    const float chevron_plate_x = button_x + 1.5F * bs;
     if (!show_clock) {
-        graphics.FillRectangle(&button_fill, button_x + 3.0F * bs,
+        graphics.FillRectangle(&button_fill, chevron_plate_x,
                                button_y + 3.0F * bs, 19.0F * bs, 19.0F * bs);
     }
     Gdiplus::Pen chevron(Gdiplus::Color(235, 224, 235, 248), 1.5F * bs);
     chevron.SetLineJoin(Gdiplus::LineJoinRound);
-    const float edge_y = button_y + (collapsed_ ? 10.0F : 14.0F) * bs;
-    const float middle_y = button_y + (collapsed_ ? 14.0F : 10.0F) * bs;
-    // The two plates are already adjacent, but each glyph is centred in
-    // its own plate, so the gap the eye sees is the sum of two inner
-    // margins -- wider than the seam between the plates. Nudging the
-    // glyphs towards each other closes it without moving either plate or
-    // its hit rectangle.
-    const float chevron_nudge = 1.5F * bs;
+    // Every glyph is centred on its plate: 9.5 units in from the plate's
+    // corner on both axes (a 19-unit plate). The chevron spans 9 units
+    // across and 10.5..14.5 down. Glyphs used
+    // to be nudged towards each other to narrow the gap between them; the
+    // owner's 2026-10-08 redraw centres them instead, and off-centre is
+    // what read as wrong (design/compact-ui-new-design-20261008.png).
+    const float edge_y = button_y + (collapsed_ ? 10.5F : 14.5F) * bs;
+    const float middle_y = button_y + (collapsed_ ? 14.5F : 10.5F) * bs;
     const Gdiplus::PointF arrow[]{
-        {button_x + 8.0F * bs - chevron_nudge, edge_y},
-        {button_x + 12.5F * bs - chevron_nudge, middle_y},
-        {button_x + 17.0F * bs - chevron_nudge, edge_y}};
+        {chevron_plate_x + 5.0F * bs, edge_y},
+        {chevron_plate_x + 9.5F * bs, middle_y},
+        {chevron_plate_x + 14.0F * bs, edge_y}};
     if (!show_clock) graphics.DrawLines(&chevron, arrow, 3);
 
     // The lock is offered only where arranging is possible: the compact
@@ -2793,14 +3060,15 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
             : Gdiplus::Color(235, 255, 184, 72);
         Gdiplus::Pen lock_pen(lock_tint, 1.4F * bs);
         lock_pen.SetLineJoin(Gdiplus::LineJoinRound);
-        // Closed: the shackle sits on the body. Open: it lifts and shifts.
+        // Closed: the shackle sits on the body. Open: it shifts right. The
+        // body is centred on the plate (7.75..17.25 across; the glyph runs
+        // 6.75..18.5 down), and so is the closed shackle (9..16); the open
+        // one keeps its offset, which is what says "open".
         const float body_top = button_y + 12.0F * bs;
-        const float lock_nudge = 1.0F * bs;
-        const float arc_x =
-            lock_x + (compact_locked_ ? 9.0F : 10.75F) * bs + lock_nudge;
+        const float arc_x = lock_x + (compact_locked_ ? 9.0F : 10.75F) * bs;
         graphics.DrawArc(&lock_pen, arc_x, body_top - 5.25F * bs, 7.0F * bs,
                          7.0F * bs, 180.0F, 180.0F);
-        const Gdiplus::RectF body(lock_x + 7.75F * bs + lock_nudge, body_top,
+        const Gdiplus::RectF body(lock_x + 7.75F * bs, body_top,
                                   9.5F * bs, 6.5F * bs);
         if (compact_locked_) {
             graphics.DrawRectangle(&lock_pen, body);

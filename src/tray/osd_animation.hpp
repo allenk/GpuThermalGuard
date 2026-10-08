@@ -27,6 +27,7 @@ namespace gtg::tray::animation {
 enum class Effect {
     Sweep,      // one band travelling left to right
     Rain,       // columns of blocks falling at their own speeds
+    Spin,       // the overlay's O turning while an attach runs; not block-based
 };
 
 // What an indicator draws unless its caller asks for something else. Named
@@ -108,8 +109,26 @@ inline constexpr std::uint64_t kSweepPeriodMs = 1200;
             return SweepIntensity(column, row, columns, rows, elapsed_ms);
         case Effect::Rain:
             return RainIntensity(column, row, rows, elapsed_ms);
+        case Effect::Spin:
+            return 0.0F;  // drawn as a ring, not as blocks
     }
     return 0.0F;
+}
+
+// Spin (AF-20261008-overlay-o-installing): the O turns once a second, and its
+// colour moves from where it starts towards the overlay's yellow as t/(t+2),
+// scaled so it never arrives -- an attach has no known length, so the ring must
+// not claim to be done. Full yellow is the static O drawn once it is.
+inline constexpr std::uint64_t kSpinPeriodMs = 1000;
+inline constexpr float kSpinWarmthCeiling = 0.85F;
+
+[[nodiscard]] constexpr float SpinAngle(std::uint64_t elapsed_ms) noexcept {
+    return 360.0F * static_cast<float>(elapsed_ms % kSpinPeriodMs) /
+           static_cast<float>(kSpinPeriodMs);
+}
+[[nodiscard]] constexpr float SpinWarmth(std::uint64_t elapsed_ms) noexcept {
+    const float seconds = static_cast<float>(elapsed_ms) / 1000.0F;
+    return kSpinWarmthCeiling * seconds / (seconds + 2.0F);
 }
 
 // Block size in dip. A compact cell is 72 x 51, so four gives eighteen columns

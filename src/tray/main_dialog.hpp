@@ -76,6 +76,7 @@ public:
         COMMAND_HANDLER(IDC_THEME, CBN_SELCHANGE, OnUiThemeSelected)
         COMMAND_HANDLER(IDC_OVERLAY_ENABLED, BN_CLICKED, OnOverlayToggle)
         COMMAND_HANDLER(IDC_OVERLAY_AUTO_SDR, BN_CLICKED, OnOverlayAutoSdr)
+        COMMAND_HANDLER(IDC_OVERLAY_HIDES_OSD, BN_CLICKED, OnOverlayHidesOsd)
         COMMAND_ID_HANDLER(IDC_OVERLAY_HOTKEY, OnOverlayHotkey)
         COMMAND_HANDLER(IDC_OSD_SCALE, CBN_SELCHANGE, OnOsdScaleChanged)
         COMMAND_HANDLER(IDC_OSD_SCALE, CBN_DROPDOWN, OnOsdScaleDropDown)
@@ -184,6 +185,8 @@ private:
     LRESULT OnUiSettingChange(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnOverlayToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnOverlayAutoSdr(WORD, WORD, HWND, BOOL&);
+    // AF-20261008-overlay-embedded-osd.
+    LRESULT OnOverlayHidesOsd(WORD, WORD, HWND, BOOL&);
     LRESULT OnOverlayHotkey(WORD, WORD, HWND, BOOL&);
     void ApplyUiTheme();
     void RefreshThemeChoices();

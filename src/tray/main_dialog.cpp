@@ -216,7 +216,8 @@ bool OverlayDllPresent() noexcept {
 // Without the overlay its controls are not shown at all: a checkbox that
 // cannot do anything is worse than none.
 void HideOverlayControls(const HWND dialog) noexcept {
-    for (const int id : {IDC_OVERLAY_ENABLED, IDC_OVERLAY_AUTO_SDR, IDC_OVERLAY_HOTKEY})
+    for (const int id : {IDC_OVERLAY_ENABLED, IDC_OVERLAY_AUTO_SDR, IDC_OVERLAY_HOTKEY,
+                         IDC_OVERLAY_HIDES_OSD})
         if (const HWND control = ::GetDlgItem(dialog, id)) ::ShowWindow(control, SW_HIDE);
 }
 
@@ -607,13 +608,16 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
                    settings::LoadOverlayEnabled() ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(IDC_OVERLAY_AUTO_SDR,
                    settings::LoadOverlayAutoSdr() ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(IDC_OVERLAY_HIDES_OSD,
+                   settings::LoadOverlayHidesOsd() ? BST_CHECKED : BST_UNCHECKED);
     tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
                                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, m_hWnd, nullptr,
                                ATL::_AtlBaseModule.GetModuleInstance(), nullptr);
     if (tooltip_ != nullptr) {
         SendMessageW(tooltip_, TTM_SETMAXTIPWIDTH, 0, 360);
-        for (const int id : {IDC_OVERLAY_ENABLED, IDC_OVERLAY_HOTKEY, IDC_OVERLAY_AUTO_SDR}) {
+        for (const int id : {IDC_OVERLAY_ENABLED, IDC_OVERLAY_HOTKEY, IDC_OVERLAY_AUTO_SDR,
+                             IDC_OVERLAY_HIDES_OSD}) {
             TTTOOLINFOW tool{sizeof(tool)};
             tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
             tool.hwnd = m_hWnd;
@@ -707,6 +711,7 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     RefreshSnapshot();
     if (osd_ready_ && osd_preference.enabled) osd_overlay_.SetVisible(true);
 #ifdef GTG_FEATURE_OVERLAY
+    overlay::integration::SetHidesOsd(settings::LoadOverlayHidesOsd());
     if (!OverlayDllPresent()) {
         HideOverlayControls(m_hWnd);
         logging::Info(L"overlay unavailable: gtg_overlay.dll is not beside the executable; "
@@ -990,6 +995,13 @@ LRESULT CALLBACK MainDialog::ReadingColorSubclass(HWND window, const UINT messag
         // The overlay controls' tooltip, built when shown so it names the
         // current hotkey in the current language.
         auto* info = reinterpret_cast<NMTTDISPINFOW*>(lparam);
+        if (info->hdr.idFrom == reinterpret_cast<UINT_PTR>(dialog->GetDlgItem(IDC_OVERLAY_HIDES_OSD).m_hWnd)) {
+            dialog->tooltip_text_ = localization::Select(
+                L"遊戲內 overlay 顯示時，以它取代桌面 OSD；離開遊戲（ALT+TAB、關閉 overlay 或結束遊戲）後 OSD 會回來。",
+                L"The in-game overlay replaces the desktop OSD while its game is in front. The OSD returns when you leave the game (ALT+TAB, overlay off, or the game exits).");
+            info->lpszText = dialog->tooltip_text_.data();
+            return 0;
+        }
         if (info->hdr.idFrom == reinterpret_cast<UINT_PTR>(dialog->GetDlgItem(IDC_OVERLAY_AUTO_SDR).m_hWnd)) {
             dialog->tooltip_text_ = localization::Select(
                 L"勾選：新 Overlay 工作階段以 SDR 解讀，不詢問。取消：顯示色彩策略選擇器。HDR 支援有限；這不是 HDR 偵測，錯誤解讀可能影響亮度與顏色。已注入的工作階段不會改變。",
@@ -1702,7 +1714,9 @@ LRESULT MainDialog::OnTrayOpenLog(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 LRESULT MainDialog::OnTrayToggleOsd(WORD, WORD, HWND, BOOL&) {
-    SetOsdVisible(!osd_overlay_.Visible(), true);
+    // The user's switch, not the window: while the overlay stands in for the
+    // OSD the window is hidden but still switched on.
+    SetOsdVisible(!osd_overlay_.Wanted(), true);
     return 0;
 }
 LRESULT MainDialog::OnTrayExit(WORD, WORD, HWND, BOOL&) {
@@ -1776,7 +1790,7 @@ void MainDialog::ShowTrayMenu() {
                 localization::Select(L"開啟 GPU Thermal Guard", L"Open GPU Thermal Guard").data());
     AppendMenuW(menu, MF_STRING, IDM_TRAY_REFRESH,
                 localization::Select(L"立即重新整理", L"Refresh Now").data());
-    AppendMenuW(menu, MF_STRING | (osd_overlay_.Visible() ? MF_CHECKED : MF_UNCHECKED),
+    AppendMenuW(menu, MF_STRING | (osd_overlay_.Wanted() ? MF_CHECKED : MF_UNCHECKED),
                 IDM_TRAY_TOGGLE_OSD,
                 localization::Select(L"顯示即時 OSD", L"Show Live OSD").data());
     AppendMenuW(menu, MF_STRING, IDM_TRAY_CAPTURE_SNAPSHOT,
@@ -2511,6 +2525,8 @@ void MainDialog::ApplyLocalization() {
     SetControlText(IDC_SHOW_RAM, L"RAM");
     SetControlText(IDC_SHOW_NET, text(L"網路", L"NET"));
     SetControlText(IDC_OVERLAY_ENABLED, L"Overlay");
+    SetControlText(IDC_OVERLAY_HIDES_OSD,
+                   text(L"遊戲中隱藏桌面 OSD", L"Hide desktop OSD in game"));
     SetControlText(IDC_OVERLAY_AUTO_SDR, text(L"自動 SDR（不詢問）", L"Auto SDR (skip prompt)"));
     SetControlText(IDC_OVERLAY_HOTKEY, text(L"Overlay 熱鍵", L"Overlay Hotkey"));
     SetControlText(IDC_THEME_LABEL, text(L"主題", L"Theme"));
@@ -2846,6 +2862,21 @@ LRESULT MainDialog::OnOverlayAutoSdr(WORD, WORD, HWND, BOOL&) {
         return 0;
     }
     logging::Info(std::format(L"overlay Auto SDR preference saved; enabled={}; new sessions only", enabled));
+    return 0;
+}
+
+LRESULT MainDialog::OnOverlayHidesOsd(WORD, WORD, HWND, BOOL&) {
+    const bool enabled = IsDlgButtonChecked(IDC_OVERLAY_HIDES_OSD) == BST_CHECKED;
+    std::wstring error;
+    if (!settings::SaveOverlayHidesOsd(enabled, error)) {
+        CheckDlgButton(IDC_OVERLAY_HIDES_OSD, enabled ? BST_UNCHECKED : BST_CHECKED);
+        logging::Warning(error);
+        return 0;
+    }
+#ifdef GTG_FEATURE_OVERLAY
+    overlay::integration::SetHidesOsd(enabled);
+#endif
+    logging::Info(std::format(L"overlay hides desktop OSD in game; enabled={}", enabled));
     return 0;
 }
 

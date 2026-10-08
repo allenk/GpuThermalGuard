@@ -591,6 +591,20 @@ bool SaveOverlayAutoSdr(const bool enabled, std::wstring& error) {
     return success;
 }
 
+bool LoadOverlayHidesOsd() noexcept {
+    std::uint32_t value{};
+    const bool valid = ReadValidDword(L"OverlayHidesOsd", value);
+    return ResolveOverlayHidesOsd(valid, value);
+}
+
+bool SaveOverlayHidesOsd(const bool enabled, std::wstring& error) {
+    HKEY key{};
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"OverlayHidesOsd", enabled ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
 bool LoadFeatureNoticeSerial(std::uint32_t& serial) noexcept {
     return ReadValidDword(L"FeatureNoticeSerial", serial);
 }

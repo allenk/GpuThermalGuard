@@ -214,6 +214,37 @@ LRESULT HistoryChart::OnCaptureChanged(UINT, WPARAM, LPARAM, BOOL&) {
     return 0;
 }
 
+bool HistoryChart::EnsureSurface(HDC target, const int width, const int height) {
+    if (surface_.bitmap != nullptr && surface_.width == width &&
+        surface_.height == height) {
+        return true;
+    }
+    if (surface_.bitmap != nullptr) DeleteObject(surface_.bitmap);
+    surface_.bitmap = nullptr;
+    surface_.bits = nullptr;
+    surface_.width = 0;
+    surface_.height = 0;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;  // top-down, matching GDI+'s stride
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(target, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        if (bitmap != nullptr) DeleteObject(bitmap);
+        return false;
+    }
+    surface_.bitmap = bitmap;
+    surface_.bits = bits;
+    surface_.width = width;
+    surface_.height = height;
+    return true;
+}
+
 void HistoryChart::Paint(HDC target, const RECT& bounds) {
     const int width = bounds.right - bounds.left;
     const int height = bounds.bottom - bounds.top;
@@ -221,19 +252,33 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
 
     HDC memory = CreateCompatibleDC(target);
     if (memory == nullptr) return;
-    ScopedGdiObject bitmap{CreateCompatibleBitmap(target, width, height)};
-    if (bitmap.value == nullptr) {
+    if (!EnsureSurface(target, width, height)) {
         DeleteDC(memory);
         return;
     }
-    const HGDIOBJ old_bitmap = SelectObject(memory, bitmap.value);
+    const HGDIOBJ old_bitmap = SelectObject(memory, surface_.bitmap);
     RECT client{0, 0, width, height};
     const ChartPalette palette = palette_.value_or(ChartPalette::System());
     ScopedGdiObject background_brush{CreateSolidBrush(palette.background)};
     FillRect(memory, &client, static_cast<HBRUSH>(background_brush.value));
+    // GDI may batch the fill; GDI+ is about to write the same memory directly.
+    GdiFlush();
 
-    Gdiplus::Graphics graphics(memory);
-    if (graphics.GetLastStatus() != Gdiplus::Ok) {
+    // The window's DPI, not the paint DC's LOGPIXELSX: in a PerMonitorV2
+    // process the latter is the system DPI, which disagrees with the hit
+    // testing below on a monitor scaled differently from the primary. The
+    // bitmap carries the same DPI so UnitPoint fonts keep their size.
+    UINT dpi = GetDpiForWindow(m_hWnd);
+    if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
+    // 32bppRGB, not PARGB: FillRect leaves alpha at 0, which PARGB would read
+    // as transparent and blend anti-aliased edges against black.
+    Gdiplus::Bitmap canvas(width, height, width * 4, PixelFormat32bppRGB,
+                           static_cast<BYTE*>(surface_.bits));
+    (void)canvas.SetResolution(static_cast<Gdiplus::REAL>(dpi),
+                               static_cast<Gdiplus::REAL>(dpi));
+    Gdiplus::Graphics graphics(&canvas);
+    if (canvas.GetLastStatus() != Gdiplus::Ok ||
+        graphics.GetLastStatus() != Gdiplus::Ok) {
         SetBkMode(memory, TRANSPARENT);
         SetTextColor(memory, palette.muted_text);
         const std::wstring unavailable(localization::Select(
@@ -251,7 +296,7 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
     graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
-    const Gdiplus::REAL scale = graphics.GetDpiX() / 96.0F;
+    const Gdiplus::REAL scale = static_cast<Gdiplus::REAL>(dpi) / 96.0F;
     const Gdiplus::REAL margin = 4.0F * scale;
     // 44, not 40: at 100 % scaling a 40 DLU gutter left a 34 px text box and
     // truncated "GPU %" and "CPU %" to an ellipsis. Measured by the DPI bench.

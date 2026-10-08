@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-07
+## [1.0.0] - 2026-10-08
 
 GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows how the frame got to the screen.
 
@@ -12,6 +12,9 @@ GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows 
 
 - **In-game overlay** for native 64-bit Direct3D 11 and Direct3D 12 games, visible in exclusive and borderless fullscreen. GTG draws the dashboard; `gtg_overlay.dll`, loaded into the game only when you press the overlay hotkey with that game in front, draws the picture just before the game presents. A helper process (the same EXE) checks the target and works out the Direct3D entry points in its own process before anything is loaded. Up to four games at once; a further press hides or shows the overlay. Built on [Splice](https://github.com/allenk/splice) 1.1, included as a submodule.
 - **Overlay hotkey**, `Alt`+`F10` by default, recorded as keycaps through a keyboard hook that exists only while the dialog is in front. A combination needs a modifier, `F12` is refused (Windows reserves it for debuggers), and one another program holds is reported instead of saved.
+- **The overlay stands in for the desktop OSD** (**Hide desktop OSD in game**, on by default): while a game with the overlay is in front, the always-on-top OSD is hidden; it returns at once on `Alt`+`Tab`, the Start menu, Task Manager, `Ctrl`+`Alt`+`Del`, the hotkey or the game exiting, showing its buttons so it can be moved. Returning to the game hides it after half a second, so `Alt`+`Tab` does not flash it.
+- **The O**, beside the status dot: the overlay's state and a button that does what the hotkey does. Indigo, attach; yellow, the program in front has the overlay (always yellow in the overlay's own copy); turning and warming towards yellow while attaching, with clicks ignored; a brief red when a program cannot take the overlay, for the hotkey too.
+- **The OSD header is a handle end to end.** A press on its buttons that moves becomes a drag; one that stays is a click. The outline lights up while the OSD moves.
 - **Two downloads with one EXE.** Without `gtg_overlay.dll` beside it the EXE hides the overlay controls and registers no hotkey.
 - **Light and dark themes**: Auto (follows the Windows app mode, live), Dark and Light. High contrast keeps the system colours; a Windows build that cannot draw dark controls falls back to light. The main window is redesigned, and its title bar shows the version.
 - **Wall clock** in the OSD header two seconds after the pointer leaves, in place of the lock and chevron; not while the arrangement is unlocked. The in-game overlay always shows it.
@@ -23,6 +26,8 @@ GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows 
 
 - **FPS distinguishes composed frames from independent flip.** When Windows composes a game, the displayed frames are counted; when the game flips straight to the screen, the frames it presented are counted. Previously a game on independent flip could read a fraction of its real rate -- about 26 instead of about 248 in one measured case -- or nothing at all.
 - The chevron stays where you click it: expanding and collapsing grow and shrink the OSD to its left, and each view reopens where it was left.
+- The main window's history chart draws into a retained bitmap that GDI+ writes directly, instead of round-tripping every curve through the kernel. With the window open behind a game, GTG's CPU use fell by a third and its page faults by 84 %.
+- A program the overlay cannot attach to no longer holds one of the four overlay places until it exits, and is not tried again while it runs.
 - Building from source now needs vcpkg (`VCPKG_ROOT`) for the overlay's Dear ImGui; `-DGTG_FEATURE_OVERLAY=OFF` does not.
 
 ### Fixed
@@ -30,6 +35,9 @@ GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows 
 - The compact OSD reopened with the right height but the wrong horizontal position when arranged as a single column near a screen's right edge.
 - The status icon in the main window was upscaled from a 48-pixel image and looked soft at high DPI.
 - **Save & Apply** looked different from the buttons beside it.
+- The lock and chevron sat off-centre on their buttons in the OSD header.
+- A dragged card's outline was clipped on its right and bottom edges.
+- The FPS curve's ends slid left and right as the OSD redrew.
 
 ### Notes
 

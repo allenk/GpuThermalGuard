@@ -61,6 +61,7 @@
 #define IDC_HOTKEY_EDIT                 1061
 #define IDC_HOTKEY_NOTE                 1062
 #define IDC_HOTKEY_DEFAULT              1063
+#define IDC_OVERLAY_HIDES_OSD           1064
 #define IDM_TRAY_OPEN                   40001
 #define IDM_TRAY_REFRESH                40002
 #define IDM_TRAY_EXIT                   40003

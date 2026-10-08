@@ -117,6 +117,12 @@ inline constexpr UINT kHotkeyModifierMask = MOD_ALT | MOD_CONTROL | MOD_SHIFT | 
 }
 
 // A compatibility assumption, not HDR detection. Only new sessions read it.
+// On unless the user turned it off (AF-20261008-overlay-embedded-osd).
+[[nodiscard]] constexpr bool ResolveOverlayHidesOsd(const bool has_valid_value,
+                                                    const std::uint32_t value) noexcept {
+    return !has_valid_value || value != 0;
+}
+
 [[nodiscard]] constexpr bool ResolveOverlayAutoSdr(const bool has_valid_value,
                                                    const std::uint32_t value) noexcept {
     return !has_valid_value || value != 0;
