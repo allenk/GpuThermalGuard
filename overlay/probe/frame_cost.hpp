@@ -46,7 +46,9 @@ inline thread_local std::uint32_t t_segment[kSegments]{};
 inline thread_local std::uint64_t t_mark = 0;
 
 // Start of the measured part of a frame.
-inline void Begin() { t_mark = QpcNs(); }
+inline void Begin() {
+    t_mark = QpcNs();
+}
 
 // Charge the time since the previous mark to `segment`. Accumulates, so a
 // segment that happens in two pieces (D3D11's ImGui calls) is counted whole.
@@ -66,59 +68,57 @@ inline void Record(std::uint64_t overlay_ns) {
     const std::uint32_t at = g_samples.load(std::memory_order_relaxed);
     if (at < kSamples) {
         g_frame_ns[at] = static_cast<std::uint32_t>(overlay_ns);
-        for (int i = 0; i < kSegments; ++i) g_segment_ns[i][at] = t_segment[i];
+        for (int i = 0; i < kSegments; ++i)
+            g_segment_ns[i][at] = t_segment[i];
         g_samples.store(at + 1, std::memory_order_relaxed);
     }
-    for (auto& segment : t_segment) segment = 0;
+    for (auto& segment : t_segment)
+        segment = 0;
 }
 
 }  // namespace gtg::overlay::probe::cost
 
 // The exports, defined once per probe DLL. `stats` is the probe's
 // ConsumerStats (published.stats()).
-#define GTG_FRAME_COST_EXPORTS(stats)                                              \
-    extern "C" __declspec(dllexport) void WINAPI GtgOverlayResearchCost(           \
-        std::uint64_t* upload_total, std::uint64_t* upload_max,                    \
-        std::uint64_t* uploads, std::uint64_t* frame_total,                        \
-        std::uint64_t* frame_max, std::uint64_t* frames) {                         \
-        namespace c = gtg::overlay::probe::cost;                                   \
-        auto& st = (stats);                                                        \
-        if (upload_total) *upload_total = st.upload_ns_total.load();               \
-        if (upload_max) *upload_max = st.upload_ns_max.load();                     \
-        if (uploads) *uploads = st.uploads.load();                                 \
-        if (frame_total) *frame_total = c::g_frame_ns_total.load();                \
-        if (frame_max) *frame_max = c::g_frame_ns_max.load();                      \
-        if (frames) *frames = c::g_frames.load();                                  \
-    }                                                                              \
-    extern "C" __declspec(dllexport) void WINAPI GtgOverlayResearchUploadSteady(   \
-        std::uint64_t* total_ns, std::uint64_t* count) {                           \
-        auto& st = (stats);                                                        \
-        if (total_ns) *total_ns = st.upload_ns_steady_total.load();                \
-        if (count) *count = st.uploads_steady.load();                              \
-    }                                                                              \
-    extern "C" __declspec(dllexport) std::uint32_t WINAPI                          \
-    GtgOverlayResearchCostSamples(const std::uint32_t** frame_ns,                  \
-                                  const std::uint32_t** segments,                  \
-                                  int* segment_count, std::uint32_t* stride) {     \
-        namespace c = gtg::overlay::probe::cost;                                   \
-        if (frame_ns) *frame_ns = c::g_frame_ns;                                   \
-        if (segments) *segments = &c::g_segment_ns[0][0];                          \
-        if (segment_count) *segment_count = c::kSegments;                          \
-        if (stride) *stride = static_cast<std::uint32_t>(c::kSamples);             \
-        return c::g_samples.load();                                                \
-    }                                                                              \
-    extern "C" __declspec(dllexport) void WINAPI GtgOverlayResearchPlacement(      \
-        std::uint64_t* applied, std::uint64_t* rejected,                           \
-        std::uint64_t* latency_total_us, std::uint64_t* latency_max_us,            \
-        std::uint64_t* uploads) {                                                  \
-        auto& st = (stats);                                                        \
-        if (applied) *applied = st.placements_applied.load();                      \
-        if (rejected) *rejected = st.placements_rejected.load();                   \
-        if (latency_total_us) *latency_total_us = st.placement_latency_us_total.load(); \
-        if (latency_max_us) *latency_max_us = st.placement_latency_us_max.load();  \
-        if (uploads) *uploads = st.uploads.load();                                 \
-    }                                                                              \
-    extern "C" __declspec(dllexport) std::uint64_t WINAPI                          \
-    GtgOverlayResearchAwaitingFrameSize() {                                        \
-        return (stats).awaiting_frame_size.load();                                 \
+#define GTG_FRAME_COST_EXPORTS(stats)                                                             \
+    extern "C" __declspec(dllexport) void WINAPI GtgOverlayResearchCost(                          \
+        std::uint64_t* upload_total, std::uint64_t* upload_max, std::uint64_t* uploads,           \
+        std::uint64_t* frame_total, std::uint64_t* frame_max, std::uint64_t* frames) {            \
+        namespace c = gtg::overlay::probe::cost;                                                  \
+        auto& st = (stats);                                                                       \
+        if (upload_total) *upload_total = st.upload_ns_total.load();                              \
+        if (upload_max) *upload_max = st.upload_ns_max.load();                                    \
+        if (uploads) *uploads = st.uploads.load();                                                \
+        if (frame_total) *frame_total = c::g_frame_ns_total.load();                               \
+        if (frame_max) *frame_max = c::g_frame_ns_max.load();                                     \
+        if (frames) *frames = c::g_frames.load();                                                 \
+    }                                                                                             \
+    extern "C" __declspec(dllexport) void WINAPI GtgOverlayResearchUploadSteady(                  \
+        std::uint64_t* total_ns, std::uint64_t* count) {                                          \
+        auto& st = (stats);                                                                       \
+        if (total_ns) *total_ns = st.upload_ns_steady_total.load();                               \
+        if (count) *count = st.uploads_steady.load();                                             \
+    }                                                                                             \
+    extern "C" __declspec(dllexport) std::uint32_t WINAPI GtgOverlayResearchCostSamples(          \
+        const std::uint32_t** frame_ns, const std::uint32_t** segments, int* segment_count,       \
+        std::uint32_t* stride) {                                                                  \
+        namespace c = gtg::overlay::probe::cost;                                                  \
+        if (frame_ns) *frame_ns = c::g_frame_ns;                                                  \
+        if (segments) *segments = &c::g_segment_ns[0][0];                                         \
+        if (segment_count) *segment_count = c::kSegments;                                         \
+        if (stride) *stride = static_cast<std::uint32_t>(c::kSamples);                            \
+        return c::g_samples.load();                                                               \
+    }                                                                                             \
+    extern "C" __declspec(dllexport) void WINAPI GtgOverlayResearchPlacement(                     \
+        std::uint64_t* applied, std::uint64_t* rejected, std::uint64_t* latency_total_us,         \
+        std::uint64_t* latency_max_us, std::uint64_t* uploads) {                                  \
+        auto& st = (stats);                                                                       \
+        if (applied) *applied = st.placements_applied.load();                                     \
+        if (rejected) *rejected = st.placements_rejected.load();                                  \
+        if (latency_total_us) *latency_total_us = st.placement_latency_us_total.load();           \
+        if (latency_max_us) *latency_max_us = st.placement_latency_us_max.load();                 \
+        if (uploads) *uploads = st.uploads.load();                                                \
+    }                                                                                             \
+    extern "C" __declspec(dllexport) std::uint64_t WINAPI GtgOverlayResearchAwaitingFrameSize() { \
+        return (stats).awaiting_frame_size.load();                                                \
     }

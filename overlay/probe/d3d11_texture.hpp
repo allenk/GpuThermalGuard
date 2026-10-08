@@ -31,23 +31,26 @@ public:
     }
 
     bool Bound() const { return device_ != nullptr && context_ != nullptr; }
+
     void SetTargetFormat(DXGI_FORMAT format) noexcept {
         srgb_output_ = format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-            format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+                       format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                       format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
     }
+
     bool Has() const { return srv_ != nullptr; }
-    bool Matches(std::uint32_t w, std::uint32_t h) const {
-        return tex_w_ == w && tex_h_ == h;
-    }
+
+    bool Matches(std::uint32_t w, std::uint32_t h) const { return tex_w_ == w && tex_h_ == h; }
+
     ImTextureID Id() const {
-        return static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(srgb_output_ ? srgb_srv_ : srv_));
+        return static_cast<ImTextureID>(
+            reinterpret_cast<std::intptr_t>(srgb_output_ ? srgb_srv_ : srv_));
     }
 
     // D3D11's stage is a CPU copy, and it has to be: Map(WRITE_DISCARD) destroys
     // the texture's contents before a torn read could be detected, so the bytes
     // must be held somewhere that can still be thrown away.
-    bool Stage(const std::uint8_t* section_pixels, const ipc::FrameHeader& h,
-               ConsumerStats&) {
+    bool Stage(const std::uint8_t* section_pixels, const ipc::FrameHeader& h, ConsumerStats&) {
         staging_.resize(h.byte_count);
         std::memcpy(staging_.data(), section_pixels, h.byte_count);
         return true;
@@ -57,8 +60,7 @@ public:
         return Upload(staging_.data(), h, stats);
     }
 
-    bool Upload(const std::uint8_t* pixels, const ipc::FrameHeader& h,
-                ConsumerStats& stats) {
+    bool Upload(const std::uint8_t* pixels, const ipc::FrameHeader& h, ConsumerStats& stats) {
         if (tex_ == nullptr || tex_w_ != h.width || tex_h_ != h.height) {
             // A resolution change recreates the texture rather than stretching
             // into the old one. T-06 is the test; this is the mechanism.
@@ -75,18 +77,15 @@ public:
             td.Usage = D3D11_USAGE_DYNAMIC;
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            if (FAILED(device_->CreateTexture2D(&td, nullptr, &tex_)) ||
-                tex_ == nullptr) {
-                Print("[T-04] CreateTexture2D failed for %ux%u\n",
-                            h.width, h.height);
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, &tex_)) || tex_ == nullptr) {
+                Print("[T-04] CreateTexture2D failed for %ux%u\n", h.width, h.height);
                 return false;
             }
             D3D11_SHADER_RESOURCE_VIEW_DESC view{};
             view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             view.Texture2D.MipLevels = 1;
-            if (FAILED(device_->CreateShaderResourceView(tex_, &view, &srv_)) ||
-                srv_ == nullptr) {
+            if (FAILED(device_->CreateShaderResourceView(tex_, &view, &srv_)) || srv_ == nullptr) {
                 Release();
                 return false;
             }
@@ -119,9 +118,18 @@ public:
     }
 
     void Release() {
-        if (srgb_srv_ != nullptr) { srgb_srv_->Release(); srgb_srv_ = nullptr; }
-        if (srv_ != nullptr) { srv_->Release(); srv_ = nullptr; }
-        if (tex_ != nullptr) { tex_->Release(); tex_ = nullptr; }
+        if (srgb_srv_ != nullptr) {
+            srgb_srv_->Release();
+            srgb_srv_ = nullptr;
+        }
+        if (srv_ != nullptr) {
+            srv_->Release();
+            srv_ = nullptr;
+        }
+        if (tex_ != nullptr) {
+            tex_->Release();
+            tex_ = nullptr;
+        }
         tex_w_ = 0;
         tex_h_ = 0;
     }

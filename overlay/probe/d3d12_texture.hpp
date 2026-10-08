@@ -67,8 +67,9 @@ class D3D12Texture {
 public:
     static bool SupportsHeader(const ipc::FrameHeader& header) noexcept {
         return header.format == static_cast<std::uint32_t>(ipc::PixelFormat::Bgra8) &&
-            header.alpha_mode <= static_cast<std::uint32_t>(ipc::AlphaMode::Premultiplied);
+               header.alpha_mode <= static_cast<std::uint32_t>(ipc::AlphaMode::Premultiplied);
     }
+
     static constexpr UINT kMaxSlots = 4;
 
     // The live texture plus those retired and not yet released: retirement is
@@ -79,8 +80,7 @@ public:
     // `stride` bytes apart, in a shader-visible CBV_SRV_UAV heap owned by the
     // caller. `descriptors` should be `slots` + 1 (see kMaxDescriptors).
     void Bind(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu,
-              D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu, UINT stride, UINT slots,
-              UINT descriptors) {
+              D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu, UINT stride, UINT slots, UINT descriptors) {
         device_ = device;
         srv_cpu_ = srv_cpu;
         srv_gpu_ = srv_gpu;
@@ -102,14 +102,15 @@ public:
     }
 
     bool Bound() const { return device_ != nullptr && source_ != nullptr; }
-    bool Has() const { return tex_ != nullptr && state_ == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; }
-    bool Matches(std::uint32_t w, std::uint32_t h) const {
-        return tex_w_ == w && tex_h_ == h;
+
+    bool Has() const {
+        return tex_ != nullptr && state_ == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
+
+    bool Matches(std::uint32_t w, std::uint32_t h) const { return tex_w_ == w && tex_h_ == h; }
+
     // Stable from one texture creation to the next -- the L2/L3 cache key.
-    ImTextureID Id() const {
-        return static_cast<ImTextureID>(DescriptorGpu(tex_descriptor_).ptr);
-    }
+    ImTextureID Id() const { return static_cast<ImTextureID>(DescriptorGpu(tex_descriptor_).ptr); }
 
     // The stage is this slot's upload buffer, written straight from the section.
     // Nothing reads it until Commit records a copy, so a torn stage is dropped by
@@ -121,8 +122,7 @@ public:
         // the rule today, and asking is what keeps this right if it is not.
         const D3D12_RESOURCE_DESC desc = TextureDesc(h);
         UINT64 total = 0;
-        device_->GetCopyableFootprints(&desc, 0, 1, 0, &footprint_, nullptr,
-                                       nullptr, &total);
+        device_->GetCopyableFootprints(&desc, 0, 1, 0, &footprint_, nullptr, nullptr, &total);
         // Opening the list is what makes the slot's upload buffer safe to write.
         list_ = source_->Open();
         if (list_ == nullptr) return false;
@@ -136,8 +136,7 @@ public:
         const std::size_t row_bytes = static_cast<std::size_t>(h.width) * 4u;
         for (std::uint32_t y = 0; y < h.height; ++y) {
             std::memcpy(dst + static_cast<std::size_t>(y) * footprint_.Footprint.RowPitch,
-                        section_pixels + static_cast<std::size_t>(y) * h.stride,
-                        row_bytes);
+                        section_pixels + static_cast<std::size_t>(y) * h.stride, row_bytes);
         }
         return true;
     }
@@ -164,16 +163,19 @@ public:
         from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         from.PlacedFootprint = footprint;
         list_->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-        Transition(D3D12_RESOURCE_STATE_COPY_DEST,
-                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         return true;
     }
 
     // Only once the GPU is idle for everything this owns -- the caller's job.
     void Release() {
-        for (Retired& r : retired_) ReleaseRetired(r);
+        for (Retired& r : retired_)
+            ReleaseRetired(r);
         for (Slot& s : per_slot_) {
-            if (s.upload != nullptr) { s.upload->Release(); s.upload = nullptr; }
+            if (s.upload != nullptr) {
+                s.upload->Release();
+                s.upload = nullptr;
+            }
             s.mapped = nullptr;
             s.size = 0;
         }
@@ -192,6 +194,7 @@ private:
         void* mapped = nullptr;
         UINT64 size = 0;
     };
+
     struct Retired {
         ID3D12Resource* texture = nullptr;
         UINT descriptor = 0;
@@ -203,6 +206,7 @@ private:
         h.ptr += static_cast<SIZE_T>(index) * stride_;
         return h;
     }
+
     D3D12_GPU_DESCRIPTOR_HANDLE DescriptorGpu(UINT index) const {
         D3D12_GPU_DESCRIPTOR_HANDLE h = srv_gpu_;
         h.ptr += static_cast<UINT64>(index) * stride_;
@@ -255,11 +259,13 @@ private:
         // so running out leaves the current texture exactly as it was.
         UINT free_descriptor = descriptors_;
         for (UINT i = 0; i < descriptors_; ++i) {
-            if (!descriptor_busy_[i]) { free_descriptor = i; break; }
+            if (!descriptor_busy_[i]) {
+                free_descriptor = i;
+                break;
+            }
         }
         if (free_descriptor == descriptors_) {
-            std::printf("[T-04] no free SRV descriptor for a %ux%u texture\n",
-                        h.width, h.height);
+            std::printf("[T-04] no free SRV descriptor for a %ux%u texture\n", h.width, h.height);
             return false;
         }
         // The old texture may still be sampled by frames already submitted, so
@@ -279,12 +285,11 @@ private:
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         const D3D12_RESOURCE_DESC desc = TextureDesc(h);
-        if (FAILED(device_->CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr, IID_PPV_ARGS(&tex_))) ||
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    IID_PPV_ARGS(&tex_))) ||
             tex_ == nullptr) {
-            std::printf("[T-04] D3D12 texture %ux%u creation failed\n",
-                        h.width, h.height);
+            std::printf("[T-04] D3D12 texture %ux%u creation failed\n", h.width, h.height);
             tex_ = nullptr;
             return false;
         }
@@ -317,10 +322,9 @@ private:
         desc.Format = DXGI_FORMAT_UNKNOWN;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(device_->CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &desc,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                IID_PPV_ARGS(&s.upload))) ||
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                    IID_PPV_ARGS(&s.upload))) ||
             s.upload == nullptr) {
             s.upload = nullptr;
             return false;

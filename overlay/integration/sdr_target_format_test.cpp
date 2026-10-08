@@ -9,6 +9,7 @@
 
 namespace {
 int failures = 0;
+
 void Check(const bool condition, const char* message) {
     if (!condition) {
         std::fprintf(stderr, "FAIL %s\n", message);
@@ -56,8 +57,8 @@ int main() {
     Check(!MatchesSdrBuffer(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 3840, 2160,
                             DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 3840, 2160, 1),
           "shared: DX12 buffer match still refuses sRGB");
-    Check(MatchesSdrBuffer(DXGI_FORMAT_R8G8B8A8_UNORM, 640, 360,
-                           DXGI_FORMAT_R8G8B8A8_UNORM, 640, 360, 1),
+    Check(MatchesSdrBuffer(DXGI_FORMAT_R8G8B8A8_UNORM, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, 640,
+                           360, 1),
           "shared: UNORM still matches");
 
     if (failures == 0) std::puts("PASS target-format admission");

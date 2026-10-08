@@ -17,16 +17,17 @@ inline bool TargetAdmitted(HANDLE process) noexcept {
     if (!pid || !ProcessIdToSessionId(pid, &session) ||
         !ProcessIdToSessionId(GetCurrentProcessId(), &own_session) || !session ||
         session != own_session || !IsProcessCritical(process, &critical) || critical ||
-        !IsWow64Process2(process, &machine, &native) ||
-        machine != IMAGE_FILE_MACHINE_UNKNOWN || native != IMAGE_FILE_MACHINE_AMD64 ||
-        WaitForSingleObject(process, 0) != WAIT_TIMEOUT) return false;
+        !IsWow64Process2(process, &machine, &native) || machine != IMAGE_FILE_MACHINE_UNKNOWN ||
+        native != IMAGE_FILE_MACHINE_AMD64 || WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+        return false;
     wchar_t image[32768]{}, windows[MAX_PATH]{};
     DWORD length = 32768;
     const UINT count = GetWindowsDirectoryW(windows, MAX_PATH);
-    if (!count || count >= MAX_PATH ||
-        !QueryFullProcessImageNameW(process, 0, image, &length)) return false;
+    if (!count || count >= MAX_PATH || !QueryFullProcessImageNameW(process, 0, image, &length))
+        return false;
     if (_wcsnicmp(image, windows, count) == 0 &&
-        (image[count] == L'\\' || image[count] == L'/' || image[count] == 0)) return false;
+        (image[count] == L'\\' || image[count] == L'/' || image[count] == 0))
+        return false;
     const auto* slash = wcsrchr(image, L'\\');
     const auto* name = slash ? slash + 1 : image;
     return _wcsicmp(name, L"GpuThermalGuard.exe") != 0;

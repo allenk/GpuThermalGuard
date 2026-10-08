@@ -3,16 +3,22 @@
 #include <cstdlib>
 #include <thread>
 using namespace gtg::overlay::integration;
+
 namespace {
 void Check(bool value, const char* message) {
-    if (!value) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
+    if (!value) {
+        std::fprintf(stderr, "FAIL: %s\n", message);
+        std::exit(1);
+    }
 }
+
 struct Clock {
     std::uint64_t time = 0;
     D3d12LifecycleGate* gate = nullptr;
     bool release = false;
     bool fail_during_start = false;
     std::uint64_t pause_cost = 40;
+
     std::uint64_t Now() noexcept {
         if (fail_during_start) {
             fail_during_start = false;
@@ -22,13 +28,18 @@ struct Clock {
         }
         return time;
     }
+
     void Pause() noexcept {
         Check(!gate->TryDraw(), "published transition rejects new draws while owner is busy");
         time += pause_cost;
-        if (release) { gate->EndDraw(); release = false; }
+        if (release) {
+            gate->EndDraw();
+            release = false;
+        }
     }
 };
 }
+
 int main() {
     D3d12LifecycleGate gate;
     Check(gate.TryDraw(), "idle draw admission");

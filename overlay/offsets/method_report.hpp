@@ -9,7 +9,11 @@
 #include <vector>
 
 namespace gtg::research {
-struct MethodAddress { const char* role; void* address; void* object = nullptr; };
+struct MethodAddress {
+    const char* role;
+    void* address;
+    void* object = nullptr;
+};
 
 // A research oracle: called by the helper and, only when requested through an
 // environment variable, by our generators. The loader never receives COM objects.
@@ -21,8 +25,9 @@ inline bool WriteMethodReport(const wchar_t* path, const std::vector<MethodAddre
     for (const auto& method : methods) {
         HMODULE module{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCWSTR>(method.address), &module)) return false;
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(method.address), &module))
+            return false;
         wchar_t module_path[32768]{};
         const DWORD n = GetModuleFileNameW(module, module_path, 32768);
         if (!n || n == 32768) return false;
@@ -34,7 +39,8 @@ inline bool WriteMethodReport(const wchar_t* path, const std::vector<MethodAddre
         MEMORY_BASIC_INFORMATION memory{};
         if (!VirtualQuery(method.address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT ||
             (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
-            !(memory.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
+            !(memory.Protect &
+              (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
             address + 16 > reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize)
             return false;
         if (!first) out << ',';
@@ -47,13 +53,13 @@ inline bool WriteMethodReport(const wchar_t* path, const std::vector<MethodAddre
             out << static_cast<char>(c);
         }
         out << "\",\"object\":" << reinterpret_cast<std::uintptr_t>(method.object)
-            << ",\"base\":" << base << ",\"address\":" << address
-            << ",\"rva\":" << address - base
+            << ",\"base\":" << base << ",\"address\":" << address << ",\"rva\":" << address - base
             << ",\"image_size\":" << nt->OptionalHeader.SizeOfImage
             << ",\"timestamp\":" << nt->FileHeader.TimeDateStamp << ",\"bytes\":\"";
         const auto* bytes = static_cast<const unsigned char*>(method.address);
-        for (int i = 0; i < 16; ++i) out << std::hex << std::setw(2) << std::setfill('0')
-                                        << static_cast<unsigned int>(bytes[i]);
+        for (int i = 0; i < 16; ++i)
+            out << std::hex << std::setw(2) << std::setfill('0')
+                << static_cast<unsigned int>(bytes[i]);
         out << std::dec << "\"}";
     }
     out << "]}\n";

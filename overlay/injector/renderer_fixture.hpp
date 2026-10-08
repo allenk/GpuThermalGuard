@@ -8,6 +8,7 @@ namespace gtg::research {
 inline void BitmapSectionName(DWORD pid, wchar_t (&name)[96]) {
     swprintf_s(name, L"Local\\GTG.Research.Bitmap.%lu", pid);
 }
+
 inline void BitmapRequestName(DWORD pid, wchar_t (&name)[96]) {
     swprintf_s(name, L"Local\\GTG.Research.Request.%lu", pid);
 }
@@ -16,24 +17,27 @@ inline void BitmapRequestName(DWORD pid, wchar_t (&name)[96]) {
 class FixturePublisher {
 public:
     FixturePublisher() = default;
+
     ~FixturePublisher() {
         if (request_) UnmapViewOfFile(request_);
         if (request_mapping_) CloseHandle(request_mapping_);
         if (section_) UnmapViewOfFile(section_);
         if (mapping_) CloseHandle(mapping_);
     }
+
     FixturePublisher(const FixturePublisher&) = delete;
     FixturePublisher& operator=(const FixturePublisher&) = delete;
+
     void Start(DWORD pid, bool enabled, bool request = false) {
         namespace ipc = gtg::overlay::ipc;
         wchar_t name[96]{};
         BitmapSectionName(pid, name);
-        mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-            0, static_cast<DWORD>(ipc::kSectionBytes), name);
+        mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                      static_cast<DWORD>(ipc::kSectionBytes), name);
         if (!mapping_ || GetLastError() == ERROR_ALREADY_EXISTS)
             throw std::runtime_error("unique fixture bitmap section");
-        section_ = static_cast<ipc::Section*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS,
-            0, 0, ipc::kSectionBytes));
+        section_ = static_cast<ipc::Section*>(
+            MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, ipc::kSectionBytes));
         if (!section_) throw std::runtime_error("map fixture bitmap");
         section_->magic = ipc::kMagic;
         section_->version = ipc::kVersion;
@@ -41,12 +45,12 @@ public:
         section_->writer_pid = GetCurrentProcessId();
         if (request) {
             BitmapRequestName(pid, name);
-            request_mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                0, static_cast<DWORD>(ipc::kRequestBytes), name);
+            request_mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                                  static_cast<DWORD>(ipc::kRequestBytes), name);
             if (!request_mapping_ || GetLastError() == ERROR_ALREADY_EXISTS)
                 throw std::runtime_error("unique fixture request section");
-            request_ = static_cast<ipc::Request*>(MapViewOfFile(request_mapping_, FILE_MAP_ALL_ACCESS,
-                0, 0, ipc::kRequestBytes));
+            request_ = static_cast<ipc::Request*>(
+                MapViewOfFile(request_mapping_, FILE_MAP_ALL_ACCESS, 0, 0, ipc::kRequestBytes));
             if (!request_) throw std::runtime_error("map fixture request");
             request_->magic = ipc::kRequestMagic;
             request_->version = ipc::kRequestVersion;
@@ -71,20 +75,25 @@ public:
         ipc::SetEnabled(*section_, enabled);
         Beat();
     }
+
     bool RequestReceived(DWORD pid, unsigned width, unsigned height) const {
         return request_ && gtg::overlay::ipc::RequestSerial(*request_) > 0 &&
-            gtg::overlay::ipc::RequestSerialBegun(*request_) == gtg::overlay::ipc::RequestSerial(*request_) &&
-            request_->writer_pid == pid && request_->swapchain_width == width && request_->swapchain_height == height;
+               gtg::overlay::ipc::RequestSerialBegun(*request_) ==
+                   gtg::overlay::ipc::RequestSerial(*request_) &&
+               request_->writer_pid == pid && request_->swapchain_width == width &&
+               request_->swapchain_height == height;
     }
+
     void Beat() {
         if (!section_) return;
         LARGE_INTEGER now{}, frequency{};
         QueryPerformanceCounter(&now);
         QueryPerformanceFrequency(&frequency);
-        std::atomic_ref<std::uint64_t>(section_->heartbeat_us).store(
-            static_cast<std::uint64_t>(now.QuadPart) * 1'000'000ULL / frequency.QuadPart,
-            std::memory_order_release);
+        std::atomic_ref<std::uint64_t>(section_->heartbeat_us)
+            .store(static_cast<std::uint64_t>(now.QuadPart) * 1'000'000ULL / frequency.QuadPart,
+                   std::memory_order_release);
     }
+
     // Bounded test schedule, independent clocks for metadata and content.
     // No catch-up burst after scheduling delays; the final dwell verifies idle.
     void TickMotion(bool content, unsigned frame_width = 640, unsigned frame_height = 360) {
@@ -128,13 +137,16 @@ public:
             ipc::Publish(*section_, index);
         }
     }
+
     bool MotionFinished(bool content) const {
         return placement_count_ == 40 && content_count_ == (content ? 10U : 0U) &&
-            GetTickCount64() - last_placement_ms_ >= 1000 &&
-            (!content || GetTickCount64() - last_content_ms_ >= 1000) &&
-            gtg::overlay::ipc::PlacementSerial(*section_) == 40;
+               GetTickCount64() - last_placement_ms_ >= 1000 &&
+               (!content || GetTickCount64() - last_content_ms_ >= 1000) &&
+               gtg::overlay::ipc::PlacementSerial(*section_) == 40;
     }
-    void PublishControlFrame(unsigned serial, unsigned size, unsigned frame_width, unsigned frame_height) {
+
+    void PublishControlFrame(unsigned serial, unsigned size, unsigned frame_width,
+                             unsigned frame_height) {
         namespace ipc = gtg::overlay::ipc;
         const auto index = 1 - ipc::PublishedIndex(*section_);
         auto& frame = section_->buffer[index];
@@ -153,15 +165,19 @@ public:
         ipc::FinishFrame(frame, serial);
         ipc::Publish(*section_, index);
     }
+
     void ControlPlacement(unsigned serial, unsigned size) {
         namespace ipc = gtg::overlay::ipc;
         ipc::BeginPlacement(*section_, serial);
         auto& p = section_->placement;
-        p.left = 0; p.top = 32;
+        p.left = 0;
+        p.top = 32;
         p.width = p.height = static_cast<std::int32_t>(size);
-        p.frame_width = 640; p.frame_height = 360;
+        p.frame_width = 640;
+        p.frame_height = 360;
         ipc::FinishPlacement(*section_, serial);
     }
+
     void TickControl(int mode, LONG resized_hidden_samples, volatile LONG& epoch) {
         namespace ipc = gtg::overlay::ipc;
         const auto now = GetTickCount64();
@@ -178,12 +194,25 @@ public:
             PublishControlFrame(2, 16, 320, 180);
             control_step_ = 1;
         } else if (mode == 3) {
-            if (control_step_ == 0 && elapsed >= 1000) { ControlPlacement(1, 24); ++control_step_; }
-            if (control_step_ == 1 && elapsed >= 1500) { PublishControlFrame(2, 24, 640, 360); ++control_step_; }
-            if (control_step_ == 2 && elapsed >= 3000) { ControlPlacement(2, 16); ++control_step_; }
-            if (control_step_ == 3 && elapsed >= 3500) { PublishControlFrame(3, 16, 640, 360); ++control_step_; }
+            if (control_step_ == 0 && elapsed >= 1000) {
+                ControlPlacement(1, 24);
+                ++control_step_;
+            }
+            if (control_step_ == 1 && elapsed >= 1500) {
+                PublishControlFrame(2, 24, 640, 360);
+                ++control_step_;
+            }
+            if (control_step_ == 2 && elapsed >= 3000) {
+                ControlPlacement(2, 16);
+                ++control_step_;
+            }
+            if (control_step_ == 3 && elapsed >= 3500) {
+                PublishControlFrame(3, 16, 640, 360);
+                ++control_step_;
+            }
         }
     }
+
 private:
     ULONGLONG control_start_{};
     unsigned control_step_{};

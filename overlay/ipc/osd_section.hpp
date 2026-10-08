@@ -35,13 +35,15 @@ inline constexpr std::uint32_t kVersion = 2;
 // cost of not needing a lock.
 inline constexpr std::uint32_t kMaxWidth = 1280;
 inline constexpr std::uint32_t kMaxHeight = 1024;
-inline constexpr std::size_t kMaxPixelBytes =
-    static_cast<std::size_t>(kMaxWidth) * kMaxHeight * 4;
+inline constexpr std::size_t kMaxPixelBytes = static_cast<std::size_t>(kMaxWidth) * kMaxHeight * 4;
 
 enum class PixelFormat : std::uint32_t { Bgra8 = 0 };
 enum class AlphaMode : std::uint32_t { Straight = 0, Premultiplied = 1 };
 enum class AnchorCorner : std::uint32_t {
-    TopLeft = 0, TopRight = 1, BottomLeft = 2, BottomRight = 3
+    TopLeft = 0,
+    TopRight = 1,
+    BottomLeft = 2,
+    BottomRight = 3
 };
 
 // Everything about one frame except the pixels, kept beside them so a reader
@@ -54,8 +56,8 @@ struct FrameHeader {
     std::uint32_t format;        // PixelFormat
     std::uint32_t alpha_mode;    // AlphaMode
     std::uint32_t anchor_corner; // AnchorCorner
-    std::int32_t  offset_dip_x;
-    std::int32_t  offset_dip_y;
+    std::int32_t offset_dip_x;
+    std::int32_t offset_dip_y;
     std::uint32_t mode;          // 0 compact, 1 expanded
     std::uint32_t byte_count;    // height * stride, <= kMaxPixelBytes
 
@@ -97,10 +99,10 @@ struct Frame {
 // same failure path: keep what you had.
 struct Placement {
     std::uint32_t serial_begin;
-    std::int32_t  left;
-    std::int32_t  top;
-    std::int32_t  width;
-    std::int32_t  height;
+    std::int32_t left;
+    std::int32_t top;
+    std::int32_t width;
+    std::int32_t height;
     std::uint32_t frame_width;    // the frame it was computed for
     std::uint32_t frame_height;
     std::uint32_t reserved;
@@ -174,13 +176,11 @@ inline constexpr std::size_t kSectionBytes = sizeof(Section);
 // a seqlock's cost is its retry, and there is no retry here.
 
 inline std::uint32_t PublishedIndex(const Section& s) noexcept {
-    return std::atomic_ref<const std::uint32_t>(s.published_index)
-        .load(std::memory_order_acquire);
+    return std::atomic_ref<const std::uint32_t>(s.published_index).load(std::memory_order_acquire);
 }
 
 inline void Publish(Section& s, std::uint32_t index) noexcept {
-    std::atomic_ref<std::uint32_t>(s.published_index)
-        .store(index, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(s.published_index).store(index, std::memory_order_release);
 }
 
 // `serial` is stored after the pixels and `serial_begin` before them, each with
@@ -188,8 +188,7 @@ inline void Publish(Section& s, std::uint32_t index) noexcept {
 // store ordering -- is what makes the check above sound, so it holds on ARM64
 // as well as on x86 and does not need a comment about TSO to be believed.
 inline std::uint32_t FrameSerial(const Frame& f) noexcept {
-    return std::atomic_ref<const std::uint32_t>(f.header.serial)
-        .load(std::memory_order_acquire);
+    return std::atomic_ref<const std::uint32_t>(f.header.serial).load(std::memory_order_acquire);
 }
 
 inline std::uint32_t FrameSerialBegun(const Frame& f) noexcept {
@@ -199,19 +198,16 @@ inline std::uint32_t FrameSerialBegun(const Frame& f) noexcept {
 
 // Order matters and is the whole point: Begin, then pixels, then Finish.
 inline void BeginFrame(Frame& f, std::uint32_t serial) noexcept {
-    std::atomic_ref<std::uint32_t>(f.header.serial_begin)
-        .store(serial, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(f.header.serial_begin).store(serial, std::memory_order_release);
 }
 
 inline void FinishFrame(Frame& f, std::uint32_t serial) noexcept {
-    std::atomic_ref<std::uint32_t>(f.header.serial)
-        .store(serial, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(f.header.serial).store(serial, std::memory_order_release);
 }
 
 // The placement record's guard, as the frame's: Begin, fields, Finish.
 inline std::uint32_t PlacementSerial(const Section& s) noexcept {
-    return std::atomic_ref<const std::uint32_t>(s.placement.serial)
-        .load(std::memory_order_acquire);
+    return std::atomic_ref<const std::uint32_t>(s.placement.serial).load(std::memory_order_acquire);
 }
 
 inline std::uint32_t PlacementSerialBegun(const Section& s) noexcept {
@@ -225,28 +221,23 @@ inline void BeginPlacement(Section& s, std::uint32_t serial) noexcept {
 }
 
 inline void FinishPlacement(Section& s, std::uint32_t serial) noexcept {
-    std::atomic_ref<std::uint32_t>(s.placement.serial)
-        .store(serial, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(s.placement.serial).store(serial, std::memory_order_release);
 }
 
 inline std::uint64_t Heartbeat(const Section& s) noexcept {
-    return std::atomic_ref<const std::uint64_t>(s.heartbeat_us)
-        .load(std::memory_order_relaxed);
+    return std::atomic_ref<const std::uint64_t>(s.heartbeat_us).load(std::memory_order_relaxed);
 }
 
 inline void Beat(Section& s, std::uint64_t now_us) noexcept {
-    std::atomic_ref<std::uint64_t>(s.heartbeat_us)
-        .store(now_us, std::memory_order_relaxed);
+    std::atomic_ref<std::uint64_t>(s.heartbeat_us).store(now_us, std::memory_order_relaxed);
 }
 
 inline bool Enabled(const Section& s) noexcept {
-    return std::atomic_ref<const std::uint32_t>(s.enabled)
-        .load(std::memory_order_relaxed) != 0;
+    return std::atomic_ref<const std::uint32_t>(s.enabled).load(std::memory_order_relaxed) != 0;
 }
 
 inline void SetEnabled(Section& s, bool on) noexcept {
-    std::atomic_ref<std::uint32_t>(s.enabled)
-        .store(on ? 1U : 0U, std::memory_order_relaxed);
+    std::atomic_ref<std::uint32_t>(s.enabled).store(on ? 1U : 0U, std::memory_order_relaxed);
 }
 
 // ─── the reverse section: what the game needs ──────────────────────────────
@@ -274,8 +265,7 @@ inline void SetEnabled(Section& s, bool on) noexcept {
 //
 // Both sections are created by GpuThermalGuard, as section 8 requires, so there
 // is no name for anything else to squat on.
-inline constexpr wchar_t kRequestName[] =
-    L"Local\\GpuThermalGuard.OsdReq.v1";
+inline constexpr wchar_t kRequestName[] = L"Local\\GpuThermalGuard.OsdReq.v1";
 
 inline constexpr std::uint32_t kRequestMagic = 0x52475447;   // "GTGR"
 inline constexpr std::uint32_t kRequestVersion = 1;
@@ -335,43 +325,41 @@ inline constexpr std::uint32_t kScalingUnknown = 0xFFFFFFFFU;
 
 inline const char* ScalingName(std::uint32_t scaling) noexcept {
     switch (scaling) {
-        case kScalingStretch:             return "stretch";
-        case kScalingNone:                return "none";
-        case kScalingAspectRatioStretch:  return "aspect-ratio-stretch";
-        default:                          return "unknown";
+        case kScalingStretch:
+            return "stretch";
+        case kScalingNone:
+            return "none";
+        case kScalingAspectRatioStretch:
+            return "aspect-ratio-stretch";
+        default:
+            return "unknown";
     }
 }
 
 inline constexpr std::size_t kRequestBytes = sizeof(Request);
 
 inline std::uint32_t RequestSerial(const Request& r) noexcept {
-    return std::atomic_ref<const std::uint32_t>(r.serial)
-        .load(std::memory_order_acquire);
+    return std::atomic_ref<const std::uint32_t>(r.serial).load(std::memory_order_acquire);
 }
 
 inline std::uint32_t RequestSerialBegun(const Request& r) noexcept {
-    return std::atomic_ref<const std::uint32_t>(r.serial_begin)
-        .load(std::memory_order_acquire);
+    return std::atomic_ref<const std::uint32_t>(r.serial_begin).load(std::memory_order_acquire);
 }
 
 inline void BeginRequest(Request& r, std::uint32_t serial) noexcept {
-    std::atomic_ref<std::uint32_t>(r.serial_begin)
-        .store(serial, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(r.serial_begin).store(serial, std::memory_order_release);
 }
 
 inline void FinishRequest(Request& r, std::uint32_t serial) noexcept {
-    std::atomic_ref<std::uint32_t>(r.serial)
-        .store(serial, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(r.serial).store(serial, std::memory_order_release);
 }
 
 inline std::uint64_t RequestHeartbeat(const Request& r) noexcept {
-    return std::atomic_ref<const std::uint64_t>(r.heartbeat_us)
-        .load(std::memory_order_relaxed);
+    return std::atomic_ref<const std::uint64_t>(r.heartbeat_us).load(std::memory_order_relaxed);
 }
 
 inline void BeatRequest(Request& r, std::uint64_t now_us) noexcept {
-    std::atomic_ref<std::uint64_t>(r.heartbeat_us)
-        .store(now_us, std::memory_order_relaxed);
+    std::atomic_ref<std::uint64_t>(r.heartbeat_us).store(now_us, std::memory_order_relaxed);
 }
 
 // The game wrote this. Everything a publisher would act on is checked here, in
@@ -401,9 +389,8 @@ inline bool RequestPlausible(const Request& r) noexcept {
 // frame -- new header over old pixels, or pixels from two publishes -- fails
 // this, and a checksum over a sample of bytes would not reliably notice.
 inline std::uint8_t PatternByte(std::uint32_t serial, std::size_t offset) noexcept {
-    const std::uint64_t mixed =
-        (static_cast<std::uint64_t>(serial) * 2654435761ULL) +
-        (static_cast<std::uint64_t>(offset) * 2246822519ULL);
+    const std::uint64_t mixed = (static_cast<std::uint64_t>(serial) * 2654435761ULL) +
+                                (static_cast<std::uint64_t>(offset) * 2246822519ULL);
     return static_cast<std::uint8_t>((mixed >> 13) & 0xFFU);
 }
 

@@ -11,26 +11,33 @@
 #include <cwchar>
 #include <format>
 int GtgFeatureAttach(gtg::overlay::integration::Identity, const wchar_t*, const wchar_t*);
+
 namespace {
 using namespace gtg::overlay::integration;
 Control* control{};
 HANDLE parent{};
 ULONGLONG startup_started{};
+
 void Check(bool b, const char* why) {
     if (!b) throw std::runtime_error(why);
 }
+
 struct Handle {
     HANDLE value{};
+
     ~Handle() {
         if (value) CloseHandle(value);
     }
 };
+
 struct View {
     void* value{};
+
     ~View() {
         if (value) UnmapViewOfFile(value);
     }
 };
+
 std::filesystem::path OwnPath() {
     wchar_t path[32768]{};
     const auto n = GetModuleFileNameW(nullptr, path, 32768);
@@ -38,14 +45,15 @@ std::filesystem::path OwnPath() {
     return path;
 }
 }  // namespace
+
 void GtgFeatureStartupStage(const char* stage, ULONGLONG duration) noexcept {
     const auto saved_error = GetLastError();
     try {
         const auto path = OwnPath().parent_path() / L"GpuThermalGuard-overlay-startup.log";
         Handle file;
         const auto opened = CreateFileW(path.c_str(), FILE_APPEND_DATA,
-                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                       nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (opened != INVALID_HANDLE_VALUE) {
             file.value = opened;
             SYSTEMTIME time{};
@@ -53,25 +61,29 @@ void GtgFeatureStartupStage(const char* stage, ULONGLONG duration) noexcept {
             const auto line = std::format(
                 "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03} helper={} target={} stage={} elapsed_ms={} duration_ms={}\r\n",
                 time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
-                time.wMilliseconds, GetCurrentProcessId(), control ? control->target.pid : 0,
-                stage, GetTickCount64() - startup_started, duration);
+                time.wMilliseconds, GetCurrentProcessId(), control ? control->target.pid : 0, stage,
+                GetTickCount64() - startup_started, duration);
             DWORD written{};
-            (void)WriteFile(file.value, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+            (void)WriteFile(file.value, line.data(), static_cast<DWORD>(line.size()), &written,
+                            nullptr);
         }
     } catch (...) {
         // Diagnostic I/O must never affect attachment or Win32 error reporting.
     }
     SetLastError(saved_error);
 }
+
 bool GtgFeatureContinue() noexcept {
     return control && parent && WaitForSingleObject(parent, 0) == WAIT_TIMEOUT &&
            !InterlockedCompareExchange(&control->stop, 0, 0);
 }
-gtg::overlay::integration::ChoiceRead GtgFeatureColorChoice(DWORD pid, std::uint64_t created,
-                                                          gtg::overlay::integration::ColorPolicy& policy) noexcept {
+
+gtg::overlay::integration::ChoiceRead GtgFeatureColorChoice(
+    DWORD pid, std::uint64_t created, gtg::overlay::integration::ColorPolicy& policy) noexcept {
     if (!control || !ValidControl(*control)) return ChoiceRead::Invalid;
     return ReadColorChoice(pid, created, policy, control->parent_pid, control->parent_created);
 }
+
 int GtgFeatureSession(gtg::research::HookSection& section, HANDLE target) noexcept {
     if (!GtgFeatureContinue()) return 1;
     InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Ready));
@@ -95,18 +107,22 @@ int GtgFeatureSession(gtg::research::HookSection& section, HANDLE target) noexce
     InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Closed));
     return 0;
 }
+
 int gtg::overlay::integration::HelperMain(const wchar_t* argument) noexcept {
     startup_started = GetTickCount64();
     Handle mapping;
     View mapped;
     Handle owner;
     wchar_t temp_file[MAX_PATH]{};
+
     struct Temp {
         wchar_t* path;
+
         ~Temp() {
             if (*path) DeleteFileW(path);
         }
     } temp{temp_file};
+
     int result = 1;
     try {
         wchar_t* end{};

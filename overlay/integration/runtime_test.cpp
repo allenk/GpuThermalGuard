@@ -6,8 +6,9 @@
 #include <cstdio>
 WTL::CAppModule _Module;
 int GtgFeatureSession(gtg::research::HookSection&, HANDLE) noexcept;
-gtg::overlay::integration::ChoiceRead GtgFeatureColorChoice(DWORD, std::uint64_t,
-    gtg::overlay::integration::ColorPolicy&) noexcept;
+gtg::overlay::integration::ChoiceRead GtgFeatureColorChoice(
+    DWORD, std::uint64_t, gtg::overlay::integration::ColorPolicy&) noexcept;
+
 int GtgFeatureAttach(gtg::overlay::integration::Identity target, const wchar_t*, const wchar_t*) {
     HANDLE process =
         OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
@@ -15,20 +16,26 @@ int GtgFeatureAttach(gtg::overlay::integration::Identity target, const wchar_t*,
     auto section = std::make_unique<gtg::research::HookSection>();
     gtg::overlay::integration::ColorPolicy policy{};
     if (GtgFeatureColorChoice(target.pid, target.created, policy) ==
-        gtg::overlay::integration::ChoiceRead::Invalid) { CloseHandle(process); return 1; }
+        gtg::overlay::integration::ChoiceRead::Invalid) {
+        CloseHandle(process);
+        return 1;
+    }
     section->product_color_policy = static_cast<DWORD>(policy);
     const int result = GtgFeatureSession(*section, process);
     CloseHandle(process);
     return result;
 }
+
 namespace {
 void Require(bool ok, const char* why) {
     if (!ok) throw std::runtime_error(why);
 }
+
 struct ExitEvidence {
     DWORD helper_pid{};
     volatile LONG exit_now{};
 };
+
 int ParentExitFixture(DWORD target_pid) {
     using namespace gtg::overlay::integration;
     wchar_t name[96]{};
@@ -55,6 +62,7 @@ int ParentExitFixture(DWORD target_pid) {
     }
     ExitProcess(2);
 }
+
 void CheckParentExit() {
     using namespace gtg::overlay::integration;
     wchar_t name[96]{}, path[32768]{};
@@ -92,6 +100,7 @@ void CheckParentExit() {
             "helper exits when parent dies, target still alive");
 }
 }  // namespace
+
 int wmain(int argc, wchar_t** argv) {
     using namespace gtg::overlay::integration;
     namespace ipc = gtg::overlay::ipc;
@@ -113,10 +122,13 @@ int wmain(int argc, wchar_t** argv) {
         bool repaired{};
         Require(source.Initialize(nullptr, &history, true, {40, 40}, repaired),
                 "actual OSD HWND initialized");
+
         struct OsdLifetime {
             gtg::tray::OsdOverlay& source;
+
             ~OsdLifetime() { source.Shutdown(); }
         } osd_lifetime{source};
+
         runtime.source = &source;
         runtime.window = source.m_hWnd;
         Require(source.CurrentDpi() != 0, "actual OSD DPI available");
@@ -137,10 +149,12 @@ int wmain(int argc, wchar_t** argv) {
         runtime.sessions[0] = std::move(owned);
         auto& s = *runtime.sessions[0];
         s.color_choice = std::make_unique<ColorChoiceMapping>();
-        Require(s.color_choice->Create(identity.pid, identity.created), "GTG owns SDR choice before helper launch");
+        Require(s.color_choice->Create(identity.pid, identity.created),
+                "GTG owns SDR choice before helper launch");
         ColorPolicy selected{};
         Require(ReadColorChoice(identity.pid, identity.created, selected) == ChoiceRead::Chosen &&
-            selected == ColorPolicy::ResearchAssumeSdr, "in-process session choice needs no external executable");
+                    selected == ColorPolicy::ResearchAssumeSdr,
+                "in-process session choice needs no external executable");
         Launch(s);
         Require(Configure(false), "disable during helper startup");
         const auto deadline = GetTickCount64() + 15000;
@@ -207,9 +221,9 @@ int wmain(int argc, wchar_t** argv) {
         // A failed session gives its slot back and its identity is refused from
         // then on (refused_targets.hpp); `s` is gone after this tick.
         Tick();
-        Require(!runtime.sessions[0] && runtime.refused.Contains(identity) &&
-                    GetStatus().failed == 1,
-                "helper exit fails closed: slot released, target refused");
+        Require(
+            !runtime.sessions[0] && runtime.refused.Contains(identity) && GetStatus().failed == 1,
+            "helper exit fails closed: slot released, target refused");
         Stop();
         Require(!runtime.source && !runtime.hotkey && !runtime.sessions[0],
                 "nonblocking teardown releases state");

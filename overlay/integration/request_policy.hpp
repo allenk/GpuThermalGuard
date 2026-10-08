@@ -1,5 +1,6 @@
 #pragma once
 #include "../ipc/osd_section.hpp"
+
 namespace gtg::overlay::integration {
 inline bool AcceptRequest(const ipc::Request& request, std::uint32_t serial, std::uint32_t begun,
                           std::uint32_t pid, std::uint64_t now_us) noexcept {

@@ -6,11 +6,13 @@ namespace gtg::research {
 constexpr std::uint32_t kHookMagic = 0x35485447;
 constexpr DWORD kProductVersion = 2;
 enum class HookState : LONG { kWaiting, kInstalled, kRefused, kRecoveryRequired, kPartialResident };
+
 struct alignas(8) CallerSample {
     volatile LONG tid;
     volatile LONG calls;
     volatile LONG64 first_queue;
 };
+
 struct alignas(8) HookSection {
     LoadSection header;
     DWORD target_tid;
@@ -76,6 +78,7 @@ struct alignas(8) HookSection {
     volatile LONG product_color_provenance;
     std::uint64_t product_target_created;
 };
+
 static_assert(offsetof(HookSection, header) == 0);
 static_assert(offsetof(HookSection, hook_calls) % 8 == 0);
 static_assert(offsetof(HookSection, first_hook_qpc) % 8 == 0);

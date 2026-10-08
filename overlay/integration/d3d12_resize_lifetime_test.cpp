@@ -9,6 +9,7 @@
 
 using Microsoft::WRL::ComPtr;
 using namespace gtg::overlay::integration;
+
 namespace {
 void Check(bool value, const char* message) {
     if (!value) {
@@ -20,21 +21,31 @@ void Check(bool value, const char* message) {
         ExitProcess(1);
     }
 }
+
 void Hr(HRESULT value, const char* message) {
     if (FAILED(value)) {
         std::fprintf(stderr, "HRESULT=0x%08lX ", static_cast<unsigned long>(value));
         Check(false, message);
     }
 }
+
 struct Window {
-    HWND handle = CreateWindowExW(0, L"STATIC", L"GTG owned resize lifetime test",
-        WS_POPUP, 0, 0, 64, 64, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    ~Window() { if (handle) DestroyWindow(handle); }
+    HWND handle = CreateWindowExW(0, L"STATIC", L"GTG owned resize lifetime test", WS_POPUP, 0, 0,
+                                  64, 64, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+    ~Window() {
+        if (handle) DestroyWindow(handle);
+    }
 };
+
 struct Event {
     HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    ~Event() { if (handle) CloseHandle(handle); }
+
+    ~Event() {
+        if (handle) CloseHandle(handle);
+    }
 };
+
 void WaitOwned(ID3D12Fence* fence, UINT64 value) {
     Event event;
     Check(event.handle != nullptr, "owned completion event");
@@ -42,22 +53,30 @@ void WaitOwned(ID3D12Fence* fence, UINT64 value) {
     if (FAILED(notification) || WaitForSingleObject(event.handle, 5000) != WAIT_OBJECT_0 ||
         fence->GetCompletedValue() != value) {
         // The failing fixture exits. Never close a potentially registered event.
-        fence->AddRef(); event.handle = nullptr;
+        fence->AddRef();
+        event.handle = nullptr;
         Check(false, "owned completion proof");
     }
 }
+
 struct Gate {
     ComPtr<ID3D12Fence> fence;
-    ~Gate() { if (fence) fence->Signal(1); }
+
+    ~Gate() {
+        if (fence) fence->Signal(1);
+    }
+
     void Open() { Hr(fence->Signal(1), "open owned WARP queue gate"); }
 };
-D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* buffer,
-    D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+
+D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* buffer, D3D12_RESOURCE_STATES before,
+                                  D3D12_RESOURCE_STATES after) {
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition = {buffer, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
     return barrier;
 }
+
 void NoD3d12Warnings(ID3D12Device* device) {
     ComPtr<ID3D12InfoQueue> messages;
     Hr(device->QueryInterface(IID_PPV_ARGS(&messages)), "debug oracle");
@@ -102,8 +121,8 @@ int main() {
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     ComPtr<IDXGISwapChain1> chain;
-    Hr(factory->CreateSwapChainForHwnd(queue.Get(), window.handle, &desc,
-        nullptr, nullptr, &chain), "owned chain");
+    Hr(factory->CreateSwapChainForHwnd(queue.Get(), window.handle, &desc, nullptr, nullptr, &chain),
+       "owned chain");
     Hr(chain->ResizeBuffers(0, 64, 64, DXGI_FORMAT_UNKNOWN, 0),
        "baseline resize with no external backbuffer references");
 
@@ -124,7 +143,7 @@ int main() {
     const auto handle = rtv->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(backbuffer.Get(), nullptr, handle);
     auto barrier = Transition(backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT,
-                             D3D12_RESOURCE_STATE_RENDER_TARGET);
+                              D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->ResourceBarrier(1, &barrier);
     constexpr float color[] = {0.25f, 0.5f, 0.75f, 1.0f};
     list->ClearRenderTargetView(handle, color, 0, nullptr);
@@ -147,7 +166,7 @@ int main() {
 
     const HRESULT pending_resize = chain->ResizeBuffers(0, 80, 80, DXGI_FORMAT_UNKNOWN, 0);
     std::printf("pending retained-reference ResizeBuffers=0x%08lX\n",
-        static_cast<unsigned long>(pending_resize));
+                static_cast<unsigned long>(pending_resize));
     Check(pending_resize == DXGI_ERROR_INVALID_CALL,
           "retained overlay backbuffer obstructs native resize");
     gate.Open();

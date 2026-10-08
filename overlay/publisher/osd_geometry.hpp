@@ -31,11 +31,17 @@ struct Rect {
     std::int32_t top = 0;
     std::int32_t right = 0;
     std::int32_t bottom = 0;
+
     std::int32_t Width() const { return right - left; }
+
     std::int32_t Height() const { return bottom - top; }
 };
 
-enum class Edge : std::uint32_t { kNear = 0, kCentre = 1, kFar = 2 };  // left/top, centre, right/bottom
+enum class Edge : std::uint32_t {
+    kNear = 0,
+    kCentre = 1,
+    kFar = 2
+};  // left/top, centre, right/bottom
 
 // The answer for one frame size: how big to render, and the anchoring that
 // Place turns into a rectangle once the real bitmap size is known.
@@ -56,14 +62,12 @@ namespace detail {
 
 // Nearest of near edge, centre, far edge; a tie goes to an edge, because an
 // edge is what a user means by "put it in the corner" (design §4).
-inline Edge NearestEdge(std::int32_t osd_lo, std::int32_t osd_hi,
-                        std::int32_t mon_lo, std::int32_t mon_hi,
-                        double& margin) {
+inline Edge NearestEdge(std::int32_t osd_lo, std::int32_t osd_hi, std::int32_t mon_lo,
+                        std::int32_t mon_hi, double& margin) {
     const double near_gap = static_cast<double>(osd_lo - mon_lo);
     const double far_gap = static_cast<double>(mon_hi - osd_hi);
     const double centre_offset =
-        (static_cast<double>(osd_lo) + osd_hi) / 2.0 -
-        (static_cast<double>(mon_lo) + mon_hi) / 2.0;
+        (static_cast<double>(osd_lo) + osd_hi) / 2.0 - (static_cast<double>(mon_lo) + mon_hi) / 2.0;
     const double near_d = std::abs(near_gap);
     const double far_d = std::abs(far_gap);
     const double centre_d = std::abs(centre_offset);
@@ -79,18 +83,23 @@ inline Edge NearestEdge(std::int32_t osd_lo, std::int32_t osd_hi,
     return Edge::kCentre;
 }
 
-inline std::int32_t Round(double v) { return static_cast<std::int32_t>(std::lround(v)); }
+inline std::int32_t Round(double v) {
+    return static_cast<std::int32_t>(std::lround(v));
+}
 
 // One axis of Place: the start coordinate of `size` pixels in `extent`.
-inline std::int32_t PlaceAxis(Edge edge, double margin, std::int32_t size,
-                              std::int32_t extent) {
+inline std::int32_t PlaceAxis(Edge edge, double margin, std::int32_t size, std::int32_t extent) {
     std::int32_t start = 0;
     switch (edge) {
-        case Edge::kNear:   start = Round(margin); break;
-        case Edge::kFar:    start = extent - Round(margin) - size; break;
+        case Edge::kNear:
+            start = Round(margin);
+            break;
+        case Edge::kFar:
+            start = extent - Round(margin) - size;
+            break;
         case Edge::kCentre:
-            start = Round(static_cast<double>(extent) / 2.0 + margin -
-                          static_cast<double>(size) / 2.0);
+            start =
+                Round(static_cast<double>(extent) / 2.0 + margin - static_cast<double>(size) / 2.0);
             break;
     }
     // Rule 4. A dashboard wider than the frame cannot happen after Map's
@@ -107,8 +116,8 @@ inline Mapping Map(const Rect& osd, const Rect& monitor, std::int32_t frame_widt
     Mapping m;
     m.frame_width = frame_width;
     m.frame_height = frame_height;
-    if (osd.Width() <= 0 || osd.Height() <= 0 || monitor.Width() <= 0 ||
-        monitor.Height() <= 0 || frame_width <= 0 || frame_height <= 0) {
+    if (osd.Width() <= 0 || osd.Height() <= 0 || monitor.Width() <= 0 || monitor.Height() <= 0 ||
+        frame_width <= 0 || frame_height <= 0) {
         m.scale = 0.0;  // nothing sensible to draw; the caller draws nothing
         return m;
     }
@@ -125,10 +134,8 @@ inline Mapping Map(const Rect& osd, const Rect& monitor, std::int32_t frame_widt
 
     double mx = 0.0;
     double my = 0.0;
-    m.horizontal = detail::NearestEdge(osd.left, osd.right, monitor.left,
-                                       monitor.right, mx);
-    m.vertical = detail::NearestEdge(osd.top, osd.bottom, monitor.top,
-                                     monitor.bottom, my);
+    m.horizontal = detail::NearestEdge(osd.left, osd.right, monitor.left, monitor.right, mx);
+    m.vertical = detail::NearestEdge(osd.top, osd.bottom, monitor.top, monitor.bottom, my);
     // Question (a), continued: each margin by its own axis's ratio, so the
     // relation to each edge is kept on a frame of a different shape.
     m.margin_x = mx * rx;
@@ -138,21 +145,18 @@ inline Mapping Map(const Rect& osd, const Rect& monitor, std::int32_t frame_widt
 
 // The size Map expects the bitmap to come out at, for a desktop OSD of
 // `osd_width` x `osd_height`.
-inline void ExpectedSize(const Mapping& m, std::int32_t osd_width,
-                         std::int32_t osd_height, std::int32_t& width,
-                         std::int32_t& height) {
+inline void ExpectedSize(const Mapping& m, std::int32_t osd_width, std::int32_t osd_height,
+                         std::int32_t& width, std::int32_t& height) {
     width = detail::Round(osd_width * m.scale);
     height = detail::Round(osd_height * m.scale);
 }
 
 // The destination rectangle, in frame pixels, for a bitmap of the size the
 // rasteriser actually produced.
-inline Rect Place(const Mapping& m, std::int32_t bitmap_width,
-                  std::int32_t bitmap_height) {
+inline Rect Place(const Mapping& m, std::int32_t bitmap_width, std::int32_t bitmap_height) {
     const std::int32_t w = std::min(bitmap_width, m.frame_width);
     const std::int32_t h = std::min(bitmap_height, m.frame_height);
-    const std::int32_t x =
-        detail::PlaceAxis(m.horizontal, m.margin_x, w, m.frame_width);
+    const std::int32_t x = detail::PlaceAxis(m.horizontal, m.margin_x, w, m.frame_width);
     const std::int32_t y = detail::PlaceAxis(m.vertical, m.margin_y, h, m.frame_height);
     return Rect{x, y, x + w, y + h};
 }

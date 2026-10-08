@@ -5,9 +5,14 @@
 #include <thread>
 
 using namespace gtg::overlay::integration;
+
 void Check(bool result, const char* message) {
-    if (!result) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
+    if (!result) {
+        std::fprintf(stderr, "FAIL: %s\n", message);
+        std::exit(1);
+    }
 }
+
 int main() {
     constexpr auto removed = std::numeric_limits<std::uint64_t>::max();
     D3d12Slots slots;
@@ -56,7 +61,8 @@ int main() {
           "device loss quarantines every owned in-flight slot");
     Check(!submitted_loss.Resume(removed), "device loss cannot resume a generation");
     D3d12Slots overflow;
-    Check(!overflow.Submitted(overflow.Reserve(0), removed, true), "reserved removal value refused");
+    Check(!overflow.Submitted(overflow.Reserve(0), removed, true),
+          "reserved removal value refused");
 
     D3d12Slots invalid;
     Check(!invalid.Submitted(-1, 1, true), "invalid index safely refused");

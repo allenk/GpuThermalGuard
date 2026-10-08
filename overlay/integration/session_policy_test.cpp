@@ -2,12 +2,14 @@
 #include <cstdio>
 #include <cstdlib>
 using namespace gtg::overlay::integration;
+
 void Check(bool b, const char* why) {
     if (!b) {
         std::fprintf(stderr, "FAIL %s\n", why);
         std::exit(1);
     }
 }
+
 int main() {
     SessionPolicy s;
     const Identity a{5, 10}, reused{5, 11};

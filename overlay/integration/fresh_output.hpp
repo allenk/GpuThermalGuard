@@ -1,9 +1,11 @@
 #pragma once
 #include <dxgi.h>
+
 namespace gtg::overlay::integration {
 constexpr UINT kOutputAdapterLimit = 8;
 constexpr UINT kOutputPerAdapterLimit = 16;
-template<class Ops>
+
+template <class Ops>
 LONG FindFreshMonitorOutput(Ops& ops) noexcept {
     for (UINT adapter = 0; adapter < kOutputAdapterLimit; ++adapter) {
         const HRESULT found_adapter = ops.Adapter(adapter);
@@ -20,7 +22,8 @@ LONG FindFreshMonitorOutput(Ops& ops) noexcept {
     }
     return -285;
 }
-template<class Ops>
+
+template <class Ops>
 LONG QualifyFreshOutput(Ops& ops) noexcept {
     if (!ops.Window()) return -281;
     if (!ops.Create()) return -280;

@@ -6,9 +6,10 @@
 namespace gtg::overlay::integration {
 enum class DrainResult { Complete, Timeout, Removed, NotifyFailed, WaitFailed, Unproven };
 inline constexpr DWORD kTransitionWaitMs = 250;
+
 // Transition-only policy. Ops owns a persistent event and a private GPU fence;
 // a failed/uncertain notification must not be destroyed or reused afterward.
-template<class Ops>
+template <class Ops>
 DrainResult DrainPrivateFence(Ops& ops, std::uint64_t target, DWORD budget) noexcept {
     constexpr auto removed = std::numeric_limits<std::uint64_t>::max();
     const auto start = ops.Now();

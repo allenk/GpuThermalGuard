@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdio>
+
 namespace gtg::overlay::probe {
 template <typename... Args>
 void Print(const char* format, Args... args) {

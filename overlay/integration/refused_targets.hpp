@@ -25,9 +25,11 @@ public:
         if (targets_.size() == kCapacity) targets_.erase(targets_.begin());
         targets_.push_back(target);
     }
+
     [[nodiscard]] bool Contains(const Identity& target) const noexcept {
         return std::find(targets_.begin(), targets_.end(), target) != targets_.end();
     }
+
     // Drops every target `alive` says has exited.
     template <class Alive>
     void Prune(Alive alive) {
@@ -35,6 +37,7 @@ public:
                                       [&](const Identity& t) { return !alive(t); }),
                        targets_.end());
     }
+
     [[nodiscard]] std::size_t Size() const noexcept { return targets_.size(); }
 
 private:

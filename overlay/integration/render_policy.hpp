@@ -3,6 +3,7 @@
 #include "../ipc/osd_section.hpp"
 #include <algorithm>
 #include <cmath>
+
 namespace gtg::overlay::integration {
 inline float BoundRenderScale(float scale, bool collapsed) noexcept {
     // ChooseFootprint cannot exceed these bounds for any valid arrangement,

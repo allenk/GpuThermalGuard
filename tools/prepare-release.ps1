@@ -113,8 +113,10 @@ foreach ($package in $packages) {
     $hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
     $sums.Add("$($hash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($zipPath))")
 }
-($sums -join "`n") |
-    Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Encoding utf8NoBOM
+# LF throughout, final newline included: Set-Content would end the last line with
+# CRLF on Windows, and GNU `sha256sum -c` then looks for a file named "<zip>\r".
+(($sums -join "`n") + "`n") |
+    Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Encoding utf8NoBOM -NoNewline
 
 $notes = [System.Collections.Generic.List[string]]::new()
 $notes.Add("# GpuThermalGuard $Tag")

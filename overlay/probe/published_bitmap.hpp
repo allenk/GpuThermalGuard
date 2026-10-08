@@ -166,12 +166,18 @@ enum class ConsumerState : int {
 
 inline const char* ConsumerStateName(ConsumerState s) {
     switch (s) {
-        case ConsumerState::Start:          return "start";
-        case ConsumerState::NoSection:      return "no-section";
-        case ConsumerState::Drawing:        return "drawing";
-        case ConsumerState::StaleHeartbeat: return "stale-heartbeat";
-        case ConsumerState::DisabledByFlag: return "disabled-by-flag";
-        case ConsumerState::BadHeader:      return "bad-header";
+        case ConsumerState::Start:
+            return "start";
+        case ConsumerState::NoSection:
+            return "no-section";
+        case ConsumerState::Drawing:
+            return "drawing";
+        case ConsumerState::StaleHeartbeat:
+            return "stale-heartbeat";
+        case ConsumerState::DisabledByFlag:
+            return "disabled-by-flag";
+        case ConsumerState::BadHeader:
+            return "bad-header";
     }
     return "?";
 }
@@ -197,10 +203,10 @@ class TargetFactsCache {
 public:
     static constexpr std::uint64_t kRefreshUs = 1'000'000;
 
-    const TargetFacts& Get(IDXGISwapChain* swap_chain, std::uint32_t swap_w,
-                           std::uint32_t swap_h, std::uint64_t now_us) {
-        if (valid_ && swap_chain == swap_chain_ && swap_w == swap_w_ &&
-            swap_h == swap_h_ && now_us < next_us_) {
+    const TargetFacts& Get(IDXGISwapChain* swap_chain, std::uint32_t swap_w, std::uint32_t swap_h,
+                           std::uint64_t now_us) {
+        if (valid_ && swap_chain == swap_chain_ && swap_w == swap_w_ && swap_h == swap_h_ &&
+            now_us < next_us_) {
             return facts_;
         }
         swap_chain_ = swap_chain;
@@ -217,8 +223,8 @@ public:
         facts_.display_height = swap_h;
         DEVMODEW mode{};
         mode.dmSize = sizeof(mode);
-        if (::EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) &&
-            mode.dmPelsWidth > 0 && mode.dmPelsHeight > 0) {
+        if (::EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsWidth > 0 &&
+            mode.dmPelsHeight > 0) {
             facts_.display_width = mode.dmPelsWidth;
             facts_.display_height = mode.dmPelsHeight;
         }
@@ -253,13 +259,16 @@ template <class Texture>
 class PublishedBitmapT {
 public:
     Texture& texture() { return texture_; }
+
     ConsumerStats& stats() { return stats_; }
+
     const DestRect& dest() const { return dest_; }
 #ifdef GTG_REMOTE_RENDER_RESEARCH
     // Same-render-thread diagnostic; not a cross-thread/public IPC interface.
     std::uint32_t ResearchPlacementSerial() const { return placement_serial_; }
 #endif
     ConsumerState state() const { return state_; }
+
     std::uint64_t transitions() const { return transitions_; }
 
     // Printed on a cadence the CALLER chooses, from the present path rather than
@@ -269,39 +278,32 @@ public:
         std::int32_t t = dest_.top.load(std::memory_order_relaxed);
         std::int32_t w = dest_.width.load(std::memory_order_relaxed);
         std::int32_t h = dest_.height.load(std::memory_order_relaxed);
-        Print("[T-04] present %llu, state %s | serial=%u uploads=%llu "
-                    "reused=%llu rejected=%llu outside=%llu | opens=%llu "
-                    "stale=%llu disabled=%llu bad=%llu requests=%llu | "
-                    "rect=%d,%d %dx%d\n",
-                    static_cast<unsigned long long>(present_count),
-                    ConsumerStateName(state_),
-                    stats_.last_serial.load(std::memory_order_relaxed),
-                    static_cast<unsigned long long>(
-                        stats_.uploads.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.reused.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.rejected.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.geometry_outside.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.open_attempts.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.stale_heartbeat.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.disabled_by_flag.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.bad_header.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(
-                        stats_.requests_written.load(std::memory_order_relaxed)),
-                    l, t, w, h);
+        Print(
+            "[T-04] present %llu, state %s | serial=%u uploads=%llu "
+            "reused=%llu rejected=%llu outside=%llu | opens=%llu "
+            "stale=%llu disabled=%llu bad=%llu requests=%llu | "
+            "rect=%d,%d %dx%d\n",
+            static_cast<unsigned long long>(present_count), ConsumerStateName(state_),
+            stats_.last_serial.load(std::memory_order_relaxed),
+            static_cast<unsigned long long>(stats_.uploads.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(stats_.reused.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(stats_.rejected.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                stats_.geometry_outside.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(stats_.open_attempts.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(stats_.stale_heartbeat.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                stats_.disabled_by_flag.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(stats_.bad_header.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                stats_.requests_written.load(std::memory_order_relaxed)),
+            l, t, w, h);
         std::fflush(stdout);
     }
 
     // True when there is a texture worth drawing, with the destination
     // rectangle computed for the swapchain it was given.
-    bool Acquire(std::uint32_t target_w, std::uint32_t target_h,
-                 std::uint64_t now_us) {
+    bool Acquire(std::uint32_t target_w, std::uint32_t target_h, std::uint64_t now_us) {
         if (!texture_.Bound()) return false;
         ++frames_seen_;
         if (!EnsureOpen(now_us)) {
@@ -350,8 +352,7 @@ public:
         // Spike 4, rule 4: an image sized and placed for another frame size is
         // not drawn -- not uploaded either. It is the writer's guess before our
         // request reached it, and it would be drawn partly outside this frame.
-        if (h.frame_width != 0 &&
-            (h.frame_width != target_w || h.frame_height != target_h)) {
+        if (h.frame_width != 0 && (h.frame_width != target_w || h.frame_height != target_h)) {
             stats_.awaiting_frame_size.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -370,8 +371,7 @@ public:
         // upload buffer -- then check, then commit. The copy may be torn; the
         // point of staging is that a torn copy can still be thrown away.
         const std::uint64_t upload_start = QpcNs();
-        const std::uint64_t allocations_before =
-            stats_.allocations.load(std::memory_order_relaxed);
+        const std::uint64_t allocations_before = stats_.allocations.load(std::memory_order_relaxed);
 #ifdef GTG_REMOTE_RENDER_RESEARCH
         stats_.copy_attempts.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -405,11 +405,17 @@ public:
     }
 
     ImTextureID TextureId() const { return texture_.Id(); }
+
     bool HasTexture() const { return texture_.Has(); }
+
     std::uint32_t AlphaMode() const { return last_header_.alpha_mode; }
+
     float DestLeft() const { return dest_left_; }
+
     float DestTop() const { return dest_top_; }
+
     float DestRight() const { return dest_left_ + dest_w_; }
+
     float DestBottom() const { return dest_top_ + dest_h_; }
 
     // ─── T-06: telling the publisher what this swapchain is ────────────────
@@ -422,12 +428,10 @@ public:
     // scaling mode. Two facts, not a conclusion: see the note on Request in
     // osd_section.hpp for why the conclusion was removed after T-06 printed a
     // wrong one.
-    void ReportTarget(std::uint32_t swap_w, std::uint32_t swap_h,
-                      std::uint32_t disp_w, std::uint32_t disp_h,
-                      std::uint32_t scaling, std::uint64_t now_us) {
-        if (swap_w == req_swap_w_ && swap_h == req_swap_h_ &&
-            disp_w == req_disp_w_ && disp_h == req_disp_h_ &&
-            scaling == req_scaling_) {
+    void ReportTarget(std::uint32_t swap_w, std::uint32_t swap_h, std::uint32_t disp_w,
+                      std::uint32_t disp_h, std::uint32_t scaling, std::uint64_t now_us) {
+        if (swap_w == req_swap_w_ && swap_h == req_swap_h_ && disp_w == req_disp_w_ &&
+            disp_h == req_disp_h_ && scaling == req_scaling_) {
             // Unchanged. Keep the heartbeat moving so the publisher can tell a
             // steady game from a departed one, and do nothing else.
             if (request_ != nullptr && (++beat_tick_ % 60) == 0) {
@@ -455,10 +459,10 @@ public:
         ipc::FinishRequest(*request_, request_serial_);
 
         stats_.requests_written.fetch_add(1, std::memory_order_relaxed);
-        Print("[T-06] request %u: swapchain %ux%u, display mode %ux%u, "
-                    "scaling %s\n",
-                    request_serial_, swap_w, swap_h, disp_w, disp_h,
-                    ipc::ScalingName(scaling));
+        Print(
+            "[T-06] request %u: swapchain %ux%u, display mode %ux%u, "
+            "scaling %s\n",
+            request_serial_, swap_w, swap_h, disp_w, disp_h, ipc::ScalingName(scaling));
     }
 
     void Release() {
@@ -467,7 +471,10 @@ public:
             ::UnmapViewOfFile(const_cast<ipc::Section*>(section_));
             section_ = nullptr;
         }
-        if (mapping_ != nullptr) { ::CloseHandle(mapping_); mapping_ = nullptr; }
+        if (mapping_ != nullptr) {
+            ::CloseHandle(mapping_);
+            mapping_ = nullptr;
+        }
         if (request_ != nullptr) {
             ::UnmapViewOfFile(request_);
             request_ = nullptr;
@@ -488,16 +495,16 @@ private:
         state_ = next;
         ++transitions_;
         if (next == ConsumerState::StaleHeartbeat) {
-            Print("[T-07] %s -> %s at frame %llu: last beat %llu us ago "
-                        "(threshold %llu) -- drawing stopped, no frozen frame\n",
-                        ConsumerStateName(from), ConsumerStateName(next),
-                        static_cast<unsigned long long>(frames_seen_),
-                        static_cast<unsigned long long>(detail_us),
-                        static_cast<unsigned long long>(kHeartbeatStaleUs));
+            Print(
+                "[T-07] %s -> %s at frame %llu: last beat %llu us ago "
+                "(threshold %llu) -- drawing stopped, no frozen frame\n",
+                ConsumerStateName(from), ConsumerStateName(next),
+                static_cast<unsigned long long>(frames_seen_),
+                static_cast<unsigned long long>(detail_us),
+                static_cast<unsigned long long>(kHeartbeatStaleUs));
         } else {
-            Print("[T-07] %s -> %s at frame %llu\n",
-                        ConsumerStateName(from), ConsumerStateName(next),
-                        static_cast<unsigned long long>(frames_seen_));
+            Print("[T-07] %s -> %s at frame %llu\n", ConsumerStateName(from),
+                  ConsumerStateName(next), static_cast<unsigned long long>(frames_seen_));
         }
         std::fflush(stdout);
     }
@@ -537,17 +544,19 @@ private:
 #endif
         if (m == nullptr) return false;
         void* view = ::MapViewOfFile(m, FILE_MAP_READ, 0, 0, ipc::kSectionBytes);
-        if (view == nullptr) { ::CloseHandle(m); return false; }
+        if (view == nullptr) {
+            ::CloseHandle(m);
+            return false;
+        }
         const auto* candidate = static_cast<const ipc::Section*>(view);
-        if (candidate->magic != ipc::kMagic ||
-            candidate->version != ipc::kVersion ||
+        if (candidate->magic != ipc::kMagic || candidate->version != ipc::kVersion ||
             candidate->header_size != sizeof(ipc::Section)) {
             // A publisher we do not understand is not a publisher. Refuse, and
             // keep refusing on the same 2 s timer, rather than draw its bytes.
-            Print("[T-04] section refused: magic=0x%08X version=%u "
-                        "header_size=%u\n",
-                        candidate->magic, candidate->version,
-                        candidate->header_size);
+            Print(
+                "[T-04] section refused: magic=0x%08X version=%u "
+                "header_size=%u\n",
+                candidate->magic, candidate->version, candidate->header_size);
             ::UnmapViewOfFile(view);
             ::CloseHandle(m);
             return false;
@@ -555,8 +564,8 @@ private:
         mapping_ = m;
         section_ = candidate;
         opened_us_ = now_us;
-        Print("[T-04] section opened: writer_pid=%u, %zu bytes\n",
-                    candidate->writer_pid, ipc::kSectionBytes);
+        Print("[T-04] section opened: writer_pid=%u, %zu bytes\n", candidate->writer_pid,
+              ipc::kSectionBytes);
         return true;
     }
 
@@ -564,7 +573,8 @@ private:
     // and the reason section 8 has two of them. Same 2 s timer as the other, and
     // the same refusal to touch a section whose header we do not recognise.
     bool EnsureRequestOpen(std::uint64_t now_us) {
-#if defined(GTG_REMOTE_RENDER_RESEARCH) && !defined(GTG_TARGET_OSD) && !defined(GTG_PID_BITMAP_REQUEST)
+#if defined(GTG_REMOTE_RENDER_RESEARCH) && !defined(GTG_TARGET_OSD) && \
+    !defined(GTG_PID_BITMAP_REQUEST)
         (void)now_us;
         return false;  // Never write the real desktop publisher's request section.
 #else
@@ -581,15 +591,17 @@ private:
 #endif
         if (m == nullptr) return false;
         void* view = ::MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, ipc::kRequestBytes);
-        if (view == nullptr) { ::CloseHandle(m); return false; }
+        if (view == nullptr) {
+            ::CloseHandle(m);
+            return false;
+        }
         auto* candidate = static_cast<ipc::Request*>(view);
-        if (candidate->magic != ipc::kRequestMagic ||
-            candidate->version != ipc::kRequestVersion ||
+        if (candidate->magic != ipc::kRequestMagic || candidate->version != ipc::kRequestVersion ||
             candidate->header_size != sizeof(ipc::Request)) {
-            Print("[T-06] request section refused: magic=0x%08X "
-                        "version=%u header_size=%u\n",
-                        candidate->magic, candidate->version,
-                        candidate->header_size);
+            Print(
+                "[T-06] request section refused: magic=0x%08X "
+                "version=%u header_size=%u\n",
+                candidate->magic, candidate->version, candidate->header_size);
             ::UnmapViewOfFile(view);
             ::CloseHandle(m);
             return false;
@@ -597,8 +609,7 @@ private:
         request_mapping_ = m;
         request_ = candidate;
         request_serial_ = ipc::RequestSerial(*candidate);
-        Print("[T-06] request section opened, %zu bytes\n",
-                    ipc::kRequestBytes);
+        Print("[T-06] request section opened, %zu bytes\n", ipc::kRequestBytes);
         return true;
 #endif
     }
@@ -610,8 +621,7 @@ private:
     // has no DPI for a swapchain it does not own. That is a real gap rather than
     // a simplification: T-05 is where it gets settled, and it is written into
     // the evidence rather than left implied by this code.
-    void PlaceInto(const ipc::FrameHeader& h, std::uint32_t target_w,
-                   std::uint32_t target_h) {
+    void PlaceInto(const ipc::FrameHeader& h, std::uint32_t target_w, std::uint32_t target_h) {
         const float w = static_cast<float>(h.width);
         const float ht = static_cast<float>(h.height);
         const float ox = static_cast<float>(h.offset_dip_x);
@@ -634,14 +644,22 @@ private:
         }
         switch (static_cast<ipc::AnchorCorner>(h.anchor_corner)) {
             case ipc::AnchorCorner::TopLeft:
-                dest_left_ = ox;          dest_top_ = oy;           break;
+                dest_left_ = ox;
+                dest_top_ = oy;
+                break;
             case ipc::AnchorCorner::TopRight:
-                dest_left_ = tw - w - ox; dest_top_ = oy;           break;
+                dest_left_ = tw - w - ox;
+                dest_top_ = oy;
+                break;
             case ipc::AnchorCorner::BottomLeft:
-                dest_left_ = ox;          dest_top_ = th - ht - oy; break;
+                dest_left_ = ox;
+                dest_top_ = th - ht - oy;
+                break;
             case ipc::AnchorCorner::BottomRight:
             default:
-                dest_left_ = tw - w - ox; dest_top_ = th - ht - oy; break;
+                dest_left_ = tw - w - ox;
+                dest_top_ = th - ht - oy;
+                break;
         }
         dest_w_ = w;
         dest_h_ = ht;
@@ -651,16 +669,15 @@ private:
         // from a right one, which is exactly what T-05 has to be able to tell
         // apart. So the rectangle stays where the arithmetic put it, the frame
         // clips it, and the discrepancy is counted and named once.
-        if (dest_left_ < 0.0f || dest_top_ < 0.0f ||
-            dest_left_ + w > tw || dest_top_ + ht > th) {
-            const std::uint64_t n =
-                stats_.geometry_outside.fetch_add(1, std::memory_order_relaxed);
+        if (dest_left_ < 0.0f || dest_top_ < 0.0f || dest_left_ + w > tw || dest_top_ + ht > th) {
+            const std::uint64_t n = stats_.geometry_outside.fetch_add(1, std::memory_order_relaxed);
             if (n == 0) {
-                Print("[T-04] GEOMETRY OUTSIDE FRAME: bitmap %.0fx%.0f at "
-                            "%.0f,%.0f does not fit swapchain %.0fx%.0f -- the "
-                            "publisher was not told this resolution (section 8 "
-                            "reverse section, OsdReq.v1, is not built)\n",
-                            w, ht, dest_left_, dest_top_, tw, th);
+                Print(
+                    "[T-04] GEOMETRY OUTSIDE FRAME: bitmap %.0fx%.0f at "
+                    "%.0f,%.0f does not fit swapchain %.0fx%.0f -- the "
+                    "publisher was not told this resolution (section 8 "
+                    "reverse section, OsdReq.v1, is not built)\n",
+                    w, ht, dest_left_, dest_top_, tw, th);
             }
         }
 
@@ -668,14 +685,10 @@ private:
     }
 
     void StoreDest() {
-        dest_.left.store(static_cast<std::int32_t>(dest_left_),
-                         std::memory_order_relaxed);
-        dest_.top.store(static_cast<std::int32_t>(dest_top_),
-                        std::memory_order_relaxed);
-        dest_.width.store(static_cast<std::int32_t>(dest_w_),
-                          std::memory_order_relaxed);
-        dest_.height.store(static_cast<std::int32_t>(dest_h_),
-                           std::memory_order_relaxed);
+        dest_.left.store(static_cast<std::int32_t>(dest_left_), std::memory_order_relaxed);
+        dest_.top.store(static_cast<std::int32_t>(dest_top_), std::memory_order_relaxed);
+        dest_.width.store(static_cast<std::int32_t>(dest_w_), std::memory_order_relaxed);
+        dest_.height.store(static_cast<std::int32_t>(dest_h_), std::memory_order_relaxed);
     }
 
     // Spike 4: one acquire load per frame. A new serial is copied under the
@@ -685,10 +698,10 @@ private:
         const std::uint32_t serial = ipc::PlacementSerial(*section_);
         if (serial == 0 || serial == placement_serial_) return;
         const ipc::Placement copy = section_->placement;
-        if (ipc::PlacementSerialBegun(*section_) != serial || copy.width <= 0 ||
-            copy.height <= 0 || copy.width > static_cast<std::int32_t>(ipc::kMaxWidth) ||
-            copy.height > static_cast<std::int32_t>(ipc::kMaxHeight) ||
-            copy.frame_width == 0 || copy.frame_height == 0) {
+        if (ipc::PlacementSerialBegun(*section_) != serial || copy.width <= 0 || copy.height <= 0 ||
+            copy.width > static_cast<std::int32_t>(ipc::kMaxWidth) ||
+            copy.height > static_cast<std::int32_t>(ipc::kMaxHeight) || copy.frame_width == 0 ||
+            copy.frame_height == 0) {
             stats_.placements_rejected.fetch_add(1, std::memory_order_relaxed);
             return;
         }

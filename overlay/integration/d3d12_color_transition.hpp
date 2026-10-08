@@ -2,14 +2,19 @@
 #include "d3d12_lifecycle_gate.hpp"
 
 namespace gtg::overlay::integration {
-struct ColorTransitionResult { HRESULT original_result; bool qualified; };
-template<class Ops>
+struct ColorTransitionResult {
+    HRESULT original_result;
+    bool qualified;
+};
+
+template <class Ops>
 void RecordColorTransitionRefusal(Ops& ops, LONG reason) noexcept {
     if constexpr (requires { ops.RefuseColor(reason); }) ops.RefuseColor(reason);
 }
-template<class Clock, class Ops, class Call>
-ColorTransitionResult ForwardColorTransition(D3d12LifecycleGate& gate, Clock& clock,
-    Ops& ops, Call&& call) noexcept {
+
+template <class Clock, class Ops, class Call>
+ColorTransitionResult ForwardColorTransition(D3d12LifecycleGate& gate, Clock& clock, Ops& ops,
+                                             Call&& call) noexcept {
     const bool owned = gate.BeginTransition(clock);
     const bool drained = owned && ops.BeforeColor(gate.Remaining(clock));
     if (!drained) RecordColorTransitionRefusal(ops, -251);

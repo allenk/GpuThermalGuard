@@ -6,6 +6,7 @@
 
 namespace {
 int failures = 0;
+
 void Check(const bool condition, const char* message) {
     if (!condition) {
         std::fprintf(stderr, "FAIL %s\n", message);

@@ -8,14 +8,17 @@
 namespace gtg::overlay::integration {
 enum class Backend { Unsupported, D3d11, D3d12, Ambiguous, QueryFailed };
 enum class Capability { Absent, Present, Error };
+
 struct BackendEvidence {
     Capability d3d11 = Capability::Absent;
     Capability d3d12 = Capability::Absent;
     Capability interop = Capability::Absent;
 };
+
 inline Backend SelectBackend(BackendEvidence value) noexcept {
     if (value.d3d11 == Capability::Error || value.d3d12 == Capability::Error ||
-        value.interop == Capability::Error) return Backend::QueryFailed;
+        value.interop == Capability::Error)
+        return Backend::QueryFailed;
     if (value.interop == Capability::Present) return Backend::Unsupported;
     if (value.d3d11 == Capability::Present && value.d3d12 == Capability::Present)
         return Backend::Ambiguous;
@@ -23,11 +26,13 @@ inline Backend SelectBackend(BackendEvidence value) noexcept {
     if (value.d3d12 == Capability::Present) return Backend::D3d12;
     return Backend::Unsupported;
 }
+
 inline Capability QueryCapability(HRESULT result, bool returned) noexcept {
     if (SUCCEEDED(result)) return returned ? Capability::Present : Capability::Error;
     // A failed query is not generally proof of an absent interface.
     return result == E_NOINTERFACE && !returned ? Capability::Absent : Capability::Error;
 }
+
 inline Backend InspectBackend(IDXGISwapChain* chain) noexcept {
     if (!chain) return Backend::QueryFailed;
     Microsoft::WRL::ComPtr<ID3D11Device> device11;

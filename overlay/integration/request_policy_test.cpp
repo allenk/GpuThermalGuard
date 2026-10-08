@@ -2,12 +2,14 @@
 #include <cstdio>
 #include <cstdlib>
 using namespace gtg::overlay;
+
 void Check(bool ok, const char* why) {
     if (!ok) {
         std::fprintf(stderr, "FAIL %s\n", why);
         std::exit(1);
     }
 }
+
 int main() {
     ipc::Request r{};
     r.magic = ipc::kRequestMagic;

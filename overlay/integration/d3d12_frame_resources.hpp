@@ -6,6 +6,7 @@
 
 namespace gtg::overlay::integration {
 enum class Retirement { Released, Retained };
+
 class D3d12FrameResources {
 public:
     // All access, including destruction, requires the same external admission.
@@ -13,12 +14,15 @@ public:
     D3d12FrameResources() = default;
     D3d12FrameResources(const D3d12FrameResources&) = delete;
     D3d12FrameResources& operator=(const D3d12FrameResources&) = delete;
+
     ~D3d12FrameResources() noexcept { Close(); }
+
     bool Initialize(ID3D12CommandQueue* queue) noexcept {
         if (attempted_ || closed_) return false;
         attempted_ = true;
         if (!queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
-            FAILED(queue->GetDevice(IID_PPV_ARGS(&device_))) || !device_ || device_->GetNodeCount() != 1)
+            FAILED(queue->GetDevice(IID_PPV_ARGS(&device_))) || !device_ ||
+            device_->GetNodeCount() != 1)
             return FailInitialization();
         queue_ = queue;
         if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_))))
@@ -29,12 +33,15 @@ public:
             if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                        IID_PPV_ARGS(&allocators_[i]))) ||
                 FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    allocators_[i].Get(), nullptr, IID_PPV_ARGS(&lists_[i]))) ||
-                FAILED(lists_[i]->Close())) return FailInitialization();
+                                                  allocators_[i].Get(), nullptr,
+                                                  IID_PPV_ARGS(&lists_[i]))) ||
+                FAILED(lists_[i]->Close()))
+                return FailInitialization();
         }
         initialized_ = true;
         return true;
     }
+
     ID3D12GraphicsCommandList* TryBegin() noexcept {
         if (!initialized_ || closed_ || Failed() || open_ >= 0) return nullptr;
         const int index = slots_.Reserve(fence_->GetCompletedValue());
@@ -48,14 +55,18 @@ public:
         open_ = index;
         return lists_[index].Get();
     }
+
     bool Submit() noexcept {
-        const auto signal = [](ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) noexcept {
+        const auto signal = [](ID3D12CommandQueue* queue, ID3D12Fence* fence,
+                               UINT64 value) noexcept {
             return queue->Signal(fence, value);
         };
         return Submit(signal);
     }
+
     // Injectable operation is for owned failure tests. Product uses Submit().
-    template<class Signal> bool Submit(Signal& signal) noexcept {
+    template <class Signal>
+    bool Submit(Signal& signal) noexcept {
         if (closed_ || Failed() || open_ < 0) return false;
         const int index = open_;
         open_ = -1;
@@ -72,6 +83,7 @@ public:
         if (!signaled) uncertain_ = true;
         return slots_.Submitted(index, last_value_, signaled);
     }
+
     bool Cancel() noexcept {
         if (closed_ || Failed() || open_ < 0) return false;
         const int index = open_;
@@ -83,15 +95,17 @@ public:
         }
         return slots_.Cancel(index);
     }
+
     void Invalidate() noexcept {
         if (closed_) return;
         if (open_ >= 0) Cancel();
         slots_.Invalidate();
     }
+
     bool Resume() noexcept {
-        return initialized_ && !closed_ && !Failed() &&
-            slots_.Resume(fence_->GetCompletedValue());
+        return initialized_ && !closed_ && !Failed() && slots_.Resume(fence_->GetCompletedValue());
     }
+
     // Only approved resize/color transitions may call this. The caller already
     // owns admission and passes the remaining shared transition deadline.
     // Invalidate stops old-generation reservations before any wait. Neither
@@ -100,20 +114,26 @@ public:
         if (!initialized_ || closed_) return DrainResult::Unproven;
         Invalidate();
         if (Failed() || uncertain_) return DrainResult::Unproven;
+
         struct Ops {
             D3d12FrameResources& owner;
+
             std::uint64_t Now() noexcept { return GetTickCount64(); }
+
             std::uint64_t Completed() noexcept { return owner.fence_->GetCompletedValue(); }
+
             HRESULT Notify(std::uint64_t target) noexcept {
                 // Retain the event even on a failed registration unless proof
                 // later establishes completion. Never pass a null HANDLE.
                 owner.event_registered_ = true;
                 return owner.fence_->SetEventOnCompletion(target, owner.transition_event_);
             }
+
             DWORD Wait(DWORD remaining) noexcept {
                 return WaitForSingleObject(owner.transition_event_, remaining);
             }
         } ops{*this};
+
         const DrainResult result = DrainPrivateFence(ops, last_value_, budget);
         if (result == DrainResult::Complete) {
             event_registered_ = false;
@@ -125,30 +145,47 @@ public:
         }
         return result;
     }
+
     bool Failed() const noexcept { return failed_ || slots_.Failed(); }
+
     UINT OpenSlot() const noexcept { return static_cast<UINT>(open_); }
+
     UINT64 Completed() const noexcept { return fence_ ? fence_->GetCompletedValue() : 0; }
+
     UINT64 PendingValue() const noexcept { return last_value_ + 1; }
+
     unsigned Quarantined() const noexcept { return slots_.Quarantined(); }
+
     Retirement Close() noexcept {
         if (closed_) return retirement_;
         closed_ = true;
-        if (open_ >= 0) { lists_[open_]->Close(); open_ = -1; }
+        if (open_ >= 0) {
+            lists_[open_]->Close();
+            open_ = -1;
+        }
         const UINT64 completed = fence_ ? fence_->GetCompletedValue() : 0;
         if (event_registered_ ||
             (submitted_work_ && (uncertain_ || completed == kRemoved || completed < last_value_))) {
             // Unknown GPU lifetime: one bounded owner becomes permanently
             // disabled. Intentionally retain its COM references until process
             // exit, never release possibly executing resources or hot-unload.
-            for (auto& list : lists_) list.Detach();
-            for (auto& allocator : allocators_) allocator.Detach();
-            fence_.Detach(); queue_.Detach(); device_.Detach();
+            for (auto& list : lists_)
+                list.Detach();
+            for (auto& allocator : allocators_)
+                allocator.Detach();
+            fence_.Detach();
+            queue_.Detach();
+            device_.Detach();
             transition_event_ = nullptr;  // Intentionally retained with its fence.
             retirement_ = Retirement::Retained;
         } else {
-            for (auto& list : lists_) list.Reset();
-            for (auto& allocator : allocators_) allocator.Reset();
-            fence_.Reset(); queue_.Reset(); device_.Reset();
+            for (auto& list : lists_)
+                list.Reset();
+            for (auto& allocator : allocators_)
+                allocator.Reset();
+            fence_.Reset();
+            queue_.Reset();
+            device_.Reset();
             if (transition_event_) CloseHandle(transition_event_);
             transition_event_ = nullptr;
         }
@@ -156,7 +193,11 @@ public:
     }
 
 private:
-    bool FailInitialization() noexcept { failed_ = true; return false; }
+    bool FailInitialization() noexcept {
+        failed_ = true;
+        return false;
+    }
+
     static constexpr UINT64 kRemoved = std::numeric_limits<UINT64>::max();
     D3d12Slots slots_;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;

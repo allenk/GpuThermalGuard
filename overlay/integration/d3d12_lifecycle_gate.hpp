@@ -10,7 +10,8 @@ public:
     bool TryDraw() noexcept {
         if (disabled_.load(std::memory_order_acquire) ||
             transition_.load(std::memory_order_acquire) ||
-            owner_.test_and_set(std::memory_order_acquire)) return false;
+            owner_.test_and_set(std::memory_order_acquire))
+            return false;
         if (disabled_.load(std::memory_order_acquire) ||
             transition_.load(std::memory_order_acquire)) {
             owner_.clear(std::memory_order_release);
@@ -18,10 +19,13 @@ public:
         }
         return true;
     }
+
     void EndDraw() noexcept { owner_.clear(std::memory_order_release); }
+
     // Only approved resize/color callers may wait here. Pass Remaining(clock) to the fence drain;
     // admission and GPU waiting share one deadline, not two250 ms budgets.
-    template<class Clock> bool BeginTransition(Clock& clock, DWORD budget = kTransitionWaitMs) noexcept {
+    template <class Clock>
+    bool BeginTransition(Clock& clock, DWORD budget = kTransitionWaitMs) noexcept {
         if (disabled_.load(std::memory_order_acquire)) return false;
         const auto start = clock.Now();
         bool expected = false;
@@ -55,10 +59,13 @@ public:
             clock.Pause();
         }
     }
-    template<class Clock> DWORD Remaining(Clock& clock) const noexcept {
+
+    template <class Clock>
+    DWORD Remaining(Clock& clock) const noexcept {
         const auto elapsed = clock.Now() - start_;
         return elapsed < budget_ ? static_cast<DWORD>(budget_ - elapsed) : 0;
     }
+
     // Caller releases/retains resources and forwards original Resize first.
     // Commit only after successful native resize and full requalification.
     void EndTransition(bool qualified) noexcept {
@@ -66,7 +73,9 @@ public:
         owner_.clear(std::memory_order_release);
         transition_.store(false, std::memory_order_release);
     }
+
     bool Disabled() const noexcept { return disabled_.load(std::memory_order_acquire); }
+
 private:
     std::atomic_flag owner_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> transition_{false};

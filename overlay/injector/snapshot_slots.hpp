@@ -9,8 +9,9 @@ class SnapshotSlots {
 public:
     bool Collect(DWORD required_tid, InstallSite* diagnostic = nullptr) noexcept {
         if (!snapshot_.Collect(splice::os::win32::max_enlisted_threads, diagnostic)) return false;
-        try { slots_.assign(snapshot_.Handles().size(), {}); }
-        catch (const std::bad_alloc&) {
+        try {
+            slots_.assign(snapshot_.Handles().size(), {});
+        } catch (const std::bad_alloc&) {
             if (diagnostic) RecordInstallError(diagnostic->primary, InstallOperation::Allocation);
             return false;
         }
@@ -19,12 +20,17 @@ public:
             slots_[i].handle = snapshot_.Handles()[i];
             found |= GetThreadId(slots_[i].handle) == required_tid;
         }
-        if (!found && diagnostic) RecordInstallError(diagnostic->primary, InstallOperation::ThreadIdentity, 2, 0, false, required_tid);
+        if (!found && diagnostic)
+            RecordInstallError(diagnostic->primary, InstallOperation::ThreadIdentity, 2, 0, false,
+                               required_tid);
         if (diagnostic) diagnostic->threads = static_cast<DWORD>(slots_.size());
         return found;
     }
+
     std::span<splice::os::win32::ThreadSlot> Slots() noexcept { return slots_; }
+
     bool Close(InstallSite* diagnostic = nullptr) noexcept { return snapshot_.Close(diagnostic); }
+
 private:
     NativeThreadSnapshot snapshot_;
     std::vector<splice::os::win32::ThreadSlot> slots_;
