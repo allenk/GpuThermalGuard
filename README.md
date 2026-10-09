@@ -104,6 +104,20 @@ The overlay hooks the game's present path with [Splice](https://github.com/allen
 
 ## The desktop OSD
 
+### OSD at a glance
+
+<img src="docs/images/osd-guide.jpg" alt="A labelled guide to the compact OSD: the status dot, the O, the lock and the chevron in the header; the Temp, Power, VRAM, GPU, CPU, RAM, NET and FPS cards below; and the clock that takes the buttons' place when the pointer is away" width="760">
+
+- **Status dot** -- the protection state.
+- **The O** -- the in-game overlay; a click does what the hotkey does (see [The O](#the-o)).
+- **Header** -- drag it to move the whole OSD.
+- **Chevron** -- switch between the compact and the expanded OSD.
+- **Lock** -- unlock to drag cards into a new order or a second row, then lock again.
+- **Clock** -- when the pointer leaves, the lock and the chevron give their place to the time.
+- **Cards** -- Temp, Power, VRAM, GPU and CPU; RAM (physical use is the number, virtual commit is drawn behind it); NET (receive ↓, transmit ↑, in MB/s); FPS (frame rate, graphics API, resolution and play time).
+
+Locked, the OSD is for reading; unlocked, it is for arranging.
+
 <img src="docs/images/overlay-arrange.gif" alt="Over a game at 4K: unlocking the compact dashboard, dragging its cards from two rows into one column, then double-clicking the RAM and NET cards" width="480">
 
 A one-minute walkthrough of an earlier release, recorded over a game at 4K, is on [YouTube](https://www.youtube.com/watch?v=1urYDlP_he0).

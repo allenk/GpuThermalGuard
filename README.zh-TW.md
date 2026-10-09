@@ -104,6 +104,20 @@ Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫�
 
 ## 桌面 OSD
 
+### OSD 一覽
+
+<img src="docs/images/osd-guide-zh-TW.jpg" alt="精簡 OSD 的圖解：標題列的狀態燈、O 按鈕、鎖頭與箭頭；下方的 Temp、Power、VRAM、GPU、CPU、RAM、NET 與 FPS 小卡；以及游標離開後取代按鈕的時鐘" width="760">
+
+- **狀態燈**：保護狀態。
+- **O 按鈕**：遊戲內 Overlay，點一下的作用和熱鍵相同（見 [O 按鈕](#o-按鈕)）。
+- **標題列**：按住拖曳即可移動整個 OSD。
+- **箭頭**：在精簡 OSD 與展開 OSD 之間切換。
+- **鎖頭**：解鎖後可拖曳小卡調整順序或拉出第二排，調整完再鎖上。
+- **時鐘**：游標離開後，鎖頭與箭頭會換成目前時間。
+- **小卡**：Temp、Power、VRAM、GPU、CPU；RAM（數字是實體記憶體使用率，後方的曲線是虛擬 commit）；NET（接收 ↓、傳送 ↑，單位 MB/s）；FPS（影格率、繪圖 API、解析度與遊戲時間）。
+
+鎖定時用來看數據，解鎖後用來調整版面。
+
 <img src="docs/images/overlay-arrange.gif" alt="在 4K 遊戲畫面上：解鎖精簡面板，把小卡從兩排拖成一欄，再雙擊 RAM 與 NET 小卡" width="480">
 
 （這段操作錄製於英文介面。）
