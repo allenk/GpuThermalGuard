@@ -6,6 +6,9 @@
 #include "install_diagnostics.hpp"
 #include "named_target_policy.hpp"
 #include "drawing_gate_guard.hpp"
+// Image identity, needed by every configuration: the module matching below is
+// not part of the feature-only attach path.
+#include "../integration/runtime_image_identity.hpp"
 #include <appmodel.h>
 #include <tlhelp32.h>
 #include <algorithm>
@@ -17,6 +20,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #ifdef GTG_FEATURE_ATTACH
 #include "../integration/control.hpp"
@@ -146,12 +150,21 @@ std::uintptr_t RemoteAddress(HANDLE process, const std::vector<MODULEENTRY32W>& 
     wchar_t path[32768]{};
     const auto length = GetModuleFileNameW(owner, path, 32768);
     Check(length && length < 32768, "local owner path");
+    const auto owner_name = std::filesystem::path(path).filename().wstring();
     const auto base = reinterpret_cast<std::uintptr_t>(owner);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     const auto rva = reinterpret_cast<std::uintptr_t>(local) - base;
     for (const auto& module : modules) {
-        if (_wcsicmp(module.szExePath, path) != 0) continue;
+        // One file can be listed under more than one path: a packaged game's
+        // runtime is reachable through its package root and through the library
+        // folder it was installed into, and comparing the strings refuses an
+        // alias of the very image this address came from. The cheap name test
+        // comes first; only a candidate is worth asking the filesystem about.
+        if (_wcsicmp(module.szModule, owner_name.c_str()) != 0) continue;
+        if (_wcsicmp(module.szExePath, path) != 0 &&
+            !gtg::overlay::integration::SameRuntimeFile(path, module.szExePath))
+            continue;
         Check(
             module.modBaseSize == nt->OptionalHeader.SizeOfImage && rva + 16 <= module.modBaseSize,
             "remote image size/RVA mismatch");
@@ -408,12 +421,22 @@ int Run(bool attach, bool load_only, bool observe, bool discovery, bool associat
             Check(at != std::string::npos, "Signal module field");
             const auto stop = object.find('"', at + 10);
             Check(stop != std::string::npos, "Signal module syntax");
-            const auto filename =
-                std::filesystem::path(object.substr(at + 10, stop - at - 10)).filename().wstring();
+            // The report writes UTF-8 with forward slashes, so decode it as
+            // that: the active code page would mangle a path it cannot hold
+            // into one that names a different file.
+            const auto decoded = gtg::overlay::integration::RuntimePath(
+                std::string_view(object).substr(at + 10, stop - at - 10));
+            Check(decoded.has_value(), "Signal module UTF-8 path");
+            auto reported = *decoded;
+            reported.make_preferred();
+            const auto filename = reported.filename().wstring();
             Check(_wcsicmp(filename.c_str(), L"d3d12.dll") == 0 ||
                       _wcsicmp(filename.c_str(), L"d3d12core.dll") == 0,
                   "Signal runtime owner");
-            owner = GetModuleHandleW(filename.c_str());
+            // Name the exact image the discovery used. A bare file name
+            // resolves to whichever runtime this process loaded first, and a
+            // target with its own Core makes those two different binaries.
+            owner = GetModuleHandleW(reported.c_str());
             Check(owner != nullptr, "Signal local runtime retained by discovery");
             const bool loaded =
                 std::any_of(modules.begin(), modules.end(), [&](const auto& module) {

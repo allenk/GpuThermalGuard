@@ -49,10 +49,10 @@ BEGIN
     CONTROL "Auto Restore", IDC_AUTO_RESTORE,
             "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 359, 186, 59, 12
     LTEXT "Safe power locks after a trip; choose manual or automatic restore after cooling.", IDC_SETTINGS_NOTE, 18, 204, 395, 10
-    // Laid out after design/gtg-main-2.png (AF-20261004-main-ui-redesign):
+    // The layout:
     // the record switches on one row, the three choices as labelled combos
     // on the next, the actions right-aligned at the bottom.
-    // The row says what its switches are for (design/gtg-main-2-1-dark.png).
+    // The row says what its switches are for.
     LTEXT "Display:", IDC_DISPLAY_LABEL, 10, 222, 40, 12, SS_CENTERIMAGE
     CONTROL "OSD", IDC_OSD_ENABLED,
             "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 53, 222, 44, 12

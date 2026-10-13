@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string_view>
 
-// Main-window preferences added by AF-20261004-main-ui-redesign, as pure rules
+// Main-window preferences, as pure rules
 // so they can be tested without a registry or a window.
 namespace gtg::settings {
 inline constexpr std::uint32_t kFeatureNoticeSerial = 1;
@@ -117,7 +117,7 @@ inline constexpr UINT kHotkeyModifierMask = MOD_ALT | MOD_CONTROL | MOD_SHIFT | 
 }
 
 // A compatibility assumption, not HDR detection. Only new sessions read it.
-// On unless the user turned it off (AF-20261008-overlay-embedded-osd).
+// On unless the user turned it off.
 [[nodiscard]] constexpr bool ResolveOverlayHidesOsd(const bool has_valid_value,
                                                     const std::uint32_t value) noexcept {
     return !has_valid_value || value != 0;

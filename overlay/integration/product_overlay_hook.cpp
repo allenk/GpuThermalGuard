@@ -9,11 +9,11 @@
 #include "../injector/draw_diagnostics.hpp"
 #include "../injector/queue_binding.hpp"
 #include "../injector/staged_attach.hpp"
-#include "../injector/snapshot_slots.hpp"
-#include "../injector/snapshot_retry.hpp"
-#include "../injector/install_thread_ops.hpp"
+// Included directly now. It used to arrive through install_thread_ops.hpp,
+// which is gone -- a transitive include is not a dependency you declared.
+#include "../injector/install_diagnostics.hpp"
 #include "../injector/install_policy.hpp"
-#include "os/win32/thread_transaction.h"
+#include <splice/live.h>
 #include <memory>
 #include <array>
 #include <dxgi1_6.h>
@@ -25,7 +25,6 @@ void RenderAndCheck(IDXGISwapChain*, gtg::research::HookSection&, bool);
 namespace {
 using namespace gtg::research;
 using namespace gtg::overlay::integration;
-using namespace splice::os::win32;
 std::array<std::atomic<void*>, 7> originals{};
 std::atomic<bool> active{false};
 HookSection* counters{};
@@ -573,18 +572,46 @@ HRESULT STDMETHODCALLTYPE ColorSpace(IDXGISwapChain3* chain, DXGI_COLOR_SPACE_TY
     return result.original_result;
 }
 
+// ─── The seven sites, as one transaction ──────────────────────────────────
+//
+// This used to be seven transactions. `Sites::Install(i)` was called once per
+// site by a staged-attach policy, and each call collected its own thread
+// snapshot, took its own page protection and ran its own enlisted-thread
+// commit -- so a seven-site attach suspended every thread in the game seven
+// times, at roughly 118 ms per thread enumeration, and a refusal at the fifth
+// left four installed with nothing tying them together. That last state is
+// `PartialResident`, and it is what the install-diagnostic sidecar was built
+// to explain.
+//
+// It is one group now: one enumeration, one suspension, all seven written or
+// none. What each piece of the old shape became is written beside it below,
+// because this is product code that patches a live render thread and "it still
+// compiles" is not the standard.
+//
+//   seven snapshots + CollectStableSnapshot   -> the engine's prepare phase
+//   VirtualProtect / restore around each      -> the engine's prepare/release
+//   PreparedStrictPatch + expected bytes      -> .expect_prologue(snapshot)
+//   OneInstructionEntry(plan)                 -> OneInstructionEntry(facts, addr)
+//   our replacement + originals[i]            -> .replace_with(fn, originals[i])
+//   commit_enlisted(plan, slots, pub, ops)    -> .install(splice::live)
+//   InstallThreadOps's wrapped Ops seam       -> splice::Failure
+//   RecoverEnlisted + its Sleep(1) loop       -> State::recovered
+//   threads.Slots().size()                    -> outcome.threads()
+//
+// The gates are deliberately absent. Our replacements are the hooks and they
+// are in the call path themselves, so `.replace_with()` refuses a group that
+// also asks for one -- the admission these functions enforce lives in their
+// own bodies, where it always did.
 struct Sites {
     HookSection& section;
     InstallReport& report;
-    std::array<splice::arch::x86_64::PreparedStrictPatch, 7> plans;
     std::array<std::uint64_t, 7> addresses;
 
+    // Admission only. Nothing here writes, allocates or suspends, and nothing
+    // here touches a splice private type any more: the prologue facts come
+    // over the public ABI and the rule over them is still ours, because
+    // relaxing a safe-admission rule is a decision recorded on this side.
     bool Prepare(std::size_t i) {
-        const std::array<void*, 7> hooks{
-            reinterpret_cast<void*>(&Present),    reinterpret_cast<void*>(&Signal),
-            reinterpret_cast<void*>(&Resize),     reinterpret_cast<void*>(&Resize1),
-            reinterpret_cast<void*>(&Fullscreen), reinterpret_cast<void*>(&Present1),
-            reinterpret_cast<void*>(&ColorSpace)};
         auto* target = reinterpret_cast<void*>(addresses[i]);
         MEMORY_BASIC_INFORMATION memory{};
         if (VirtualQuery(target, &memory, sizeof(memory)) != sizeof(memory) ||
@@ -597,109 +624,141 @@ struct Sites {
                     (addresses[i] - reinterpret_cast<std::uintptr_t>(memory.BaseAddress)) <
                 16)
             return false;
-        const auto* expected = i == 0   ? section.expected
-                               : i == 1 ? section.signal_expected
-                                        : section.product_expected[i - 2];
-        if (!plans[i].prepare(target, hooks[i], expected, 16)) {
+
+        splice_prologue_facts facts{};
+        if (splice_prologue_profile(target, &facts) != 0) {
             InterlockedExchange(&section.product_ready, -10 - static_cast<LONG>(i));
             return false;
         }
-        // Preserve the existing Present/Signal admission. Lifecycle methods
-        // use the checked coordinator's exact instruction-boundary IP map,
-        // not the older single-instruction research profile. Atomic writing
-        // alone is not execution exclusion; snapshot/new-thread risk remains.
-        if (i < 2 && !OneInstructionEntry(plans[i])) {
+
+        // Present and Signal keep the stricter admission they have always had:
+        // the patch window must be one instruction, so no thread can be inside
+        // the bytes being replaced. The coordinated tier would map an interior
+        // program counter rather than refuse it, which is why this is ours to
+        // keep rather than something to drop as redundant.
+        if (i < 2 && !OneInstructionEntry(facts, addresses[i])) {
             InterlockedExchange(&section.product_patch_copy_size,
-                                static_cast<LONG>(plans[i].copy_size()));
-            LONG mask = 0;
-            for (unsigned offset = 1; offset < plans[i].copy_size(); ++offset) {
-                std::uintptr_t mapped{};
-                if (plans[i].map_ip(addresses[i] + offset, mapped)) mask |= 1 << offset;
-            }
-            InterlockedExchange(&section.product_patch_boundaries, mask);
+                                static_cast<LONG>(facts.patch_bytes));
+            InterlockedExchange(&section.product_patch_boundaries,
+                                static_cast<LONG>(facts.interior_mask));
             InterlockedExchange(&section.product_ready, -100 - static_cast<LONG>(i));
             return false;
         }
         return true;
     }
 
-    SiteResult Install(std::size_t i) {
-        auto& site = report.sites[i];
-        SnapshotSlots threads;
+    // The chain. Seven different signatures, so it is seven `.at()` calls and
+    // not a loop -- which is the honest shape: each site names its own type,
+    // its own snapshot and its own replacement, and the compiler checks that
+    // the replacement matches the site.
+    splice::Outcome Install(std::size_t count) {
+        using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+        using SignalFn =
+            HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+        using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT,
+                                                     DXGI_FORMAT, UINT);
+        using Resize1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT,
+                                                      DXGI_FORMAT, UINT, const UINT*,
+                                                      IUnknown* const*);
+        using FullscreenFn =
+            HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+        using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT,
+                                                       const DXGI_PRESENT_PARAMETERS*);
+        using ColorSpaceFn =
+            HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
 
-        struct Collection {
-            SnapshotSlots& threads;
+        const auto at = [this](std::size_t i) noexcept {
+            return reinterpret_cast<void*>(addresses[i]);
+        };
 
-            bool Collect(InstallSite& attempt) noexcept { return threads.Collect(0, &attempt); }
-
-            bool Close(InstallSite& attempt) noexcept { return threads.Close(&attempt); }
-
-            bool Absent(DWORD tid, InstallSite& attempt) noexcept {
-                return ThreadAbsentFromFreshSnapshot(tid, attempt);
-            }
-        } collection{threads};
-
-        if (!CollectStableSnapshot(collection, &site)) {
-            RecordInstallError(site.primary, InstallOperation::Collect);
-            threads.Close(&site);
-            return SiteResult::kRefused;
+        splice::Live<> group;
+        group.at(at(0), PresentFn{})
+            .expect_prologue(section.expected)
+            .replace_with(&Present, originals[0]);
+        if (count > 1) {
+            group.at(at(1), SignalFn{})
+                .expect_prologue(section.signal_expected)
+                .replace_with(&Signal, originals[1]);
+            group.at(at(2), ResizeFn{})
+                .expect_prologue(section.product_expected[0])
+                .replace_with(&Resize, originals[2]);
+            group.at(at(3), Resize1Fn{})
+                .expect_prologue(section.product_expected[1])
+                .replace_with(&Resize1, originals[3]);
+            group.at(at(4), FullscreenFn{})
+                .expect_prologue(section.product_expected[2])
+                .replace_with(&Fullscreen, originals[4]);
+            group.at(at(5), Present1Fn{})
+                .expect_prologue(section.product_expected[3])
+                .replace_with(&Present1, originals[5]);
+            group.at(at(6), ColorSpaceFn{})
+                .expect_prologue(section.product_expected[4])
+                .replace_with(&ColorSpace, originals[6]);
         }
-        section.reserved = static_cast<DWORD>(threads.Slots().size());
-        auto& plan = plans[i];
-        DWORD old{};
-        if (!VirtualProtect(plan.target(), 8, PAGE_EXECUTE_READWRITE, &old)) {
-            RecordInstallError(site.primary, InstallOperation::Protect, 0, GetLastError(), true);
-            threads.Close(&site);
-            return SiteResult::kRefused;
-        }
-        InstallThreadOps ops{site, threads.Slots()};
-        ops.publication = &originals[i];
-        const auto result = commit_enlisted(plan, threads.Slots(), originals[i], ops);
-        site.transaction_entered = 1;
-        site.transaction_stage = static_cast<DWORD>(result.stage);
-        site.transaction_outcome = static_cast<DWORD>(result.outcome);
-        section.transaction_stage = static_cast<LONG>(result.stage);
-        if (result.outcome != TransactionOutcome::installed) {
-            // Splice exposes terminal recovery stage, not the initiating semantic
-            // refusal after failed abort cleanup. Mark that cause as unavailable.
-            const bool unknown_cause =
-                ops.Aborting() && (result.stage == TransactionStage::rollback ||
-                                   result.stage == TransactionStage::resume);
-            RecordInstallError(
-                site.primary, InstallOperation::Transaction,
-                static_cast<DWORD>(result.stage) | (unknown_cause ? kInstallCauseUnavailable : 0U));
-        }
-        if (result.outcome == TransactionOutcome::recovery_required) {
-            plan.retain_storage();
-            bool uncertain = false;
-            while (!RecoverEnlisted(threads.Slots(), result.stage, originals[i].load() != nullptr,
-                                    plan.target(), ops, uncertain)) {
-                if (uncertain && std::none_of(threads.Slots().begin(), threads.Slots().end(),
-                                              [](const auto& slot) { return slot.suspended; }))
-                    break;
-                Sleep(1);
-            }
-            DWORD ignored{};
-            if (!VirtualProtect(plan.target(), 8, old, &ignored))
-                RecordInstallError(site.cleanup, InstallOperation::RestoreProtect, 0,
-                                   GetLastError(), true);
-            threads.Close(&site);
-            return SiteResult::kRecoveryRequired;
-        }
-        DWORD ignored{};
-        const bool protection = VirtualProtect(plan.target(), 8, old, &ignored) != FALSE;
-        if (!protection)
-            RecordInstallError(site.cleanup, InstallOperation::RestoreProtect, 0, GetLastError(),
-                               true);
-        const bool closed = threads.Close(&site);
-        if (!protection || !closed) {
-            plan.retain_storage();
-            return SiteResult::kRecoveryRequired;
-        }
-        return result.outcome == TransactionOutcome::installed ? SiteResult::kInstalled
-                                                               : SiteResult::kRefused;
+        return group.install(splice::live);
     }
 };
+
+// What the transaction did, in the sidecar's own fields.
+//
+// The layout does not move: `transaction_stage` and `transaction_outcome` are
+// still DWORDs in a 76-byte InstallSite, so every size assertion still holds.
+// **The values changed domain**, which is why the diagnostics version is
+// bumped in the same change: the old outcome enumerated refused/installed/
+// recovery_required as 0/1/2 and the new one enumerates installed/refused/
+// recovered/lost as 0/1/2/3, so the most important value is inverted. A reader
+// decoding the old numbers would be silently wrong, and the version is what
+// makes it refuse instead.
+//
+// Per-site evidence survives; per-site transactions do not. All seven sites
+// report the same stage and outcome, because there was one transaction, and
+// the failing site is named by the group's own ordinal.
+void RecordGroupOutcome(HookSection& section, InstallReport& report, std::size_t count,
+                        const splice::Outcome& outcome) noexcept {
+    const auto stage = static_cast<DWORD>(outcome.failure().stage);
+    const auto state = static_cast<DWORD>(outcome.state());
+    const bool installed = outcome.state() == splice::State::installed;
+
+    section.reserved = outcome.threads();
+    InterlockedExchange(&section.transaction_stage, static_cast<LONG>(stage));
+
+    for (std::size_t i = 0; i < count; ++i) {
+        auto& site = report.sites[i];
+        site.threads = outcome.threads();
+        site.transaction_entered = 1;
+        site.transaction_stage = stage;
+        site.transaction_outcome = state;
+        site.state = installed ? 3 : (outcome.state() == splice::State::refused ? 4 : 5);
+    }
+
+    if (installed) {
+        report.failed_site = MAXDWORD;
+        return;
+    }
+
+    // One transaction, so the ordinal is the group's and it localises the
+    // refusal without implying that any other site was touched.
+    const auto ordinal = static_cast<DWORD>(outcome.failure().site.ordinal);
+    report.failed_site = ordinal < count ? ordinal : 0;
+    RecordInstallError(report.sites[report.failed_site].primary,
+                       InstallOperation::Transaction, stage, outcome.failure().os_error,
+                       outcome.failure().os_error != 0,
+                       outcome.failure().thread_id);
+}
+
+// `lost` is the one outcome a caller has to decide something about: the
+// threads may still be suspended and this module must not be unloaded. It maps
+// to the state the product already had for exactly that, and `recovered` maps
+// to a clean refusal because the writes were undone before anything resumed --
+// which is what `RecoverEnlisted` used to spin trying to achieve.
+AttachResult AttachResultFor(const splice::Outcome& outcome) noexcept {
+    switch (outcome.state()) {
+        case splice::State::installed: return AttachResult::kActive;
+        case splice::State::recovered: return AttachResult::kRefused;
+        case splice::State::lost:      return AttachResult::kRecoveryRequired;
+        default:                       return AttachResult::kRefused;
+    }
+}
 
 HookState Install(HookSection& section, InstallReport& report) {
     BOOL critical = TRUE;
@@ -716,21 +775,55 @@ HookState Install(HookSection& section, InstallReport& report) {
         if (!prepared->Prepare()) return HookState::kRefused;
         renderer = prepared.get();
     }
-    report.site_count = d12 ? 7 : 1;
+    const std::size_t count = d12 ? 7U : 1U;
+    report.site_count = static_cast<DWORD>(count);
     Sites sites{section,
                 report,
-                {},
                 {section.present_address, section.signal_address, section.product_methods[0],
                  section.product_methods[1], section.product_methods[2], section.product_methods[3],
                  section.product_methods[4]}};
-    for (std::size_t i = 0; i < (d12 ? 7U : 1U); ++i)
+    for (std::size_t i = 0; i < count; ++i)
         for (std::size_t j = 0; j < i; ++j)
             if (sites.addresses[i] == sites.addresses[j]) {
                 renderer = nullptr;
                 return HookState::kRefused;
             }
-    RecordedInstallSites recorded{sites, report};
-    const auto result = AttachStaged(d12 ? 7 : 1, active, recorded);
+
+    // Admission for every site before anything is touched, which is the one
+    // thing the staged policy did that a transaction still has to do: a
+    // refusal here has written nothing and suspended nobody. What follows it
+    // used to be a second loop over the same sites, each with its own
+    // suspension. It is one call now.
+    AttachOutcome result{AttachResult::kRefused, 0};
+    if (active.load(std::memory_order_acquire)) {
+        result = {AttachResult::kRecoveryRequired, 0};
+    } else {
+        bool admitted = true;
+        for (std::size_t i = 0; i < count && admitted; ++i) {
+            report.failed_site = static_cast<DWORD>(i);
+            admitted = sites.Prepare(i);
+            report.sites[i].state = admitted ? 1 : 4;
+            if (!admitted) {
+                RecordInstallError(report.sites[i].primary, InstallOperation::Prepare);
+            } else {
+                report.failed_site = MAXDWORD;
+            }
+        }
+        if (admitted) {
+            // Nothing disables this. The trampolines are leaked for the
+            // process's life per FR-013 and the module is retained on every
+            // non-refusal, exactly as before -- so the outcome's records are
+            // dropped here rather than stored, which is what the old path did
+            // by never keeping one.
+            const splice::Outcome outcome = sites.Install(count);
+            RecordGroupOutcome(section, report, count, outcome);
+            const AttachResult mapped = AttachResultFor(outcome);
+            result = {mapped, mapped == AttachResult::kActive ? count : 0};
+            if (mapped == AttachResult::kActive) {
+                active.store(true, std::memory_order_release);
+            }
+        }
+    }
     FinishInstallReport(report, result);
     if (result.result != AttachResult::kRefused)
         prepared.release();

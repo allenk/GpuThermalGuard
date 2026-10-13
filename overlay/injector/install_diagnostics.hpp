@@ -60,6 +60,22 @@ struct alignas(8) InstallDiagnostics {
 static_assert(sizeof(InstallError) == 28 && sizeof(InstallSite) == 76);
 static_assert(offsetof(InstallDiagnostics, report) == 32 && sizeof(InstallDiagnostics) == 584);
 constexpr DWORD kInstallMagic = 0x49475447;
+
+// Bumped to 2 on 2026-10-12, and the reason is a trap rather than a feature.
+// `transaction_stage` and `transaction_outcome` are still DWORDs in a 76-byte
+// InstallSite -- every size assertion below still holds and the layout did not
+// move. What moved is what the numbers MEAN. The install path now runs one
+// coordinated transaction instead of one per site, and that transaction's
+// vocabulary is not the old one's: the outcome used to enumerate refused /
+// installed / recovery_required as 0 / 1 / 2 and now enumerates installed /
+// refused / recovered / lost as 0 / 1 / 2 / 3, so the most important value is
+// inverted. The stage count went from eleven to eight.
+//
+// A reader that decoded the old numbers against the new writer would be
+// silently wrong -- it would read a successful attach as a refusal. The
+// version is what makes it refuse to read instead, which is the only reason a
+// version field in a shared mapping is worth having.
+constexpr DWORD kInstallDiagnosticsVersion = 2;
 constexpr DWORD kInstallCauseUnavailable = 0x80000000U;
 
 inline UINT64 InstallCreationTime(HANDLE process) noexcept {
@@ -70,7 +86,8 @@ inline UINT64 InstallCreationTime(HANDLE process) noexcept {
 
 inline bool ValidInstallDiagnostics(const InstallDiagnostics& data, DWORD pid,
                                     UINT64 created) noexcept {
-    return data.magic == kInstallMagic && data.version == 1 && data.size == sizeof(data) &&
+    return data.magic == kInstallMagic && data.version == kInstallDiagnosticsVersion &&
+           data.size == sizeof(data) &&
            data.pid == pid && created != 0 && data.created == created;
 }
 
@@ -157,7 +174,8 @@ public:
         data_ = static_cast<InstallDiagnostics*>(
             MapViewOfFile(handle_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(InstallDiagnostics)));
         if (!data_ || !created) return false;
-        *data_ = {kInstallMagic, 1, sizeof(InstallDiagnostics), pid, created};
+        *data_ = {kInstallMagic, kInstallDiagnosticsVersion, sizeof(InstallDiagnostics),
+                  pid, created};
         return true;
     }
 

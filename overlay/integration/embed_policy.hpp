@@ -1,7 +1,6 @@
 #pragma once
 // When the in-game overlay replaces the desktop OSD. Pure, so every case the
 // owner listed is a unit test rather than a manual run.
-// AF-20261008-overlay-embedded-osd; specs/changes/2026-10-08-overlay-embedded-osd/.
 #include "session_policy.hpp"
 #include <cstdint>
 #include <span>
@@ -33,7 +32,7 @@ struct EmbedSession {
 // foreground as soon as it appears, so a quick ALT+TAB back into the game
 // would otherwise flash the OSD. Measured on the foreground, not on the rule:
 // ALT+F10 pressed inside a game the user has been in for a while hides the
-// OSD as soon as the overlay draws (AF-20261008-overlay-o-button). By pid
+// OSD as soon as the overlay draws. By pid
 // alone, because a game's creation time is read only once it has a session,
 // and gaining one must not look like a change of foreground.
 class ForegroundSettle {

@@ -3,7 +3,7 @@
 // The one undocumented call in this project: empty every working set on the
 // system in a single operation.
 //
-// Approved by AF-20260923-brute-force-reclaim. Everything about it is
+// Everything about it is
 // deliberately conservative, because none of it is documented:
 //
 //  - Resolved at run time from ntdll, which is already loaded in every Windows

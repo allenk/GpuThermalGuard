@@ -2,6 +2,7 @@
 #include "control.hpp"
 #include "product_methods.hpp"
 #include "color_choice.hpp"
+#include "startup_failure.hpp"
 #include "../injector/hook_protocol.hpp"
 #include "../offsets/method_report.hpp"
 #include <d3d11.h>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <cwchar>
 #include <format>
+#include <string_view>
 int GtgFeatureAttach(gtg::overlay::integration::Identity, const wchar_t*, const wchar_t*);
 
 namespace {
@@ -44,9 +46,13 @@ std::filesystem::path OwnPath() {
     Check(n && n < 32768, "executable path");
     return path;
 }
-}  // namespace
 
-void GtgFeatureStartupStage(const char* stage, ULONGLONG duration) noexcept {
+// The one writer for the startup log: a timestamp, the two identities, and the
+// fields the caller is reporting. Diagnostic I/O must never affect attachment
+// or Win32 error reporting, so the caller's error is restored and every failure
+// here, including formatting, is swallowed.
+template <typename... Args>
+void AppendStartupLine(std::format_string<Args...> fields, Args&&... args) noexcept {
     const auto saved_error = GetLastError();
     try {
         const auto path = OwnPath().parent_path() / L"GpuThermalGuard-overlay-startup.log";
@@ -59,18 +65,38 @@ void GtgFeatureStartupStage(const char* stage, ULONGLONG duration) noexcept {
             SYSTEMTIME time{};
             GetLocalTime(&time);
             const auto line = std::format(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03} helper={} target={} stage={} elapsed_ms={} duration_ms={}\r\n",
-                time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
-                time.wMilliseconds, GetCurrentProcessId(), control ? control->target.pid : 0, stage,
-                GetTickCount64() - startup_started, duration);
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03} helper={} target={} {}\r\n", time.wYear,
+                time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond, time.wMilliseconds,
+                GetCurrentProcessId(), control ? control->target.pid : 0,
+                std::format(fields, std::forward<Args>(args)...));
             DWORD written{};
             (void)WriteFile(file.value, line.data(), static_cast<DWORD>(line.size()), &written,
                             nullptr);
         }
     } catch (...) {
-        // Diagnostic I/O must never affect attachment or Win32 error reporting.
+        // A diagnostic line is never worth a failed attach.
     }
     SetLastError(saved_error);
+}
+
+// A refusal has to say what it refused. Every distinct refusal used to arrive
+// as one generic failure, so the reason travels as its own quoted field. The
+// Win32 number stays the field it always was and no longer stands in for the
+// reason: it is whatever was last set when the refusal surfaced, which is not
+// necessarily the call that failed.
+void PublishStartupFailure(DWORD error, std::string_view reason) noexcept {
+    AppendStartupLine("stage=attach-failed elapsed_ms={} duration_ms=0 error={} reason=\"{}\"",
+                      GetTickCount64() - startup_started, error, reason);
+    if (control && ValidControl(*control)) {
+        InterlockedExchange(&control->error, static_cast<LONG>(error));
+        InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Failed));
+    }
+}
+}  // namespace
+
+void GtgFeatureStartupStage(const char* stage, ULONGLONG duration) noexcept {
+    AppendStartupLine("stage={} elapsed_ms={} duration_ms={}", stage,
+                      GetTickCount64() - startup_started, duration);
 }
 
 bool GtgFeatureContinue() noexcept {
@@ -150,16 +176,21 @@ int gtg::overlay::integration::HelperMain(const wchar_t* argument) noexcept {
               "temporary report");
         ProductMethods methods;
         const auto discovery_started = GetTickCount64();
-        Check(methods.Discover(temp_file), "product graphics discovery");
+        // The target's own identity: a method address is only evidence about
+        // the runtime that target has loaded.
+        Check(methods.Discover(temp_file, initial.target), "product graphics discovery");
         GtgFeatureStartupStage("discovery-complete", GetTickCount64() - discovery_started);
         Check(GtgFeatureContinue(), "canceled discovery");
         const auto dll = OwnPath().parent_path() / L"gtg_overlay.dll";
         result = GtgFeatureAttach(initial.target, dll.c_str(), temp_file);
+    } catch (const std::exception& failure) {
+        // Capture the Win32 error before anything else runs.
+        const auto saved_error = GetLastError();
+        const auto reason = StartupFailureReason(failure.what());
+        PublishStartupFailure(saved_error, reason.data());
     } catch (...) {
-        if (control && ValidControl(*control)) {
-            InterlockedExchange(&control->error, static_cast<LONG>(GetLastError()));
-            InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Failed));
-        }
+        const auto saved_error = GetLastError();
+        PublishStartupFailure(saved_error, "unknown attach failure");
     }
     control = nullptr;
     parent = nullptr;

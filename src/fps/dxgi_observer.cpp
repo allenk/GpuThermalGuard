@@ -41,7 +41,7 @@ constexpr GUID kDwmProvider{0x9E9BBA3C, 0x2E38, 0x40CB,
                             {0x99, 0xF4, 0x9E, 0x82, 0x81, 0x42, 0x51, 0x64}};
 constexpr GUID kDxgKrnlProvider{0x802EC45A, 0x1E99, 0x4B83,
                                 {0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D}};
-// The D3D runtimes' own providers (AF-20261004-fps-backend-runtime-evidence):
+// The D3D runtimes' own providers:
 // Microsoft-Windows-Direct3D12 and -Direct3D11. Only their device events are
 // taken -- 3 create, 4 destroy, 5 report (the answer to CAPTURE_STATE), the
 // same ids in both -- so per-frame events never reach the session.
@@ -690,7 +690,7 @@ private:
         return true;
     }
 
-    // AF-20261004-fps-backend-runtime-evidence. After the consumer is running,
+    // After the consumer is running,
     // so the state reported on CAPTURE_STATE has a reader: the device events of
     // both D3D runtimes, PID-scoped and filtered to 3/4/5, then a request for
     // the devices that already exist. Only if all four calls succeed are the

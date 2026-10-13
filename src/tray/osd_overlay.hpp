@@ -216,7 +216,7 @@ public:
     void RestoreCollapsed(const bool collapsed) noexcept { collapsed_ = collapsed; }
     // Each shape's own remembered position, set before Initialize like the
     // shape itself. Initialize still takes the position to open at; the caller
-    // passes the one for the restored shape. AF-20261004-main-ui-redesign.
+    // passes the one for the restored shape.
     void RestorePositions(const placement::ModePositions& positions) noexcept {
         positions_ = positions;
     }
@@ -231,19 +231,18 @@ public:
     void Shutdown() noexcept;
     void SetVisible(bool visible);
     [[nodiscard]] bool Visible() const noexcept;
-    // The in-game overlay is standing in for this window
-    // (AF-20261008-overlay-embedded-osd). A temporary hide, separate from the
+    // The in-game overlay is standing in for this window.
+    // A temporary hide, separate from the
     // user's switch: SetVisible while suppressed only records what to restore,
     // nothing is persisted, and the topmost watchdog leaves a hidden window
     // alone.
     void SetSuppressed(bool suppressed);
     // The user's switch: Visible() unless suppressed, then what to restore.
     [[nodiscard]] bool Wanted() const noexcept;
-    // The overlay's O beside the status dot (AF-20261008-overlay-o-button):
+    // The overlay's O beside the status dot:
     // a button that does what the hotkey does, coloured by what it would do
     // for the program in front. None while the overlay is off.
-    // Installing: the program in front is being attached; the O turns
-    // (AF-20261008-overlay-o-installing).
+    // Installing: the program in front is being attached; the O turns.
     enum class OverlayMark { None, Attachable, Installing, Live };
     void SetOverlayMark(OverlayMark mark) noexcept;
     // The program in front cannot take an overlay: the O turns red briefly.
@@ -272,8 +271,8 @@ public:
     // the same dashboard the desktop draws, via RenderToBitmap -- could produce
     // the chrome and none of the readings.
     //
-    // AF-20260929-headless-telemetry-attach. AF-20260926-single-rasteriser
-    // separated the drawing from the window; this separates the data from it,
+    // An earlier change separated the drawing from the window; this separates
+    // the data from it,
     // which was the other half of the same seam.
     //
     // Initialize() calls this rather than assigning directly, so there is one
@@ -323,8 +322,6 @@ public:
     //
     //     overlay.AdvanceTo(now);
     //     overlay.RenderToBitmap(scale, w, h, now, AlphaMode::Straight, out);
-    //
-    // AF-20260929-headless-tick-advance.
     void AdvanceTo(std::uint64_t now_ms) noexcept { UpdateFreshness(now_ms); }
 
     // The dashboard as it is now, at a scale and in a space the caller
@@ -442,14 +439,14 @@ private:
     }
     bool collapsed_{};
     // When the pointer was last over the window, and whether the header has
-    // gone idle since (AF-20261006-osd-idle-clock).
+    // gone idle since.
     std::uint64_t last_pointer_ms_{};
     bool header_idle_{};
     placement::ModePositions positions_;
     // The point of the window the cursor grabbed, set for the length of a
     // system move loop. WM_MOVING's own rectangle cannot be snapped: it is the
     // previous rectangle plus the mouse's movement, so a snapped window could
-    // never leave the edge. AF-20261005-osd-snap-anchor.
+    // never leave the edge.
     std::optional<POINT> move_grab_;
     compact::Gesture toggle_gesture_;
     compact::Gesture lock_gesture_;
@@ -520,7 +517,6 @@ private:
     void SnapMoving(RECT& proposed, int body_height) const noexcept;
     // Records where the cursor holds the moving window, for the whole drag.
     // Both windows share a top-left, so one grab serves either.
-    // AF-20261005-osd-snap-anchor.
     void BeginMove(HWND moving) noexcept;
     void ScheduleTopmostRepair(std::wstring_view reason) noexcept;
     void RepairTopmost() noexcept;
@@ -533,7 +529,6 @@ private:
     // What the header's right end shows. The desktop window shows the
     // buttons while the pointer is near and the clock once it is idle; the
     // in-game bitmap cannot be clicked, so it always shows the clock.
-    // AF-20261006-osd-idle-clock.
     // GameClock is the in-game copy: the clock, and no OVL badge, since that
     // copy is the overlay.
     enum class HeaderMode { Controls, Clock, GameClock };
@@ -562,10 +557,9 @@ private:
     static constexpr UINT kFollowupTopmostRepairDelayMs = 1'200;
 
     HWND notification_window_{nullptr};
-    // AF-20261008-overlay-embedded-osd: see SetSuppressed.
+    // See SetSuppressed.
     bool suppressed_{};
     bool wanted_while_suppressed_{};
-    // AF-20261008-overlay-o-button.
     OverlayMark overlay_mark_{OverlayMark::None};
     std::uint64_t overlay_refusal_until_ms_{};
     compact::Gesture overlay_gesture_;

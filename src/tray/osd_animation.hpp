@@ -115,7 +115,7 @@ inline constexpr std::uint64_t kSweepPeriodMs = 1200;
     return 0.0F;
 }
 
-// Spin (AF-20261008-overlay-o-installing): the O turns once a second, and its
+// Spin: the O turns once a second, and its
 // colour moves from where it starts towards the overlay's yellow as t/(t+2),
 // scaled so it never arrives -- an attach has no known length, so the ring must
 // not claim to be done. Full yellow is the static O drawn once it is.

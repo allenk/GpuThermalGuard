@@ -1,52 +1,31 @@
 #pragma once
-#include "os/win32/thread_transaction.h"
+#include <splice/engine.h>
 
 namespace gtg::research {
-template <class Plan>
-bool OneInstructionEntry(const Plan& plan) noexcept {
-    if (plan.copy_size() != 5) return false;
-    const auto address = reinterpret_cast<std::uintptr_t>(plan.target());
+// This product refuses to patch its two hottest targets unless the patch
+// window is a single instruction, so that no thread can be *inside* the bytes
+// being replaced: it is either at the entry or past all of them.
+//
+// That is stricter than splice requires -- the coordinated tier maps an
+// interior program counter through the site's instruction-boundary map rather
+// than refusing it -- and the stricter rule stays here on purpose. Relaxing a
+// safe-admission rule is a decision recorded on this side, and a library that
+// answered "may I patch this?" with this product's policy baked in would be
+// deciding it in the wrong repository.
+//
+// splice reports the facts; this is the policy over them.
+inline bool OneInstructionEntry(const splice_prologue_facts& facts,
+                                std::uintptr_t address) noexcept {
+    if (facts.patch_bytes != 5) return false;
     if ((address & 7) != 0) return false;
-    for (std::uintptr_t offset = 1; offset < 5; ++offset) {
-        std::uintptr_t mapped{};
-        if (plan.map_ip(address + offset, mapped)) return false;
-    }
-    return true;
+    return facts.interior_boundaries == 0;
 }
 
-// Recovery uses retained handles and saved contexts. No allocation, logging,
-// loader or application lock. Failure preserves state for the next attempt.
-template <class Ops>
-bool RecoverEnlisted(std::span<splice::os::win32::ThreadSlot> slots,
-                     splice::os::win32::TransactionStage stage, bool published, void* target,
-                     Ops& ops, bool& counts_uncertain) noexcept {
-    using splice::os::win32::TransactionStage;
-    if (stage == TransactionStage::rollback) {
-        if (published) return false;
-        bool restored = true;
-        for (auto& slot : slots) {
-            if (!slot.context_attempted) continue;
-            if (!ops.set(slot.handle, slot.saved))
-                restored = false;
-            else
-                slot.context_attempted = false;
-        }
-        if (!restored) return false; // Do not resume a partially restored set.
-    } else if (stage != TransactionStage::flush && stage != TransactionStage::resume)
-        return false;
-    if (published && !ops.flush(target)) return false;
-    bool resumed = true;
-    for (std::size_t i = slots.size(); i != 0; --i) {
-        auto& slot = slots[i - 1];
-        if (!slot.suspended) continue;
-        slot.resume_result = ops.resume(slot.handle);
-        if (slot.resume_result == MAXDWORD) {
-            resumed = false;
-            continue;
-        }
-        slot.suspended = false;
-        if (slot.resume_result != slot.prior_suspend + 1) counts_uncertain = true;
-    }
-    return resumed && !counts_uncertain;
-}
-} // namespace gtg::research
+// RecoverEnlisted is gone. It drove a Sleep(1) retry loop over a transaction
+// that had failed part-way and left threads suspended, and it existed because
+// the primitive underneath could end in that state with no way back. The
+// coordinated transaction reports `recovered` -- the writes undone before any
+// thread resumed -- or `lost`, which is the one outcome a caller must decide
+// something about and which no loop here can repair. Neither needs a caller
+// side recovery pass.
+}  // namespace gtg::research

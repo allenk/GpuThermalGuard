@@ -352,7 +352,7 @@ bool DrawOverlayFrame(IDXGISwapChain* swap_chain) {
         ImDrawList* fg = ImGui::GetForegroundDrawList();
         // The bitmap is BGRA with straight alpha, which is what ImGui's default
         // blend state (SrcAlpha, InvSrcAlpha) expects -- the reason
-        // AF-20260926-single-rasteriser gave RenderToBitmap an AlphaMode at all.
+        // RenderToBitmap has an AlphaMode at all.
         // White tint; the selected bitmap view decodes RGB for sRGB targets.
         // Alpha remains straight and is never gamma converted.
         if (drawing) {

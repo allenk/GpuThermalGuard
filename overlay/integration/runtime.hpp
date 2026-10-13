@@ -18,7 +18,7 @@ struct Status {
 
 Status GetStatus() noexcept;
 // Whether the desktop OSD steps aside while a drawing session's game is in
-// front (AF-20261008-overlay-embedded-osd). On by default.
+// front. On by default.
 void SetHidesOsd(bool hides) noexcept;
 int HelperMain(const wchar_t* inherited_mapping) noexcept;
 }  // namespace gtg::overlay::integration

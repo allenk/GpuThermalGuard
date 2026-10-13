@@ -1,5 +1,4 @@
 #include "install_diagnostics.hpp"
-#include "install_thread_ops.hpp"
 #include "native_thread_snapshot.hpp"
 #include <cstdio>
 #include <stdexcept>
@@ -25,30 +24,6 @@ struct FakeSites {
         }
         legacy_stage = 10;
         return SiteResult::kInstalled;
-    }
-};
-
-struct FakeNative {
-    DWORD resume_value{MAXDWORD};
-
-    DWORD suspend(HANDLE) {
-        SetLastError(ERROR_ACCESS_DENIED);
-        return MAXDWORD;
-    }
-
-    DWORD resume(HANDLE) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return resume_value;
-    }
-
-    bool get(HANDLE, CONTEXT&) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return false;
-    }
-
-    bool set(HANDLE, const CONTEXT&) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return false;
     }
 };
 
@@ -91,61 +66,17 @@ int main() {
                 }
             }
         }
-        InstallSite native_site{};
-        splice::os::win32::ThreadSlot slot{};
-        slot.handle = reinterpret_cast<HANDLE>(1);
-        slot.id = 123;
-        InstallThreadOps<FakeNative> ops{native_site, std::span(&slot, 1)};
-        Check(ops.resume(slot.handle) == MAXDWORD, "native resume failure forwarded");
-        Check(native_site.primary.operation == InstallOperation::Resume &&
-                  native_site.primary.error == ERROR_INVALID_HANDLE,
-              "first resume failure retains native primary error");
-        native_site = {};
-        Check(ops.suspend(slot.handle) == MAXDWORD, "native suspend forwarded");
-        SetLastError(0);
-        CONTEXT context{};
-        Check(!ops.get(slot.handle, context), "native context forwarded");
-        Check(native_site.primary.operation == InstallOperation::Suspend &&
-                  native_site.primary.error == ERROR_ACCESS_DENIED &&
-                  native_site.primary.tid == 123,
-              "adapter preserves first native error and thread");
-        native_site = {};
-        std::atomic<void*> unpublished{};
-        InstallThreadOps<FakeNative> abort_ops{native_site, std::span(&slot, 1)};
-        abort_ops.publication = &unpublished;
-        abort_ops.resume(slot.handle);
-        Check(native_site.primary.operation == InstallOperation::None &&
-                  native_site.cleanup.operation == InstallOperation::Resume,
-              "abort cleanup is not fabricated as initiating cause");
-        native_site = {};
-        abort_ops.native.resume_value = 0;
-        Check(abort_ops.resume(slot.handle) == 0 &&
-                  native_site.cleanup.operation == InstallOperation::Resume &&
-                  native_site.cleanup.reason == 1 && !native_site.cleanup.error_valid &&
-                  native_site.cleanup.tid == 123,
-              "successful resume count mismatch retains semantic thread evidence");
-        Check(native_site.cleanup.expected_count == 1 && native_site.cleanup.observed_count == 0,
-              "resume count values retained");
-        native_site = {};
-        context.Rip = slot.saved.Rip;
-        Check(!abort_ops.set(slot.handle, context) &&
-                  native_site.primary.operation == InstallOperation::None &&
-                  native_site.cleanup.operation == InstallOperation::RestoreContext &&
-                  native_site.cleanup.tid == 123,
-              "rollback native error stays cleanup, not migration cause");
-        std::vector<splice::os::win32::ThreadSlot> indexed_slots(4096);
-        for (std::size_t i = 0; i < indexed_slots.size(); ++i) {
-            indexed_slots[i].handle = reinterpret_cast<HANDLE>(2 * (4096 - i));
-            indexed_slots[i].id = static_cast<DWORD>(i + 1);
-        }
-        InstallThreadOps<FakeNative> indexed_ops{native_site, indexed_slots};
-        for (const auto& indexed_slot : indexed_slots)
-            Check(indexed_ops.Id(indexed_slot.handle) == indexed_slot.id,
-                  "full capacity sorted handle index preserves slot identity");
-        Check(indexed_ops.Id(nullptr) == 0, "unknown handle lookup");
+        // The block that stood here drove InstallThreadOps -- the decorator that
+        // wrapped splice's compile-time Ops seam to find out which operation had
+        // failed on which thread. The coordinated transaction reports that in
+        // splice::Failure, so there is no seam left to wrap and the decorator is
+        // gone. Nothing else in this file depended on it: the layout pins above,
+        // the staged-attach matrix, and the publication, identity, version and
+        // bounds cases below are unchanged and still the detectors they were.
         for (DWORD site = 0; site < 7; ++site) {
             for (auto operation : {InstallOperation::Collect, InstallOperation::Protect}) {
-                InstallDiagnostics data{kInstallMagic, 1, sizeof(InstallDiagnostics), 42, 99};
+                InstallDiagnostics data{kInstallMagic, kInstallDiagnosticsVersion,
+                                        sizeof(InstallDiagnostics), 42, 99};
                 InstallReport report{};
                 report.site_count = 7;
                 report.failed_site = site;
@@ -172,11 +103,20 @@ int main() {
                 Check(!ReadInstallReport(data, 43, 99, read) &&
                           !ReadInstallReport(data, 42, 100, read),
                       "identity mismatch");
-                data.version = 2;
+                // This case caught the version bump the moment it landed: it
+                // used to write 2 and expect a refusal, and 2 is now the
+                // valid version. Written against the constant so the next
+                // bump cannot quietly make it assert nothing.
+                data.version = kInstallDiagnosticsVersion + 1;
                 Check(!ReadInstallReport(data, 42, 99, read), "mixed version refused");
+                data.version = kInstallDiagnosticsVersion - 1;
+                Check(!ReadInstallReport(data, 42, 99, read),
+                      "the previous version is refused too, because its stage and "
+                      "outcome numbers mean something else");
             }
         }
-        InstallDiagnostics pending{kInstallMagic, 1, sizeof(InstallDiagnostics), 42, 99};
+        InstallDiagnostics pending{kInstallMagic, kInstallDiagnosticsVersion,
+                                   sizeof(InstallDiagnostics), 42, 99};
         InstallReport read{};
         Check(!ReadInstallReport(pending, 42, 99, read), "pending reader");
         pending.complete = -1;

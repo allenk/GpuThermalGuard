@@ -1,5 +1,4 @@
 // The embedded-OSD rule, one check per case the owner listed on 2026-10-08.
-// AF-20261008-overlay-embedded-osd.
 #include "embed_policy.hpp"
 
 #include <array>
@@ -46,7 +45,7 @@ int main() {
     Check(OverlayOwnsForeground(four, other_game), "four sessions: another drawing game");
     Check(!OverlayOwnsForeground(four, Identity{4000, 1}), "four sessions: installing one");
 
-    // Timing is measured on the foreground (AF-20261008-overlay-o-button).
+    // Timing is measured on the foreground.
     ForegroundSettle f;
     Check(!f.Settled(1000, 10'000), "a new foreground is not settled");
     Check(!f.Settled(1000, 10'499), "499 ms is not settled");

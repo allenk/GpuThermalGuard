@@ -2,6 +2,11 @@ target_sources(GpuThermalGuard PRIVATE runtime.cpp helper.cpp ../injector/target
 target_compile_definitions(GpuThermalGuard PRIVATE GTG_FEATURE_OVERLAY GTG_FEATURE_ATTACH
     GTG_FOREGROUND_OVERLAY)
 
+# GUID data symbols only: CLSID_D3D12SDKConfiguration is declared with
+# DEFINE_GUID, so selecting a target's own runtime needs its definition at link
+# time. There is no dxguid.dll and the import table is unchanged.
+target_link_libraries(GpuThermalGuard PRIVATE dxguid)
+
 # Discovery is dynamic in the helper; no graphics import is added to GTG.
 find_package(imgui CONFIG REQUIRED)
 
@@ -62,6 +67,23 @@ if(BUILD_TESTING)
     target_link_libraries(gtg_overlay_color_choice_test PRIVATE gtg_build_options advapi32)
     add_test(NAME gtg_overlay_color_choice COMMAND gtg_overlay_color_choice_test)
 
+    add_executable(gtg_overlay_startup_failure_test startup_failure_test.cpp)
+    target_link_libraries(gtg_overlay_startup_failure_test PRIVATE gtg_build_options)
+    add_test(NAME gtg_overlay_startup_failure COMMAND gtg_overlay_startup_failure_test)
+
+    add_executable(gtg_overlay_runtime_image_identity_test runtime_image_identity_test.cpp)
+    target_link_libraries(gtg_overlay_runtime_image_identity_test PRIVATE gtg_build_options)
+    add_test(NAME gtg_overlay_runtime_image_identity COMMAND
+        gtg_overlay_runtime_image_identity_test)
+
+    add_executable(gtg_overlay_runtime_export_test runtime_export_test.cpp)
+    target_link_libraries(gtg_overlay_runtime_export_test PRIVATE gtg_build_options)
+    add_test(NAME gtg_overlay_runtime_export COMMAND gtg_overlay_runtime_export_test)
+
+    add_executable(gtg_overlay_runtime_core_test runtime_core_test.cpp)
+    target_link_libraries(gtg_overlay_runtime_core_test PRIVATE gtg_build_options)
+    add_test(NAME gtg_overlay_runtime_core COMMAND gtg_overlay_runtime_core_test)
+
     add_executable(gtg_overlay_install_diagnostics_test ../injector/install_diagnostics_test.cpp)
     target_link_libraries(gtg_overlay_install_diagnostics_test PRIVATE gtg_build_options)
     target_include_directories(gtg_overlay_install_diagnostics_test PRIVATE
@@ -101,7 +123,11 @@ if(BUILD_TESTING)
         ../injector/target_attach.cpp)
     target_compile_definitions(gtg_overlay_d3d12_product_hook_test PRIVATE GTG_FEATURE_ATTACH
         GTG_FOREGROUND_OVERLAY)
-    target_link_libraries(gtg_overlay_d3d12_product_hook_test PRIVATE gtg_build_options)
+    target_link_libraries(gtg_overlay_d3d12_product_hook_test PRIVATE gtg_build_options dxguid)
+    # The success assertions name Splice's own enumerators rather than the
+    # numbers they happen to have; headers only, like the diagnostics test.
+    target_include_directories(gtg_overlay_d3d12_product_hook_test PRIVATE
+        ../../third_party/splice/include)
     set(GTG_OVERLAY_OWNED_D3D12_GENERATOR "" CACHE FILEPATH
         "Owned generator for opt-in remote D3D12 acceptance")
     set(GTG_OVERLAY_OWNED_D3D11_GENERATOR "" CACHE FILEPATH
@@ -208,7 +234,7 @@ if(BUILD_TESTING)
         ../../src/net/estats_win32.cpp ../../src/fps/dxgi_observer.cpp)
     target_include_directories(gtg_overlay_runtime_test PRIVATE ../../src)
     target_link_libraries(gtg_overlay_runtime_test PRIVATE gtg_core gtg_telemetry gtg_build_options
-        wtl gdiplus wtsapi32 dwmapi advapi32 user32 gdi32 shell32 tdh comctl32)
+        wtl gdiplus wtsapi32 dwmapi advapi32 user32 gdi32 shell32 tdh comctl32 dxguid)
     add_test(NAME gtg_overlay_runtime COMMAND gtg_overlay_runtime_test)
     set_tests_properties(gtg_overlay_runtime PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
 endif()

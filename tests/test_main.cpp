@@ -11,6 +11,7 @@
 #include "tray/osd_compact.hpp"
 #include "tray/osd_placement.hpp"
 #include "tray/trip_markers.hpp"
+#include "tray/timeline_track.hpp"
 #include "tray/hotkey_capture.hpp"
 #include "core/working_power_apply.hpp"
 #include "core/restore_prompt_gate.hpp"
@@ -154,7 +155,7 @@ void TestOsdCompact() {
     }
 }
 
-// The backend label as AF-20260925-fps-backend-and-resolution defines it: the
+// The backend label as the design defines it: the
 // events decide the family, the module list only names it, and a label that
 // cannot be established is the weaker claim, never a guess.
 void TestFpsBackendResolution() {
@@ -201,7 +202,7 @@ void TestFpsBackendResolution() {
             "d3d9 alone without a token is D9");
 }
 
-// AF-20261004-fps-backend-runtime-evidence: under a composition token the
+// Under a composition token the
 // live devices name the runtime; the module rule is the fallback.
 void TestFpsBackendFromRuntimeDevices() {
     using gtg::fps::Backend;
@@ -1495,7 +1496,7 @@ void TestMonitorOnlyWatchesAndNeverWrites() {
             "and still applies safe power at the trigger temperature");
 }
 
-// AF-20261008-overlay-o-installing: the O turns once a second and warms
+// The O turns once a second and warms
 // towards yellow without ever claiming to be done.
 void TestOverlaySpinTurnsAndNeverFinishesEarly() {
     using namespace gtg::tray::animation;
@@ -2794,7 +2795,7 @@ void TestConfigValidation() {
     gtg::ProtectionConfig valid;
     Require(!gtg::ValidateConfig(valid).has_value(), "default config should be valid");
 
-    // Equal was rejected until AF-20260924-monitor-only-and-device-defaults;
+    // Equal was rejected at first;
     // it is now the monitor-only configuration a fresh install starts in.
     valid.safe_power_w = valid.normal_power_w;
     Require(!gtg::ValidateConfig(valid).has_value(), "equal limits are monitor-only, not invalid");
@@ -3879,6 +3880,42 @@ void TestTripMarkers() {
             "bounded, keeping the newest");
 }
 
+void TestHistoryTimelineTrack() {
+    using gtg::tray::TimelineTrack;
+    constexpr std::uint64_t kHour = 3'600'000;
+    constexpr std::uint64_t kView = 300'000;
+    const auto same = [](const double a, const double b) {
+        return std::abs(a - b) < 1e-9;
+    };
+
+    // Long after boot: the track is the hour less one view, newest at the
+    // right, and the thumb is one twelfth of it -- as it has always been.
+    const auto up = TimelineTrack::For(18'000'000, kHour, kView);
+    Require(up.earliest_end == 18'000'000 - (kHour - kView) && up.latest_end == 18'000'000,
+            "the track spans 55 minutes ending now");
+    Require(same(up.ThumbShare(), 1.0 / 12.0), "the thumb is one view against the hour");
+    Require(up.FractionOf(18'000'000) == 1.0 && up.ViewEndAt(1.0) == 18'000'000,
+            "the right end is live");
+    Require(up.ViewEndAt(0.0) == 18'000'000 - (kHour - kView), "the left end is 55 minutes back");
+    Require(same(up.FractionOf(up.ViewEndAt(0.25)), 0.25), "fraction and view end round-trip");
+    Require(up.FractionOf(0) == 0.0 && up.FractionOf(99'000'000) == 1.0,
+            "a view end outside the track is drawn at the nearer end");
+
+    // Ten minutes after boot. The arithmetic this replaces divided by 55
+    // minutes regardless, which put the live thumb at 600'000 / 3'300'000 =
+    // 18 % of the track and pulled every drag to its right back to it.
+    const auto booted = TimelineTrack::For(600'000, kHour, kView);
+    Require(booted.FractionOf(600'000) == 1.0, "following live, the thumb is at the right end");
+    Require(booted.ViewEndAt(1.0) == 600'000 && booted.ViewEndAt(0.0) == 0,
+            "the whole track is draggable, from boot to now");
+    Require(same(booted.FractionOf(300'000), 0.5), "halfway along the track is halfway to boot");
+    Require(same(booted.ThumbShare(), up.ThumbShare()),
+            "the thumb keeps its size early after boot");
+    const auto just_booted = TimelineTrack::For(2'000, kHour, kView);
+    Require(just_booted.FractionOf(2'000) == 1.0 && just_booted.ViewEndAt(0.0) == 0,
+            "two seconds after boot the track still ends at now");
+}
+
 void TestOsdIdleClock() {
     using namespace gtg::tray::compact;
     Require(!HeaderIdle(true, false, 10'000, 0), "pointer over the window is never idle");
@@ -4077,6 +4114,7 @@ int main(int argc, char** argv) {
         {"OsdSnap", TestOsdSnap},
         {"OsdIdleClock", TestOsdIdleClock},
         {"TripMarkers", TestTripMarkers},
+        {"HistoryTimelineTrack", TestHistoryTimelineTrack},
         {"HotkeyCapture", TestHotkeyCapture},
         {"UiThemePreference", TestUiThemePreference},
         {"OverlayPreferences", TestOverlayPreferences},

@@ -76,7 +76,7 @@ public:
     void SetThresholds(int trigger_temperature_c, int safe_power_w,
                        std::optional<double> maximum_power_w);
     // A protection trip at `monotonic_ms` (GetTickCount64), drawn on the
-    // temperature lane only. AF-20261004-main-ui-redesign.
+    // temperature lane only.
     void AddTripMarker(std::uint64_t monotonic_ms);
     // A theme's surface colours; nullopt returns to ChartPalette::System().
     void SetPalette(const std::optional<ChartPalette>& palette) {
@@ -119,7 +119,7 @@ private:
     // client size changes. GDI+ draws straight into this DIB section's memory
     // and WM_PAINT copies it to the window with one BitBlt; drawing through an
     // HDC onto a fresh DDB instead round-tripped every anti-aliased primitive
-    // through the kernel. AF-20261008-history-chart-dib-surface.
+    // through the kernel.
     struct Surface {
         HBITMAP bitmap{};
         void* bits{};

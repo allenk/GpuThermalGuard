@@ -1,5 +1,6 @@
 #include "tray/history_chart.hpp"
 #include "localization/localization.hpp"
+#include "tray/timeline_track.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -25,6 +26,18 @@ Gdiplus::Color ToColor(const COLORREF color, const BYTE alpha = 255) {
 
 double ClampFraction(const double value) {
     return std::clamp(value, 0.0, 1.0);
+}
+
+TimelineTrack TrackAt(const std::uint64_t now, const std::uint64_t visible_ms) {
+    return TimelineTrack::For(now, telemetry::History::kRetainedDurationMs, visible_ms);
+}
+
+// The thumb as the mouse handlers measure it; Paint draws the same width in
+// floating point.
+int ThumbWidthPx(const int track_width, const int dpi, const double share) {
+    const int proportional =
+        static_cast<int>(std::lround(static_cast<double>(track_width) * share));
+    return std::min(track_width, std::max(MulDiv(12, dpi, 96), proportional));
 }
 
 void AddRoundedRectangle(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect,
@@ -121,7 +134,9 @@ RECT HistoryChart::TimelineHitRect() const {
     RECT client{};
     ::GetClientRect(m_hWnd, &client);
     const int dpi = static_cast<int>(GetDpiForWindow(m_hWnd));
-    const int label_width = MulDiv(40, dpi, 96);
+    // The gutter Paint draws the track from. It was 40 here after Paint moved
+    // to 44, so a press landed 4 dip to the left of the thumb under it.
+    const int label_width = MulDiv(44, dpi, 96);
     const int right_padding = MulDiv(6, dpi, 96);
     const int hit_height = MulDiv(11, dpi, 96);
     return {label_width, client.bottom - hit_height,
@@ -130,9 +145,7 @@ RECT HistoryChart::TimelineHitRect() const {
 
 std::uint64_t HistoryChart::EffectiveViewEnd(const std::uint64_t now) const {
     if (follow_live_ || !view_end_ms_) return now;
-    const std::uint64_t scrollable = telemetry::History::kRetainedDurationMs - kVisibleHistoryMs;
-    const std::uint64_t earliest = now > scrollable ? now - scrollable : 0;
-    return std::clamp(*view_end_ms_, earliest, now);
+    return TrackAt(now, kVisibleHistoryMs).Clamp(*view_end_ms_);
 }
 
 void HistoryChart::UpdateViewFromThumbLeft(const int thumb_left,
@@ -140,22 +153,16 @@ void HistoryChart::UpdateViewFromThumbLeft(const int thumb_left,
     const RECT track = TimelineHitRect();
     const int track_width = std::max(1L, track.right - track.left);
     const int dpi = static_cast<int>(GetDpiForWindow(m_hWnd));
-    const int thumb_width = std::max(MulDiv(12, dpi, 96),
-        static_cast<int>(std::lround(
-            static_cast<double>(track_width) * kVisibleHistoryMs /
-            telemetry::History::kRetainedDurationMs)));
+    const TimelineTrack range = TrackAt(now, kVisibleHistoryMs);
+    const int thumb_width = ThumbWidthPx(track_width, dpi, range.ThumbShare());
     const int available = std::max(1, track_width - thumb_width);
     const double fraction = ClampFraction(
         static_cast<double>(thumb_left - track.left) / static_cast<double>(available));
-    if (fraction >= 0.998) {
+    if (range.ScrollableMs() == 0 || fraction >= 0.998) {
         follow_live_ = true;
         view_end_ms_.reset();
     } else {
-        const std::uint64_t scrollable = telemetry::History::kRetainedDurationMs -
-                                         kVisibleHistoryMs;
-        const std::uint64_t earliest = now > scrollable ? now - scrollable : 0;
-        view_end_ms_ = earliest + static_cast<std::uint64_t>(
-            std::llround(fraction * static_cast<double>(scrollable)));
+        view_end_ms_ = range.ViewEndAt(fraction);
         follow_live_ = false;
     }
     Invalidate(FALSE);
@@ -170,16 +177,10 @@ LRESULT HistoryChart::OnLButtonDown(UINT, WPARAM, LPARAM lparam, BOOL&) {
     const std::uint64_t now = GetTickCount64();
     const int track_width = std::max(1L, track.right - track.left);
     const int dpi = static_cast<int>(GetDpiForWindow(m_hWnd));
-    const int thumb_width = std::max(MulDiv(12, dpi, 96),
-        static_cast<int>(std::lround(
-            static_cast<double>(track_width) * kVisibleHistoryMs /
-            telemetry::History::kRetainedDurationMs)));
+    const TimelineTrack range = TrackAt(now, kVisibleHistoryMs);
+    const int thumb_width = ThumbWidthPx(track_width, dpi, range.ThumbShare());
     const int available = std::max(1, track_width - thumb_width);
-    const std::uint64_t scrollable = telemetry::History::kRetainedDurationMs - kVisibleHistoryMs;
-    const std::uint64_t earliest = now > scrollable ? now - scrollable : 0;
-    const double fraction = scrollable == 0 ? 1.0 : ClampFraction(
-        static_cast<double>(EffectiveViewEnd(now) - earliest) /
-        static_cast<double>(scrollable));
+    const double fraction = range.FractionOf(EffectiveViewEnd(now));
     const int current_left = track.left +
         static_cast<int>(std::lround(fraction * static_cast<double>(available)));
     if (x >= current_left && x <= current_left + thumb_width) {
@@ -788,14 +789,11 @@ void HistoryChart::Paint(HDC target, const RECT& bounds) {
     Gdiplus::SolidBrush track_brush(ToColor(palette.track));
     graphics.FillPath(&track_brush, &track_path);
 
-    const Gdiplus::REAL thumb_width = std::max(
-        12.0F * scale, track_rect.Width * static_cast<Gdiplus::REAL>(kVisibleHistoryMs) /
-                           static_cast<Gdiplus::REAL>(telemetry::History::kRetainedDurationMs));
-    const std::uint64_t scrollable = telemetry::History::kRetainedDurationMs -
-                                     kVisibleHistoryMs;
-    const std::uint64_t earliest_end = live_now > scrollable ? live_now - scrollable : 0;
-    const double thumb_fraction = scrollable == 0 ? 1.0 : ClampFraction(
-        static_cast<double>(view_end - earliest_end) / static_cast<double>(scrollable));
+    const TimelineTrack range = TrackAt(live_now, kVisibleHistoryMs);
+    const Gdiplus::REAL thumb_width = std::min(
+        track_rect.Width,
+        std::max(12.0F * scale, track_rect.Width * static_cast<Gdiplus::REAL>(range.ThumbShare())));
+    const double thumb_fraction = range.FractionOf(view_end);
     const Gdiplus::REAL thumb_x = track_rect.X +
         static_cast<Gdiplus::REAL>(thumb_fraction) * (track_rect.Width - thumb_width);
     const Gdiplus::RectF thumb_rect(

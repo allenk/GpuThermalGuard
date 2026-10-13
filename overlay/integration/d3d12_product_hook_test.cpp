@@ -5,6 +5,7 @@
 #include "../injector/hook_protocol.hpp"
 #include "../injector/install_diagnostics.hpp"
 #include "../injector/renderer_fixture.hpp"
+#include <splice/live.h>
 #include <cstdio>
 #include <algorithm>
 #include <string>
@@ -65,12 +66,20 @@ int GtgFeatureSession(gtg::research::HookSection& section, HANDLE child) noexcep
                   report.failed_site == MAXDWORD && report.installed == report.site_count &&
                   report.site_count == (section.signal_address ? 7U : 1U),
               "owned product complete installation ledger");
+        // Name the enumerators rather than the numbers they happen to have: a
+        // successful coordinated install carries no stage, because it has no
+        // failure to place, and every site reports the one enlistment.
         for (DWORD i = 0; i < report.site_count; ++i)
-            Check(report.sites[i].state == 3 && report.sites[i].transaction_entered &&
-                      report.sites[i].transaction_stage == 10 &&
-                      report.sites[i].primary.operation == InstallOperation::None &&
-                      report.sites[i].cleanup.operation == InstallOperation::None,
-                  "owned native successful site evidence");
+            Check(
+                report.sites[i].state == 3 && report.sites[i].transaction_entered &&
+                    report.sites[i].transaction_stage == static_cast<DWORD>(splice::Stage::none) &&
+                    report.sites[i].transaction_outcome ==
+                        static_cast<DWORD>(splice::State::installed) &&
+                    report.sites[i].threads > 0 &&
+                    report.sites[i].threads == report.sites[0].threads &&
+                    report.sites[i].primary.operation == InstallOperation::None &&
+                    report.sites[i].cleanup.operation == InstallOperation::None,
+                "owned coordinated successful site evidence");
         Check(section.product_backend == (d3d11 ? 1 : 2) && section.product_ready == 1 &&
                   (d3d11 || section.queue_identity) && !section.queue_ambiguous,
               "actual native backend/queue qualification before activation");
@@ -217,8 +226,9 @@ int wmain(int argc, wchar_t** argv) {
     try {
         Check(GetTempPathW(MAX_PATH, temporary) && GetTempFileNameW(temporary, L"gtg", 0, report),
               "temporary report");
+        // Discovery needs the target it is discovering for, so it now happens
+        // once the owned child is running; the objects still outlive the attach.
         ProductMethods methods;
-        Check(methods.Discover(report), "helper product discovery");
         job.value = CreateJobObjectW(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -289,6 +299,7 @@ int wmain(int argc, wchar_t** argv) {
               "owned explicit color choice before attach");
         Check(target.created && ResumeThread(thread.value) != MAXDWORD, "owned child start");
         Sleep(1500);
+        Check(methods.Discover(report, target), "target-aware helper product discovery");
         int result{};
         bool refused{};
         try {

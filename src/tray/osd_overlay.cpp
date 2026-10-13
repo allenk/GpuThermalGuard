@@ -830,7 +830,6 @@ bool OsdOverlay::Initialize(HWND notification_window,
     notification_window_ = notification_window;
     // Through the setter rather than assigning the member: one path in, so the
     // windowless attach and this one cannot drift apart.
-    // AF-20260929-headless-telemetry-attach.
     SetTelemetryHistory(history);
     placement_repaired = false;
     if (m_hWnd != nullptr) return true;
@@ -946,7 +945,7 @@ void OsdOverlay::SetSuppressed(const bool suppressed) {
         suppressed_ = false;
         if (wanted_while_suppressed_) {
             // Only this transition wakes the header, so idle does not flip in
-            // and out during ordinary use (AF-20261008-overlay-o-button).
+            // and out during ordinary use.
             awake_after_overlay_ = true;
             header_idle_ = false;
             SetVisible(true);
@@ -965,8 +964,8 @@ void OsdOverlay::SetOverlayMark(const OverlayMark mark) noexcept {
     overlay_mark_ = mark;
     if (mark == OverlayMark::None) overlay_gesture_.Cancel();
     // The busy indicator is the O while an attach runs: it turns on its own
-    // 33 ms timer over the O, so the dashboard keeps its 500 ms cadence
-    // (AF-20261008-overlay-o-installing). It is shared with cell actions, so
+    // 33 ms timer over the O, so the dashboard keeps its 500 ms cadence.
+    // It is shared with cell actions, so
     // only one started here (action_slot_ < 0) is ever ended here.
     const bool spinning = busy_indicator_.Active() && action_slot_ < 0;
     if (mark == OverlayMark::Installing) {
@@ -1449,7 +1448,7 @@ void OsdBusyIndicator::DrawInto(Gdiplus::Graphics& graphics, const int width,
         // The O, turning, on nothing: this window sits exactly over the O and
         // the dashboard stops drawing its own while it does. The same two
         // arcs as the static O, rotated, warming from the accent towards the
-        // overlay's yellow (AF-20261008-overlay-o-installing).
+        // overlay's yellow.
         const std::uint64_t elapsed = GetTickCount64() - started_ms_;
         const float warmth = animation::SpinWarmth(elapsed);
         const auto mix = [warmth](const BYTE from, const BYTE to) {
@@ -2539,7 +2538,7 @@ bool OsdOverlay::RenderToBitmap(const float scale,
         graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
 
         // A game cannot click the header, so its copy always shows the
-        // clock (AF-20261006-osd-idle-clock). Only the header differs from
+        // clock. Only the header differs from
         // the desktop window's pixels.
         DrawSurface(graphics, layout, now_ms, HeaderMode::GameClock);
 
@@ -2921,7 +2920,7 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
     const float dot_left = compact::StatusDotLeftDip(show_title) * s;
     graphics.FillEllipse(&dot, dot_left, 9.0F * s, 6.0F * s, 6.0F * s);
     float status_left = 58.0F * s;
-    // The overlay's O (AF-20261008-overlay-o-button). In the game's own copy
+    // The overlay's O. In the game's own copy
     // it is always yellow: that game has the overlay. On the desktop it says
     // what pressing it would do for the program in front -- indigo, attach;
     // yellow, live -- and flashes red when that program cannot take one.

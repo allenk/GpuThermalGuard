@@ -122,7 +122,7 @@ HICON LoadDpiIcon(HWND control, const UINT resource_id, const int size_dip) {
 }
 
 // Both shapes, each under its own name: OsdX/OsdY for expanded, CompactX/
-// CompactY for collapsed (AF-20261004-main-ui-redesign).
+// CompactY for collapsed.
 bool SaveOsdWindowPosition(const OsdOverlay& overlay,
                            const std::wstring_view reason) noexcept {
     if (!ReadWindowPosition(overlay.m_hWnd)) return false;
@@ -189,7 +189,7 @@ bool RestoreOsdWindowPosition(HWND notification_window,
     return true;
 }
 
-// One EXE serves both downloads (AF-20261006-overlay-default-on): the
+// One EXE serves both downloads: the
 // overlay exists only when gtg_overlay.dll is beside the executable. Asked
 // once; adding the DLL takes a restart.
 bool OverlayDllPresent() noexcept {
@@ -1252,8 +1252,7 @@ LRESULT MainDialog::OnValidateSettings(WORD, WORD, HWND, BOOL&) {
     // temperature. At or above slowdown a trigger cannot pre-empt anything --
     // the firmware is already throttling -- and pre-empting it is the whole
     // premise of this tool. That does permit a trigger above the vendor's
-    // stated maximum operating temperature; it is the owner's decision, and
-    // the reasoning is in AF-20260924-monitor-only-and-device-defaults.
+    // stated maximum operating temperature; it is the owner's decision.
     if (gpu_slowdown_temperature_c_ &&
         candidate.trigger_temperature_c >=
             static_cast<int>(*gpu_slowdown_temperature_c_)) {

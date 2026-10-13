@@ -167,7 +167,7 @@ endif()
 target_link_options(GpuThermalGuard PRIVATE /MANIFESTUAC:NO)
 
 include(CTest)
-# On by default (AF-20261006-overlay-default-on): the in-game overlay is part
+# On by default: the in-game overlay is part
 # of GTG. gtg_overlay.dll is built beside the EXE; the EXE shows its overlay
 # controls only when that DLL is present, so one EXE serves both downloads.
 # imgui comes from vcpkg (vcpkg.json, x64-windows-static). OFF builds need
@@ -250,7 +250,7 @@ if(MSVC)
 endif()
 
 # ─── darkmodelib: the main window's dark theme ─────────────────────────────
-# Static, /MT, into GpuThermalGuard.exe (AF-20261004-main-ui-redesign). MPL-2.0;
+# Static, /MT, into GpuThermalGuard.exe. MPL-2.0;
 # the sources are used as published. Only src/tray/ui_theme.cpp includes it.
 set(GTG_DMLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/darkmodelib")
 if(NOT EXISTS "${GTG_DMLIB_DIR}/src/Darkmodelib.cpp")

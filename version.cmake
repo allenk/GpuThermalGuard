@@ -13,6 +13,6 @@
 # line -- see src/resources/gtg_version.h.in and
 # src/resources/GpuThermalGuard.manifest.in -- so they cannot disagree with it.
 #
-# To release: change this line and add a CHANGELOG.md section. That is the
-# whole list.
-set(GTG_VERSION 1.0.0)
+# To release: change this line, the "version" in vcpkg.json, and add a
+# CHANGELOG.md section. The release validation compares all three with the tag.
+set(GTG_VERSION 1.1.0)

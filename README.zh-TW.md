@@ -11,7 +11,14 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 ![GTG 面板畫在 4K 的 Direct3D 12 遊戲畫面內：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS，頂部是時鐘，FPS 卡上顯示已玩 19 分鐘](docs/images/overlay-dx12-4k.jpg)
 
-## 1.0 新功能
+## 1.1 新功能
+
+- **自帶 Direct3D 12 runtime 的遊戲，現在也掛得上 overlay。** 有些遊戲會把 Agility SDK 的 `D3D12Core.dll` 放在自己的資料夾裡。GTG 以前從 Windows 內建的 runtime 算出 overlay 要用的 Direct3D 12 進入點，偏偏那不是這些遊戲實際在跑的那一份，結果 O 閃紅色、掛不上去。現在改從遊戲真正載入的 runtime 去算（[做法](#運作方式)）。
+- **附加一次，只暫停一次。** 在 Direct3D 12 上，overlay 要裝七個 hook。以前是一個一個裝，每裝一個就把遊戲的執行緒暫停一次；[Splice](https://github.com/allenk/splice) 1.2 把七個當成一次 transaction 安裝，遊戲的執行緒只暫停一次，七個要嘛一起裝上，要嘛一個都不裝。
+- **附加失敗會說原因。** EXE 旁邊的 `GpuThermalGuard-overlay-startup.log` 現在會記下附加被拒絕的原因，不再只有一個錯誤碼。
+- **修正：開機後第一個小時的歷史時間軸。** 電腦開機未滿 55 分鐘時，跟著即時資料走的時間軸 thumb 會停在軌道中段，拖曳也只能在一小段範圍內移動。
+
+## 1.0 加入的功能
 
 - **遊戲內 Overlay。** 面板直接畫在 Direct3D 11 與 Direct3D 12 遊戲的畫面裡，在獨佔全螢幕與無邊框全螢幕下也看得到，桌面視窗做不到這一點。在你按下 Overlay 熱鍵之前，不會注入任何東西。以 [Splice](https://github.com/allenk/splice) 打造。
 - **Overlay 熱鍵。** 預設 `Alt`+`F10`，錄製方式參考 PowerToys，並向 Windows 檢查是否與其他程式衝突。
@@ -54,6 +61,8 @@ EXE 旁邊沒有 `gtg_overlay.dll` 時，Overlay 相關設定不會顯示，也�
 
 1. 主視窗的 **Overlay** 預設勾選。它只註冊熱鍵，不注入任何東西。
 2. 讓遊戲在前景，按下熱鍵（或點桌面 OSD 上的 O）。GTG 會啟動一個短命的 helper（同一支 EXE），先檢查目標：必須是你這個 session 裡原生的 64 位元行程，不是系統或關鍵行程、不在 Windows 目錄底下、也不是 GTG 自己；接著**在自己的行程裡**算出 Direct3D 的進入點，完全不碰遊戲；全部通過後，才把 `gtg_overlay.dll` 載入遊戲。我們實測時，面板在一秒內就出現。
+
+   遊戲若自帶 Direct3D 12 runtime，會多一個步驟。helper 先找出遊戲載入的那個 `D3D12Core.dll`（必須剛好一個，否則拒絕），離線確認它是 Microsoft 簽章，再**只載入 helper 自己的行程**，用遊戲實際在跑的同一個 runtime 算出進入點。遊戲自己的選擇一律不動；沒有自帶 runtime 的遊戲，走的還是原來的路。
 3. 在同一個遊戲裡再按一次熱鍵隱藏 overlay，再按一次顯示。
 4. 最多可以**同時有四個遊戲**掛著 overlay，各自是獨立的 session。
 5. 前景程式無法掛上 overlay 時，O 會閃一下紅色。這個程式在執行期間不會再被嘗試，也不會占用四個名額之一。
@@ -100,7 +109,7 @@ OSD 永遠不會搶走鍵盤焦點，所以點 O 作用的對象，就是你剛�
 
 ### 以 Splice 打造
 
-Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫面的路徑。Splice 是同一位作者開發的跨平台、型別安全的 C++ hook 函式庫。把 hook 安裝進一個 render thread 可能正在執行那段被替換程式碼的行程，是最困難的情況，而 Splice 1.1 大部分就是為此而做：透過鄰近 relay 達成原子性的五位元組安裝、嚴格的精確位置安裝，以及協調那些卡在被修補程式碼裡的執行緒。Splice 是本 repository 的 submodule，寫進遊戲的程式碼任何人都能檢視。
+Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫面的路徑。Splice 是同一位作者開發的跨平台、型別安全的 C++ hook 函式庫。把 hook 安裝進一個 render thread 可能正在執行那段被替換程式碼的行程，是最困難的情況，Splice 就是被這個情況磨出來的：透過鄰近 relay 達成原子性的五位元組安裝、嚴格的精確位置安裝、協調那些卡在被修補程式碼裡的執行緒，以及 1.2 起把一組 hook 當成一次 transaction 安裝 —— 執行緒只列舉一次、只暫停一次，全有或全無。這個 overlay 的啟動 log 量到的安裝時間，以及這幾筆樣本的限制，寫在 [Splice 1.2 的說明](https://github.com/allenk/splice#new-in-120)。Splice 是本 repository 的 submodule，寫進遊戲的程式碼任何人都能檢視。
 
 ## 桌面 OSD
 
@@ -244,7 +253,7 @@ Vulkan 與 OpenGL 不會產生 composition token，讀值是送出的影格率�
 
 **主題**清單提供 **自動**（跟隨 Windows 的應用程式模式，GTG 執行中切換也會跟著變）、**深色** 與 **淺色**。淺色就是傳統的 Windows 外觀。高對比模式一律使用系統自己的配色；無法繪製深色控制項的 Windows 版本會退回淺色，不會出現一半深一半淺。深色主題以 [darkmodelib](https://github.com/ozone10/darkmodelib) 繪製，編譯在 EXE 內。
 
-## 為什麼打造這個工具
+## 緣起
 
 這個專案源自一張長時間執行 AI 推理的 RTX PRO 6000 Blackwell Workstation Edition。持續負載下，Windows 偶爾會發生 TDR 或失去 GPU；反覆出現的事故特徵包括：
 
@@ -426,7 +435,7 @@ GTG 維持本機、standalone 設計。獨立 collector 把 GTG log 當作其中
 
 ## 發佈完整性
 
-Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt`，並為兩個套件都發佈 build-provenance attestation。有設定 Authenticode 憑證時，EXE 與 overlay DLL 會先簽章並驗證再封裝。**1.0.0 沒有 Authenticode 簽章**；Release Notes 會說明，壓縮檔改以 checksum 與 attestation 驗證。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
+Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt`，並為兩個套件都發佈 build-provenance attestation。有設定 Authenticode 憑證時，EXE 與 overlay DLL 會先簽章並驗證再封裝。**1.1.0 沒有 Authenticode 簽章**；Release Notes 會說明，壓縮檔改以 checksum 與 attestation 驗證。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
 
 下載 Release 壓縮檔後，可驗證該檔案是否確實由本 Repository 的 GitHub Actions workflow 產生：
 

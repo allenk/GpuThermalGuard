@@ -179,13 +179,12 @@ private:
     LRESULT OnDeepCleanDone(UINT, WPARAM, LPARAM, BOOL&);
     void PersistCompactArrangement();
     LRESULT OnLanguageChanged(WORD, WORD, HWND, BOOL&);
-    // AF-20261004-main-ui-redesign: theme, and the overlay settings that are
+    // Theme, and the overlay settings that are
     // stored but not yet acted on.
     LRESULT OnUiThemeSelected(WORD, WORD, HWND, BOOL&);
     LRESULT OnUiSettingChange(UINT, WPARAM, LPARAM, BOOL&);
     LRESULT OnOverlayToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnOverlayAutoSdr(WORD, WORD, HWND, BOOL&);
-    // AF-20261008-overlay-embedded-osd.
     LRESULT OnOverlayHidesOsd(WORD, WORD, HWND, BOOL&);
     LRESULT OnOverlayHotkey(WORD, WORD, HWND, BOOL&);
     void ApplyUiTheme();

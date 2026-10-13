@@ -8,7 +8,7 @@
 #include "tray/history_chart.hpp"
 
 // The main window's theme: the only file that talks to darkmodelib, so the rest
-// of the tray never includes it. AF-20261004-main-ui-redesign.
+// of the tray never includes it.
 //
 // Light is "classic" -- darkmodelib stays attached but passes every message
 // through, so the window is exactly the one GTG has always drawn. Attaching

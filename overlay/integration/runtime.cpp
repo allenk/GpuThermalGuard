@@ -105,7 +105,7 @@ struct Runtime {
     int hotkey{};
     unsigned modifiers{}, key{};
     std::array<std::unique_ptr<Session>, 4> sessions;
-    // AF-20261008-overlay-embedded-osd: the desktop OSD steps aside while a
+    // The desktop OSD steps aside while a
     // drawing session's game is in front.
     bool hides_osd{true};
     ForegroundSettle settle;
@@ -234,7 +234,7 @@ ColorConsent AskColorConsent(HANDLE target, DWORD pid) {
 }
 
 // False when the program in front cannot take an overlay, or attaching
-// was refused; the caller shows that (AF-20261008-overlay-o-button).
+// was refused; the caller shows that.
 bool TryPress() {
     struct ChoiceGuard {
         ChoiceGuard() { runtime.choosing = true; }

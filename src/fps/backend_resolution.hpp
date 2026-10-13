@@ -17,7 +17,7 @@ struct LoadedRuntimes {
 };
 
 // The D3D devices alive in the target, from the D3D11 and D3D12 runtimes' own
-// ETW providers (AF-20261004-fps-backend-runtime-evidence). Unlike a module
+// ETW providers. Unlike a module
 // list, a live device is something the program made: a measured DX11 game loads d3d12.dll and
 // its own Agility SDK yet never creates a D3D12 device.
 struct RuntimeDevices {

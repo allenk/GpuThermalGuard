@@ -5,7 +5,6 @@
 #include <optional>
 
 // When protection tripped, for the main window's temperature lane.
-// AF-20261004-main-ui-redesign.
 //
 // In memory only, like the curves the markers sit on: the history does not
 // survive a restart, so a persisted marker would have nothing to mark.

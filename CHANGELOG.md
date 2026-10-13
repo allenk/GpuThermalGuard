@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-14
+
+GpuThermalGuard 1.1: the overlay reaches games that bring their own Direct3D 12 runtime, and attaches in one step.
+
+### Added
+
+- **The overlay on games that ship their own Direct3D 12 runtime.** Some games carry the Agility SDK's `D3D12Core.dll` beside the system `d3d12.dll` loader. The helper used to work out the queue's entry point from the runtime in Windows, a different binary from the one such a game runs, so the check made before anything is loaded rightly refused the address and the O flashed red. The helper now uses the runtime the game loaded: exactly one `D3D12Core.dll` in the game or it refuses, a Microsoft signature checked offline before the file is loaded, and loaded into the helper's own process only. It changes nothing the game selected and submits no GPU work. A game without its own runtime takes the same path as before.
+- **The reason a failed attach was refused**, written to `GpuThermalGuard-overlay-startup.log` beside the EXE, where there used to be a bare error number.
+
+### Changed
+
+- **The overlay's hooks are installed as one transaction**, through [Splice](https://github.com/allenk/splice) 1.2. On Direct3D 12 the seven hooks used to go in one at a time, each enumerating and suspending the game's threads on its own; now the threads are enumerated and suspended once, and the seven are written together or not at all. In the overlay's startup log the install stage took 125, 188 and 219 ms in three attaches, against 218 ms to 2.4 s in sixteen under 1.0 -- few samples, different games, not a controlled comparison.
+- Splice 1.1 → 1.2, still included as a submodule.
+
+### Fixed
+
+- **The history timeline in the first hour after the computer starts.** Its range began at boot but was divided as if 55 minutes had already passed, so until then the thumb of a chart following live sat part-way along the track, and a drag could move it only within a small part of it. Presses were also measured against a track that began a few pixels left of the one drawn.
+- **A game reached through two paths was refused.** One file can be reached through more than one path -- a package folder and a games library, for instance -- and the overlay compared paths as text, so it refused the very Direct3D runtime the helper had read as if it came from elsewhere. Files are now compared by identity.
+
+### Notes
+
+- **1.1.0 is not Authenticode-signed.** Verify downloads with `SHA256SUMS.txt` and the build-provenance attestation.
+- Unchanged from 1.0: the overlay hides nothing from anti-cheat, so do not use it in protected or competitive online games; Vulkan, OpenGL, Direct3D 9, 32-bit games and HDR are not supported.
+
 ## [1.0.0] - 2026-10-08
 
 GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows how the frame got to the screen.
@@ -172,7 +196,9 @@ GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows 
 - A power-limit write is never reported as successful until the value is read back.
 - Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
-[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/allenk/GpuThermalGuard/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.13.0...v1.0.0
 [0.13.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.11.0-beta.1...v0.12.0
 [0.11.0-beta.1]: https://github.com/allenk/GpuThermalGuard/compare/v0.10.0-beta.1...v0.11.0-beta.1

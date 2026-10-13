@@ -1,6 +1,6 @@
 {
   "name": "gpu-thermal-guard",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "GpuThermalGuard: NVIDIA power-limit thermal guard with an optional in-game overlay",
   "license": "MIT",
   "supports": "windows & x64",

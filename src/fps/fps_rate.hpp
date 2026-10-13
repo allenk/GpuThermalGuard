@@ -160,7 +160,7 @@ public:
         // a game's login screen: 42 displayed frames matched out
         // of ~42 000 presents, every one of which PresentMon saw reach the
         // screen. Displayed-wins then held the reading at 2 while the game ran
-        // at 120, and each burst reset the window. AF-20261001-fps-sparse-displayed.
+        // at 120, and each burst reset the window.
         //
         // Sparse needs BOTH a long gap and presents inside it: a 1000 fps menu
         // on a 60 Hz display has ~16 presents per displayed frame but a 16.7 ms
@@ -348,7 +348,7 @@ private:
         displayed_sparse_ = false;
     }
 
-    // AF-20261001-fps-sparse-displayed. A displayed gap longer than this, with
+    // A displayed gap longer than this, with
     // at least kSparseDisplayedPresents presents inside it, means the displayed
     // stream is missing frames rather than the display being slower than the
     // program. 100 ms is six frames at 60 Hz.

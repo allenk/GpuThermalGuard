@@ -11,7 +11,14 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 ![The GTG dashboard drawn inside a Direct3D 12 game at 4K: temperature, power, VRAM, GPU, CPU, RAM, network and FPS, with the wall clock in the header and 19 minutes of play time on the FPS card](docs/images/overlay-dx12-4k.jpg)
 
-## What's new in 1.0
+## What's new in 1.1
+
+- **The overlay reaches games that bring their own Direct3D 12 runtime.** Some games ship the Agility SDK's `D3D12Core.dll` in their own folder. GTG used to work out the overlay's Direct3D 12 entry point from the runtime in Windows, which is not the one those games run, and refused them with a red O. It now works it out from the runtime the game actually loaded ([how](#how-it-works)).
+- **One attach, one pause.** On Direct3D 12 the overlay places seven hooks. They used to go in one at a time, each suspending the game's threads on its own; [Splice](https://github.com/allenk/splice) 1.2 installs them as one transaction, so the game's threads are suspended once and the seven go in together or not at all.
+- **A failed attach says why.** `GpuThermalGuard-overlay-startup.log`, beside the EXE, now records the reason an attach was refused instead of a bare error number.
+- **Fixed: the history timeline in the first hour after the computer starts.** Until the machine had been up for 55 minutes, the thumb of a chart following live sat part-way along the track, and a drag could move it only within a small part of it.
+
+## What 1.0 added
 
 - **In-game overlay.** The dashboard is drawn inside Direct3D 11 and Direct3D 12 games, so it stays visible in exclusive and borderless fullscreen where a desktop window cannot. Nothing is injected until you press the overlay hotkey with a game in front. Built on [Splice](https://github.com/allenk/splice).
 - **Overlay hotkey.** `Alt`+`F10` by default, recorded the way PowerToys records shortcuts, checked against Windows for conflicts.
@@ -54,6 +61,8 @@ A desktop OSD is a window, and a game in exclusive fullscreen -- or one that kee
 
 1. **Overlay** in the main window is checked by default. It registers the hotkey; it injects nothing.
 2. Bring a game to the front and press the hotkey (or click the O on the desktop OSD). GTG starts a short-lived helper (the same EXE), which checks the target -- a native 64-bit process in your session, not a system or critical process, not under the Windows directory, not GTG itself -- works out the Direct3D entry points **in its own process** without touching the game, and only then loads `gtg_overlay.dll` into the game. In our tests the dashboard appears in well under a second.
+
+   A game that carries its own Direct3D 12 runtime gets one more step. The helper finds the `D3D12Core.dll` the game loaded -- exactly one, or it refuses -- checks offline that Microsoft signed it, and loads it into **its own process only**, to work out the entry point from the same runtime the game runs. Nothing the game chose is changed, and a game without its own runtime takes the same path as before.
 3. Press the hotkey again in that game to hide the overlay, and again to show it.
 4. Up to **four games** can carry the overlay at the same time; each has its own session.
 5. If the program in front cannot take the overlay, the O flashes red. That program is not tried again while it runs, and it does not use up one of the four places.
@@ -100,7 +109,7 @@ Press the combination you want; it is shown as keycaps and checked as you type. 
 
 ### Built on Splice
 
-The overlay hooks the game's present path with [Splice](https://github.com/allenk/splice), a cross-platform, type-safe C++ hooking library by the same author. Installing a hook into a process whose render thread may be executing the very bytes being replaced is the hardest case there is, and Splice 1.1 was largely shaped by it: atomic five-byte installs through a nearby relay, strict exact-site installation, and coordination of the threads caught inside the patch. Splice is a submodule of this repository, so the code that writes into the game is open for anyone to read.
+The overlay hooks the game's present path with [Splice](https://github.com/allenk/splice), a cross-platform, type-safe C++ hooking library by the same author. Installing a hook into a process whose render thread may be executing the very bytes being replaced is the hardest case there is, and it shaped Splice: atomic five-byte installs through a nearby relay, strict exact-site installation, coordination of the threads caught inside the patch, and since 1.2 a set of hooks installed as one transaction -- one thread enumeration, one suspension, all or nothing. The [Splice 1.2 notes](https://github.com/allenk/splice#new-in-120) give the install times measured in this overlay's startup log, and the limits of those few samples. Splice is a submodule of this repository, so the code that writes into the game is open for anyone to read.
 
 ## The desktop OSD
 
@@ -240,7 +249,7 @@ It shows `-` during warm-up, across focus changes, and whenever the foreground p
 
 The **Theme** list offers **Auto** (follows the Windows app mode, and switches with it while GTG runs), **Dark** and **Light**. Light is the classic Windows look. High-contrast mode always gets the system's own colours, and a Windows build that cannot draw the dark controls falls back to light rather than half-dark. The dark theme is drawn with [darkmodelib](https://github.com/ozone10/darkmodelib), compiled into the EXE.
 
-## Why I built it
+## How it started
 
 This project started with an RTX PRO 6000 Blackwell Workstation Edition used for sustained AI inference. Under long-running workloads, Windows would occasionally report a TDR or lose the GPU. The recurring incident pattern was difficult to ignore:
 
@@ -429,7 +438,7 @@ Metric cards open a detail view with selectable time ranges and chart scaling. T
 
 ## Release integrity
 
-Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation for both packages. When an Authenticode certificate is configured, the executables and the overlay DLL are signed and verified before packaging. **1.0.0 is not Authenticode-signed**; the release notes say so, and the archives are verified by checksum and attestation instead. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
+Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation for both packages. When an Authenticode certificate is configured, the executables and the overlay DLL are signed and verified before packaging. **1.1.0 is not Authenticode-signed**; the release notes say so, and the archives are verified by checksum and attestation instead. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
 
 After downloading a release archive, verify that its exact bytes were produced by this repository's GitHub Actions workflow:
 

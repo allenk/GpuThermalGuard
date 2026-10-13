@@ -7,7 +7,7 @@
 #include <span>
 
 // Where the OSD goes, as arithmetic with no window in it, so the rules can be
-// tested. AF-20261004-main-ui-redesign.
+// tested.
 namespace gtg::tray::placement {
 
 // Each shape remembers its own top-left.

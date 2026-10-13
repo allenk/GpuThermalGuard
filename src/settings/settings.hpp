@@ -34,7 +34,6 @@ struct OsdPreference {
     int x{};
     int y{};
     // CompactX/CompactY: the collapsed shape's own position.
-    // AF-20261004-main-ui-redesign.
     bool has_compact_position{false};
     int compact_x{};
     int compact_y{};
@@ -145,14 +144,13 @@ struct TriggerTestRun {
 [[nodiscard]] localization::UiLanguage LoadUiLanguagePreference() noexcept;
 [[nodiscard]] bool SaveUiLanguagePreference(localization::UiLanguage language,
                                             std::wstring& error);
-// AF-20261004-main-ui-redesign. The rules live in ui_preferences.hpp.
+// The rules live in ui_preferences.hpp.
 [[nodiscard]] UiTheme LoadUiThemePreference() noexcept;
 [[nodiscard]] bool SaveUiThemePreference(UiTheme theme, std::wstring& error);
 [[nodiscard]] bool LoadOverlayEnabled() noexcept;
 [[nodiscard]] bool SaveOverlayEnabled(bool enabled, std::wstring& error);
 [[nodiscard]] bool LoadOverlayAutoSdr() noexcept;
 [[nodiscard]] bool SaveOverlayAutoSdr(bool enabled, std::wstring& error);
-// AF-20261008-overlay-embedded-osd.
 [[nodiscard]] bool LoadOverlayHidesOsd() noexcept;
 [[nodiscard]] bool SaveOverlayHidesOsd(bool enabled, std::wstring& error);
 [[nodiscard]] OverlayHotkey LoadOverlayHotkey() noexcept;
