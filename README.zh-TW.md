@@ -11,7 +11,16 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 ![GTG 面板畫在 4K 的 Direct3D 12 遊戲畫面內：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS，頂部是時鐘，FPS 卡上顯示已玩 19 分鐘](docs/images/overlay-dx12-4k.jpg)
 
-## 1.1 新功能
+## 1.2 新功能
+
+- **從 GitHub 更新。** GTG 每天檢查一次本 Repository 的 Release，有新版就通知你。你同意之前什麼都不會裝；同意之後，它會挑一個不影響保護的時機更新、重新啟動，新版沒有正常啟動就自動退回原本的版本。區域網路上的共用資料夾也可以取代 GitHub 當更新來源（[更新](#更新)）。
+- **主機（Hosts）。** 同一個網路裡的 GTG 用一次性配對碼配對後，彼此會以第九個項目出現在對方的面板上。主機視窗也能幫它們更新，一台接一台（[主機](#主機)）。
+- **高負載是哪個程式造成的。** GPU、VRAM、CPU 或 RAM 持續偏高時，OSD 會在該項目的曲線上標出造成負載的程式名稱（[高負載程式](#高負載程式)）。
+- **Tiny。** 精簡 OSD 可以收成一格小小的直條圖（[Tiny](#tiny)）。
+- **卡片。** 展開 OSD 可以改用卡片呈現，每張卡有完整讀值和自己的曲線（[卡片](#卡片)）。
+- **Tray 圖示上的紫點**：有新版本等著安裝時出現。
+
+## 1.1 加入的功能
 
 - **自帶 Direct3D 12 runtime 的遊戲，現在也掛得上 overlay。** 有些遊戲會把 Agility SDK 的 `D3D12Core.dll` 放在自己的資料夾裡。GTG 以前從 Windows 內建的 runtime 算出 overlay 要用的 Direct3D 12 進入點，偏偏那不是這些遊戲實際在跑的那一份，結果 O 閃紅色、掛不上去。現在改從遊戲真正載入的 runtime 去算（[做法](#運作方式)）。
 - **附加一次，只暫停一次。** 在 Direct3D 12 上，overlay 要裝七個 hook。以前是一個一個裝，每裝一個就把遊戲的執行緒暫停一次；[Splice](https://github.com/allenk/splice) 1.2 把七個當成一次 transaction 安裝，遊戲的執行緒只暫停一次，七個要嘛一起裝上，要嘛一個都不裝。
@@ -40,6 +49,8 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 | `GpuThermalGuard-<version>-no-overlay-windows-x64.zip` | `GpuThermalGuard.exe` | 確定用不到遊戲內 overlay 的機器 |
 
 EXE 旁邊沒有 `gtg_overlay.dll` 時，Overlay 相關設定不會顯示，也不會註冊熱鍵。之後放入 DLL 並重新啟動 GTG 即可啟用。
+
+從 1.2.5 起，每個 Release 另外附上單獨的 `gtg-update.json`、`GpuThermalGuard.exe` 與 `gtg_overlay.dll`。這三個檔案是給 GTG 的更新功能讀的；要手動安裝請下載 ZIP。1.1.0 沒有更新功能，從 1.1.0 換到 1.2.5 需要手動裝一次。
 
 ## 畫面
 
@@ -139,6 +150,14 @@ Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫�
 
 每個項目各有一條最近 30 秒的滿寬曲線，數值在右側。（擷取自英文介面。）
 
+螢幕高度不夠時，每一列會變矮，OSD 不會自己換成別種樣子。舊版在這種情況下會改成固定的幾張卡片，沒有 RAM、網路，也沒有曲線。
+
+### 卡片
+
+主視窗 OSD 大小旁邊的 **卡片** 勾選後，展開 OSD 改用卡片呈現：一排兩張，照你的排列順序，每張有完整讀值、視窗內的最高值、FPS 的影格來源，以及自己的曲線和門檻線。橫條與卡片用的是同一個視窗，切換時 OSD 不會移動，也不會改變大小。預設不勾選。
+
+改變 OSD 大小時，OSD 的右上角會固定不動，貼在螢幕右緣的 OSD 就會一直貼著。
+
 ### Compact 精簡 OSD
 
 ![精簡 OSD：一排八項即時數值與 30 秒迷你趨勢曲線](docs/images/osd-compact.png)
@@ -156,6 +175,12 @@ Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫�
 （上面兩張排列示意圖擷取自英文介面。）
 
 保護警報與遙測警示仍顯示於頂部；切換模式不會暫停監控或改變保護設定。兩種模式各自記得上次的位置。
+
+### Tiny
+
+精簡 OSD 可以收成頂部下方的一小格：每個項目一根直條，照你的排列順序，下面標著英文首字母 —— `T P G V C R F N`，主機是 `H` —— 不顯示數字。某個項目需要你看一眼時，它的直條會變亮、呼吸：規則跟[高負載程式](#高負載程式)相同，溫度與功率看保護狀態，FPS 則是跟最近的中位數差超過 10 %。
+
+收合鈕是 OSD 底邊正中央的小記號，游標移到 OSD 上才會出現。收合與展開都固定右上角，選擇會記住。遊戲內 overlay 也是同樣的樣子；右上角的箭頭照舊打開展開 OSD。
 
 ### 調整精簡 OSD 的排列
 
@@ -184,6 +209,21 @@ Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫�
 ### 遊戲時間
 
 FPS 卡會顯示你玩了多久，以黃色標在曲線右下角：`42 min`，接著是 `7.2 hr`，最多 `99.9 hr`。只有在遊戲有穩定的影格率時才計時，所以 `Alt`+`Tab`、選單與載入畫面只會暫停，不會歸零。遊戲關掉重開會接著算。正在計時的遊戲超過三分鐘沒有影格率 —— 你換玩別的遊戲，或乾脆不玩了 —— 計時就交給當下正在玩的那個，並把它在這三分鐘裡累積的時間加回去。數值只存在記憶體，GTG 重新啟動就從頭算。
+
+### 高負載程式
+
+GPU、VRAM、CPU 或 RAM 持續偏高時，造成負載的程式名稱會出現在該項目的曲線上，精簡小卡與展開橫條都有。超過門檻八秒才算偏高，降到較低的門檻以下十秒後解除：
+
+| 項目 | 超過 | 降到 |
+| --- | --- | --- |
+| GPU | 70 % | 55 % |
+| VRAM | 70 % | 60 % |
+| CPU | 80 % | 60 % |
+| RAM | 85 % | 75 % |
+
+一般負載下什麼都不顯示。名稱取自程式本身的描述（Windows 顯示語言），沒有就用執行檔名，再縮短：去掉版本號和 `-Win64-Shipping` 這類建置後綴，最多 20 個字。同一個程式的多個行程會合併計算；每個 `svchost` 依它承載的服務命名；WSL 與其他虛擬機直接標成 WSL、虛擬機器；GTG 認不出來的行程一律不標。電腦裝了兩張 NVIDIA 顯示卡時，GPU 與 VRAM 不標名稱，不用猜的。名稱太長時，桌面 OSD 用跑馬燈，遊戲內 overlay 每兩秒換一頁。
+
+主視窗的 **高負載程式** 可以開關（預設開啟）。程式清單每秒讀一次，在低優先權的 thread 上跑，不碰 NVML，也不碰保護迴圈；這個 thread 用掉的 CPU 超過上限時會自己暫停一分鐘。顯示過的名稱會寫進診斷 log。
 
 ### 可選的主機 RAM
 
@@ -249,6 +289,36 @@ Vulkan 與 OpenGL 不會產生 composition token，讀值是送出的影格率�
 
 暖機、切換焦點，以及前景程式根本沒有在上屏的時候會顯示 `-` —— 閒置的程式沒有影格率。曲線上的暗色連接僅維持視覺連續，**不代表該段量到了 FPS**。
 
+## 主機
+
+**主機（Hosts）** 讓同一個區域網路裡的 GTG 互相看到彼此。每一台配對過的機器都會出現在第九個項目 **主機** 裡，這個項目可以跟其他項目一樣排列：精簡 OSD 是一張小卡，最多列四台，每台有溫度、VRAM、GPU、CPU 四根直條，配對超過四台時標出 `4/6` 這樣的數量；展開 OSD 是一條獨立的橫條；Tiny 則是 `H` 那根直條。有警示的主機排在前面。
+
+主機功能預設關閉。從主視窗或 tray 選單打開 **主機...**，勾選 **主機**，然後配對兩台機器：
+
+1. 在其中一台按 **產生配對碼**，畫面會顯示一組 `GTG-` 開頭的配對碼，以及同一組碼的 QR code。配對碼只能用一次，十分鐘內有效。
+2. 在另一台把它貼到 **貼上另一台 GTG 的配對碼**，按 **加入**。
+
+<img src="docs/images/hosts-zh-TW.png" alt="全部更新完成後的主機視窗：兩台配對的主機在線上、版本 1.2.5、顯示已更新，下方是本機的更新來源與更新按鈕，再下方是配對碼和它的 QR code" width="495">
+
+*截圖裡的主機名稱、位址和配對碼都是示範用的。*
+
+配對碼帶著第一台的位址、連接埠和一次性的密鑰；兩台機器據此協商出這一對專用的金鑰（ECDH P-256），以 DPAPI 保存。打錯大小寫、多了空白或連字號、`O` 打成 `0` 這類小錯會自動容錯，真的打錯字則會被檢查碼抓到。最多可以配對 16 台。配對是一對一的：A 分別和 B、C 配對，B 和 C 要自己再配對一次才看得到對方。
+
+**網路上傳了什麼。** 每台機器每秒送一個 UDP 封包給每台配對的主機，內容就是自己面板上顯示的東西 —— 每個項目的讀值與直條、保護狀態、名稱與版本 —— 以 AES-256-GCM 加密，收到後先驗證才讀內容。收到的東西都不能改變任何設定、功率限制或保護狀態，也不經過任何伺服器。只有產生配對碼的那台會在固定連接埠上接收，預設 **29480**（可在主機視窗改成 1024 到 65535），所以 Windows 防火牆的提示只可能出現在那一台。主機結束、登出或進入睡眠時會先告知，顯示為離線；十秒沒有消息則顯示為失聯，這算警示。
+
+### 更新配對的主機
+
+主機視窗會列出每台主機的版本和它的更新進度，也可以要求某台更新到本機來源上的版本：
+
+- **更新** 要求一台更新；**強制更新** 還能重新安裝同一版，或退回較舊的版本（不會低於 1.2.0）。
+- **全部更新** 一次一台：等這台以新版回來，才換下一台；遇到沒有成功的就停下。
+
+被要求的主機從它自己的更新來源安裝，自己做所有檢查，就跟它自己的使用者按了同意一樣。只有那台勾選 **允許其他主機要求這台更新** 時才會接受 —— 預設勾選；只想手動更新的機器請取消勾選。一般的要求 30 分鐘內最多執行一次；強制更新不受這個限制。要求裡只有版本，程式碼一律來自那台主機自己的來源。
+
+### 主機記錄檔
+
+Tray 選單的 **輸出主機記錄檔**（預設關閉）會在診斷 log 旁邊寫 `GpuThermalGuard-hosts.log`：每五秒一行 JSON，內容是這台的主機狀態與每台配對主機的讀值，給同一台電腦上的其他程式讀。檔案上限 1 MiB，另外保留一個舊檔；裡面沒有位址、連接埠、金鑰或配對碼。
+
 ## 主題
 
 **主題**清單提供 **自動**（跟隨 Windows 的應用程式模式，GTG 執行中切換也會跟著變）、**深色** 與 **淺色**。淺色就是傳統的 Windows 外觀。高對比模式一律使用系統自己的配色；無法繪製深色控制項的 Windows 版本會退回淺色，不會出現一半深一半淺。深色主題以 [darkmodelib](https://github.com/ozone10/darkmodelib) 繪製，編譯在 EXE 內。
@@ -287,6 +357,7 @@ Vulkan 與 OpenGL 不會產生 composition token，讀值是送出的影格率�
 - **保存事故證據**：歷史 telemetry、log、觸發次數與溫度歷史上的觸發標記、wall-time 與自動／手動 PNG snapshot。
 - **注入只在你決定時發生**：桌面 OSD 與 FPS 都不注入、不 hook。只有 overlay 會寫進遊戲，而且只寫進前景那個遊戲，只在你按下熱鍵時。
 - **Standalone 部署**：MSVC runtime 靜態連結，不需安裝程式、不需安裝 runtime。`GpuThermalGuard.exe` 只需要 Windows 系統 DLL 與 NVIDIA driver 的 `nvml.dll`；`gtg_overlay.dll` 只需要 Windows 系統 DLL。
+- **網路用得很少**：每天一次 HTTPS 檢查本 Repository 的 Release（可以關掉）；只有開啟主機功能時，才會以 UDP 連到你配對的機器。沒有遙測、不需要帳號，也沒有我們自己的伺服器。
 
 ## 監控內容
 
@@ -301,6 +372,8 @@ Vulkan 與 OpenGL 不會產生 composition token，讀值是送出的影格率�
 - FPS 卡上的遊戲時間
 - 保留一小時 telemetry、可拖曳的固定五分鐘主面板視野
 - 精簡、不搶 focus 的 30 秒 always-on-top OSD，以及畫在 Direct3D 11／12 遊戲內的同一個面板
+- GPU、VRAM、CPU 或 RAM 高負載是哪個程式造成的
+- 區域網路上配對的其他 GTG（主機）
 
 ## 保護流程
 
@@ -332,6 +405,29 @@ Vulkan 與 OpenGL 不會產生 composition token，讀值是送出的影格率�
 
 OSD 在安全功率鎖定期間顯示 **ALERT**，包含等待恢復的階段。延遲的顯示採樣會標記出來，不會默默冒充即時資料；保護核心的遙測中斷另由保護機制處理。
 
+## 更新
+
+GTG 啟動兩分鐘後檢查一次本 Repository 在 GitHub 上的 Release，之後每天一次；檢查失敗時，一小時內會再試。一次檢查就是一個 HTTPS 請求，讀最新 Release 的 `gtg-update.json`，user agent 是 `GpuThermalGuard/<版本>`；不會送出任何關於這台電腦的資料。有新版時，tray 會通知一次，並在圖示上加一個小紫點，直到你更新為止。
+
+你在 tray 選單選 **更新到 <版本>...** 之前，什麼都不會安裝。選了之後，GTG 會：
+
+1. 下載這個 Release 的檔案，逐一比對該 Release `gtg-update.json` 裡列的 SHA-256，存到 EXE 旁邊的 `_gtg_update`，這個資料夾只有系統管理員能寫入；
+2. 等一個不影響保護的時機 —— 保護在待命狀態、GPU 比觸發溫度低至少 15 °C、沒有遊戲正在用 overlay；
+3. 交給編譯在 EXE 裡的一小段 PowerShell 腳本，然後結束自己；腳本替換檔案、啟動新版，保護因此暫停幾秒；
+4. 新版沒有正常啟動，就換回原本的版本。
+
+用 no-overlay 套件安裝的，更新後仍然沒有 `gtg_overlay.dll`。Tray 選單另有 **檢查更新**、**從來源重新安裝 <版本>...** 與 **取消更新**。
+
+**更新信任的是什麼。** 目前的 Release 還沒有 Authenticode 簽章。沒有設定簽章釘選時，更新信任的就是 GitHub 上的這個 Release：透過 HTTPS 連到 GitHub，憑證與撤銷狀態由 Windows 檢查，重新導向只接受 GitHub 自己的主機，每個檔案都要符合該 Release 自己清單裡的 SHA-256 —— 跟你自己下載 ZIP 的信任程度一樣。這些檔案跟 ZIP 一樣有 build-provenance attestation。
+
+Tray 選單的 **更新設定...** 可以調整整台電腦的設定：
+
+- **更新來源。** 留空就是 GitHub。填入 `\\server\share\GTG` 這樣的 UNC 路徑，就改用區域網路上的共用資料夾；`tools/update/publish-update.ps1` 可以把建置好的版本發佈上去。GTG 以系統管理員身分執行，看不到對應的磁碟機代號，所以必須是 UNC 路徑。
+- **自動檢查更新。** 取消勾選後，只有你按 **檢查更新** 時才會檢查。
+- **簽章釘選。** 程式碼簽章憑證的 SHA-256。設定後，只安裝由那張憑證簽署的檔案。GitHub 上的 Release 目前沒有簽章，設了釘選就不會從 GitHub 更新；這是給自己簽署版本的共用資料夾用的。
+
+安裝了 GTG Service（更新還不會替換 service）、Smart App Control 開著（它會擋下新版，連退回舊版也會被擋），或 GTG 是從網路資料夾執行時，GTG 都不會更新。配對的主機可以從主機視窗更新（[更新配對的主機](#更新配對的主機)）。
+
 ## 語言與設定
 
 首次執行預設 English；可從 **語言** 清單切換正體中文。兩種語言都內嵌在 EXE，選擇保存在目前使用者：
@@ -345,6 +441,8 @@ HKCU\SOFTWARE\GpuThermalGuard\UiLanguage
 ```text
 HKLM\SOFTWARE\GpuThermalGuard
 ```
+
+更新設定屬於整台電腦，放在 `HKLM\SOFTWARE\GpuThermalGuard\Update`，所以只有系統管理員能改變 GTG 從哪裡更新。
 
 程式需要系統管理員權限，因為修改 NVIDIA power limit 與寫入機器層級保護設定都需要 elevation。版本號顯示在主視窗的標題列。
 
@@ -391,7 +489,7 @@ out\build\windows-x64-release\gtg_overlay.dll
 out\build\windows-x64-release\GpuThermalGuardProbe.exe
 ```
 
-加上 `-DGTG_FEATURE_OVERLAY=OFF` 可建置不含 overlay 的版本，不需要 vcpkg 與 Splice。`GpuThermalGuardProbe.exe` 是開發用工具，只從原始碼建置，不放進下載檔；它完全唯讀，不會呼叫任何 NVML setter。
+加上 `-DGTG_FEATURE_OVERLAY=OFF` 可建置不含 overlay 的版本，不需要 vcpkg 與 Splice。加上 `-DGTG_FEATURE_UPDATE=OFF` 則建置不含更新功能的版本。`GpuThermalGuardProbe.exe` 是開發用工具，只從原始碼建置，不放進下載檔；它完全唯讀，不會呼叫任何 NVML setter。
 
 ## Log 與 Snapshot
 
@@ -431,11 +529,13 @@ GTG 維持本機、standalone 設計。獨立 collector 把 GTG log 當作其中
 - 尚未提供 installer 或 service 管理 UI。
 - 無法保證攔截所有 TDR、driver reset、感測器突然失效或硬體故障。
 - 遊戲內 overlay 只支援原生 64 位元的 Direct3D 11 與 12 遊戲；不支援 Vulkan、OpenGL、Direct3D 9、32 位元遊戲與 HDR。有 anti-cheat 的遊戲可能拒絕它。
+- 主機功能只在同一個區域網路、透過 IPv4 運作。
+- 安裝了 GTG Service 或 Smart App Control 開著時不會更新；Release 目前還沒有程式碼簽章。
 - 安全功率與觸發溫度必須依實際硬體審慎設定。
 
 ## 發佈完整性
 
-Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt`，並為兩個套件都發佈 build-provenance attestation。有設定 Authenticode 憑證時，EXE 與 overlay DLL 會先簽章並驗證再封裝。**1.1.0 沒有 Authenticode 簽章**；Release Notes 會說明，壓縮檔改以 checksum 與 attestation 驗證。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
+Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt`，並為兩個套件與更新用的檔案都發佈 build-provenance attestation。有設定 Authenticode 憑證時，EXE 與 overlay DLL 會先簽章並驗證再封裝。**1.2.5 沒有 Authenticode 簽章**；Release Notes 會說明，壓縮檔改以 checksum 與 attestation 驗證。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
 
 下載 Release 壓縮檔後，可驗證該檔案是否確實由本 Repository 的 GitHub Actions workflow 產生：
 
@@ -455,4 +555,4 @@ Provenance 驗證不能取代 Authenticode 發行者身分或惡意程式掃描�
 
 ## 授權
 
-GpuThermalGuard 採用 [MIT License](LICENSE)。第三方元件保留各自的授權：WTL（Microsoft Public License）、NVIDIA NVML header（NVIDIA 原始聲明）、darkmodelib（Mozilla Public License 2.0，部分程式碼為 MIT）、Dear ImGui（MIT）與 Splice（MIT）。詳見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+GpuThermalGuard 採用 [MIT License](LICENSE)。第三方元件保留各自的授權：WTL（Microsoft Public License）、NVIDIA NVML header（NVIDIA 原始聲明）、darkmodelib（Mozilla Public License 2.0，部分程式碼為 MIT）、Dear ImGui（MIT）、Splice（MIT）與 QR Code generator library（MIT）。詳見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

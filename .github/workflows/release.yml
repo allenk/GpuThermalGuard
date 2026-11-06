@@ -116,6 +116,7 @@ jobs:
           subject-path: |
             dist/*.zip
             dist/SHA256SUMS.txt
+            dist/update/*
 
       - name: Create GitHub Release
         shell: pwsh
@@ -132,7 +133,11 @@ jobs:
             '--notes-file', 'dist/release-notes.md',
             "dist/GpuThermalGuard-$version-windows-x64.zip",
             "dist/GpuThermalGuard-$version-no-overlay-windows-x64.zip",
-            'dist/SHA256SUMS.txt'
+            'dist/SHA256SUMS.txt',
+            # Read by GTG's updater from the latest release.
+            'dist/update/gtg-update.json',
+            'dist/update/GpuThermalGuard.exe',
+            'dist/update/gtg_overlay.dll'
           )
           # Signing state is in the notes; only a pre-release version is a prerelease.
           if ($tag.Contains('-')) { $arguments += '--prerelease' }

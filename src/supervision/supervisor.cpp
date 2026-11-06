@@ -1,6 +1,9 @@
 #include "supervision/supervisor.hpp"
 #include "supervision/recovery_policy.hpp"
 #include "logging/logger.hpp"
+#ifdef GTG_FEATURE_UPDATE
+#include "update/files.hpp"
+#endif
 
 #include <sddl.h>
 #include <array>
@@ -26,6 +29,10 @@ struct Shared {
     alignas(8) volatile LONG64 heartbeat;
     alignas(8) volatile LONG64 first_sample;
     char uuid[96];
+#ifdef GTG_FEATURE_UPDATE
+    // So the Tray can start an update script with the supervisor as its parent.
+    DWORD supervisor_pid;
+#endif
 };
 Shared* shared_{};  // Attached before starting threads; mapping lives until exit.
 
@@ -51,6 +58,34 @@ void ActivateExisting() noexcept {
         RegisterWindowMessageW(L"GpuThermalGuard.Activate.v1"), 0, 0,
         SMTO_ABORTIFHUNG | SMTO_NORMAL, 1000, &ignored);
 }
+#ifdef GTG_FEATURE_UPDATE
+// While an update script waits on this build, the first ready is its health
+// signal: protection is ready as this supervisor judges it. Written beside the
+// plan and renamed into place, naming this process, which the script started.
+void ReportReadyForUpdate(const std::wstring& executable) noexcept {
+    const std::wstring::size_type slash = executable.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return;
+    const std::wstring work = executable.substr(0, slash + 1) + update::kWorkFolderName + L"\\";
+    const std::wstring plan = work + update::kPlanFileName;
+    if (GetFileAttributesW(plan.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    const std::wstring ready = work + update::kReadyFileName;
+    const std::wstring temporary = ready + L".tmp";
+    const std::string text = std::format("{{\"pid\":{}}}", GetCurrentProcessId());
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written{};
+    const bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written,
+        nullptr) && written == text.size();
+    CloseHandle(file);
+    if (!ok || !MoveFileExW(temporary.c_str(), ready.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        logging::Warning(std::format(L"SUPERVISOR could not report ready for the update (Win32 {})",
+            GetLastError()));
+        return;
+    }
+    logging::Info(L"SUPERVISOR reported ready to the update script");
+}
+#endif
 }
 
 bool AttachChild(const wchar_t* text) noexcept {
@@ -72,6 +107,9 @@ bool AttachChild(const wchar_t* text) noexcept {
     return true;
 }
 bool IsChild() noexcept { return shared_ != nullptr; }
+#ifdef GTG_FEATURE_UPDATE
+DWORD SupervisorPid() noexcept { return shared_ ? shared_->supervisor_pid : 0; }
+#endif
 bool TakeRecoveryLatch() noexcept { return shared_ && InterlockedExchange(&shared_->recovery, 0) != 0; }
 void MarkCleanExit() noexcept {
     if (shared_) InterlockedExchange(&shared_->clean_exit, 1);
@@ -157,6 +195,9 @@ int RunSupervisor(const std::wstring& executable, int show_command, const Superv
     for (;;) {
         *view.value = {};
         view.value->signature = kSignature;
+#ifdef GTG_FEATURE_UPDATE
+        view.value->supervisor_pid = GetCurrentProcessId();
+#endif
         view.value->recovery = recovery;
         memcpy(view.value->uuid, uuid.data(), uuid.size());
         view.value->identity_ready = uuid[0] != 0;
@@ -216,6 +257,9 @@ int RunSupervisor(const std::wstring& executable, int show_command, const Superv
                     logging::Info(std::format(L"SUPERVISOR child pid={} ready outage_ms={}",
                         process.dwProcessId, now - outage_begin));
                     first_ready = true;
+#ifdef GTG_FEATURE_UPDATE
+                    ReportReadyForUpdate(executable);
+#endif
                 }
             }
             const bool clean = InterlockedCompareExchange(&view.value->clean_exit, 0, 0) != 0;

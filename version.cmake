@@ -15,4 +15,4 @@
 #
 # To release: change this line, the "version" in vcpkg.json, and add a
 # CHANGELOG.md section. The release validation compares all three with the tag.
-set(GTG_VERSION 1.1.0)
+set(GTG_VERSION 1.2.5)

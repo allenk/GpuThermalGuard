@@ -1,0 +1,31 @@
+#pragma once
+// Resource identifiers of the updater, compiled from update.rc only when the
+// updater is built. Clear of resource.h's ranges.
+
+#define IDR_APPLY_UPDATE 3001
+
+#define IDD_UPDATE 3100
+#define IDC_UPDATE_SOURCE 3101
+#define IDC_UPDATE_SOURCE_LABEL 3102
+#define IDC_UPDATE_AUTO_CHECK 3103
+#define IDC_UPDATE_PIN 3104
+#define IDC_UPDATE_PIN_LABEL 3105
+#define IDC_UPDATE_THIS_BUILD 3106
+#define IDC_UPDATE_SOURCE_RELEASE 3107
+#define IDC_UPDATE_NOTE 3108
+
+// The update part of the Hosts dialog.
+#define IDC_HOSTS_UPDATE_ALLOW 3120
+#define IDC_HOSTS_UPDATE_SOURCE 3121
+#define IDC_HOSTS_UPDATE_CHECK 3122
+#define IDC_HOSTS_UPDATE_ONE 3123
+#define IDC_HOSTS_UPDATE_FORCE 3124
+#define IDC_HOSTS_UPDATE_ALL 3125
+#define IDC_HOSTS_UPDATE_STOP 3126
+#define IDC_HOSTS_UPDATE_STATUS 3127
+
+#define IDM_TRAY_UPDATE_CHECK 3201
+#define IDM_TRAY_UPDATE_APPLY 3202
+#define IDM_TRAY_UPDATE_REINSTALL 3203
+#define IDM_TRAY_UPDATE_CANCEL 3204
+#define IDM_TRAY_UPDATE_SETTINGS 3205

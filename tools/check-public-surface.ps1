@@ -41,6 +41,10 @@ $forbidden = @(
     @{ Pattern = '(?i)minecraft|dungeons';      Reason = 'a commercial game name' },
     @{ Pattern = '(?i)redemption';              Reason = 'a commercial game name' },
     @{ Pattern = '(?i)kwyport';                 Reason = 'a private remote' },
+    @{ Pattern = '(?i)allenkuo/';               Reason = 'a private remote' },
+    @{ Pattern = '(?i)kwyspace|kworkpc|GTG_Shared|Dev-K'; Reason = 'a private machine or share' },
+    # Tool and agent traces: never in code, comments or anything published.
+    @{ Pattern = '(?i)co-authored-by|claude-session|claude\.ai/code|noreply@anthropic|anthropic\.com|generated (with|by)|\bai-generated\b|\bllm\b|\bclaude\b|\bcodex\b|chatgpt|\bgpt-\d|copilot|\bopus\b|\bsonnet\b|claude\.md|agents\.md|\.claude/|\.codex/|review-relay|review forge|\brfg-\d|\bbl-\d{3}\b|\baf-\d{8}'; Reason = 'a tool or agent trace' },
     @{ Pattern = '(?i)\b[A-Z]:[\\/]Users[\\/]'; Reason = 'a machine path' },
     @{ Pattern = '(?i)\b[A-Z]:[\\/]CodeForge'; Reason = 'a machine path' }
 )

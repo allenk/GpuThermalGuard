@@ -2,9 +2,14 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <cwchar>
 #include <format>
+#include <optional>
+#include <vector>
 
 namespace gtg::settings {
 namespace {
@@ -294,6 +299,10 @@ OsdPreference LoadOsdPreference() noexcept {
     result.enabled = ResolveOsdPreference(has_value, enabled);
     int collapsed = 0;
     result.collapsed = ReadDword(key, L"OsdCollapsed", collapsed) && collapsed != 0;
+    int tiny = 0;
+    result.tiny = ReadDword(key, L"CompactTiny", tiny) && tiny != 0;
+    int card = 0;
+    result.card = ReadDword(key, L"OsdCard", card) && card != 0;
     result.has_position = ReadSignedDword(key, L"OsdX", result.x) &&
                           ReadSignedDword(key, L"OsdY", result.y);
     result.has_compact_position = ReadSignedDword(key, L"CompactX", result.compact_x) &&
@@ -319,6 +328,22 @@ bool SaveOsdCollapsed(const bool collapsed, std::wstring& error) {
     HKEY key = nullptr;
     if (!OpenUserSettingsForWrite(key, error)) return false;
     const bool success = WriteDword(key, L"OsdCollapsed", collapsed ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
+bool SaveCompactTiny(const bool tiny, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"CompactTiny", tiny ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
+bool SaveOsdCard(const bool card, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"OsdCard", card ? 1 : 0, error);
     RegCloseKey(key);
     return success;
 }
@@ -422,6 +447,28 @@ bool SaveNetEnabled(const bool enabled, std::wstring& error) {
     return success;
 }
 
+bool LoadTopAppEnabled() noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return true;
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const bool valid = RegQueryValueExW(key, L"ShowTopApp", nullptr, &type,
+                                        reinterpret_cast<BYTE*>(&value), &size) == ERROR_SUCCESS &&
+                       type == REG_DWORD && size == sizeof(value);
+    RegCloseKey(key);
+    return ResolveTopAppPreference(valid, value);
+}
+
+bool SaveTopAppEnabled(const bool enabled, std::wstring& error) {
+    HKEY key = nullptr;
+    if (!OpenUserSettingsForWrite(key, error)) return false;
+    const bool success = WriteDword(key, L"ShowTopApp", enabled ? 1 : 0, error);
+    RegCloseKey(key);
+    return success;
+}
+
 std::uint32_t LoadCompactLayout() noexcept {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
@@ -438,13 +485,32 @@ std::uint32_t LoadCompactLayout() noexcept {
     return valid ? static_cast<std::uint32_t>(value) : 0;
 }
 
-bool SaveCompactLayout(const std::uint32_t packed, std::wstring& error) {
+std::optional<std::uint64_t> LoadCompactArrangement() noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return std::nullopt;
+    DWORD type = 0;
+    std::uint64_t value = 0;
+    DWORD size = sizeof(value);
+    const bool valid = RegQueryValueExW(key, L"CompactArrangement", nullptr, &type,
+                                        reinterpret_cast<BYTE*>(&value), &size) == ERROR_SUCCESS &&
+                       type == REG_QWORD && size == sizeof(value);
+    RegCloseKey(key);
+    if (!valid) return std::nullopt;
+    return value;
+}
+
+bool SaveCompactArrangement(const std::uint64_t packed, std::wstring& error) {
     HKEY key = nullptr;
     if (!OpenUserSettingsForWrite(key, error)) return false;
-    const bool success = WriteDword(key, L"CompactLayout",
-                                    static_cast<DWORD>(packed), error);
+    const LSTATUS status = RegSetValueExW(key, L"CompactArrangement", 0, REG_QWORD,
+                                          reinterpret_cast<const BYTE*>(&packed), sizeof(packed));
     RegCloseKey(key);
-    return success;
+    if (status == ERROR_SUCCESS) return true;
+    error = localization::Format(L"無法寫入設定 {}（Win32 {}）",
+                                 L"Unable to write setting {} (Win32 {})", L"CompactArrangement",
+                                 status);
+    return false;
 }
 
 bool LoadCompactLocked() noexcept {
@@ -644,6 +710,283 @@ bool SaveOverlayHotkey(const OverlayHotkey& hotkey, std::wstring& error) {
         error);
     RegCloseKey(key);
     return success;
+}
+
+// Hosts: HKCU\SOFTWARE\GpuThermalGuard\Hosts, with one subkey per pair under
+// Pairs, named by the paired host's id. Pair keys are stored as the peer
+// module hands them over -- already protected by DPAPI; this layer never sees
+// a key in the clear.
+namespace {
+
+constexpr wchar_t kHostsPath[] = L"SOFTWARE\\GpuThermalGuard\\Hosts";
+constexpr wchar_t kPairsPath[] = L"SOFTWARE\\GpuThermalGuard\\Hosts\\Pairs";
+// Longer values are not GTG's: a name is at most 48 UTF-8 bytes on the wire,
+// and a protected 32-byte key is a few hundred bytes.
+constexpr DWORD kMaxNameChars = 128;
+constexpr DWORD kMaxBlobBytes = 4'096;
+
+std::wstring PairKeyName(const std::uint64_t peer) {
+    return std::format(L"{:016x}", peer);
+}
+
+std::optional<std::uint64_t> ParsePairKeyName(const std::wstring_view name) noexcept {
+    if (name.size() != 16) return std::nullopt;
+    std::uint64_t value = 0;
+    for (const wchar_t c : name) {
+        value <<= 4;
+        if (c >= L'0' && c <= L'9') {
+            value |= static_cast<std::uint64_t>(c - L'0');
+        } else if (c >= L'a' && c <= L'f') {
+            value |= static_cast<std::uint64_t>(c - L'a' + 10);
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (value == 0) return std::nullopt;
+    return value;
+}
+
+std::optional<DWORD> ReadKeyDword(HKEY key, const wchar_t* name) noexcept {
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size) !=
+            ERROR_SUCCESS ||
+        type != REG_DWORD || size != sizeof(value)) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::optional<std::wstring> ReadKeyString(HKEY key, const wchar_t* name) {
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS ||
+        type != REG_SZ || size > (kMaxNameChars + 1) * sizeof(wchar_t)) {
+        return std::nullopt;
+    }
+    std::wstring value(size / sizeof(wchar_t) + 1, L'\0');
+    if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(value.data()), &size) !=
+            ERROR_SUCCESS ||
+        type != REG_SZ) {
+        return std::nullopt;
+    }
+    value.resize(wcsnlen(value.c_str(), value.size()));
+    return value;
+}
+
+std::optional<std::vector<std::uint8_t>> ReadKeyBinary(HKEY key, const wchar_t* name) {
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS ||
+        type != REG_BINARY || size == 0 || size > kMaxBlobBytes) {
+        return std::nullopt;
+    }
+    std::vector<std::uint8_t> value(size);
+    if (RegQueryValueExW(key, name, nullptr, &type, value.data(), &size) != ERROR_SUCCESS ||
+        type != REG_BINARY || size != value.size()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+bool HostsWriteFailed(const wchar_t* what, const LSTATUS status, std::wstring& error) {
+    error = localization::Format(L"無法保存主機設定 {}（Win32 {}）",
+                                 L"Unable to save the Hosts setting {} (Win32 {})", what, status);
+    return false;
+}
+
+bool WriteHostsValue(const wchar_t* path, const wchar_t* name, const DWORD type, const void* data,
+                     const DWORD size, std::wstring& error) {
+    HKEY key = nullptr;
+    const LSTATUS create =
+        RegCreateKeyExW(HKEY_CURRENT_USER, path, 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr);
+    if (create != ERROR_SUCCESS) return HostsWriteFailed(name, create, error);
+    const LSTATUS status = RegSetValueExW(key, name, 0, type, static_cast<const BYTE*>(data), size);
+    RegCloseKey(key);
+    if (status != ERROR_SUCCESS) return HostsWriteFailed(name, status, error);
+    return true;
+}
+
+}  // namespace
+
+HostsPreference LoadHostsPreference() noexcept {
+    HostsPreference result;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kHostsPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return result;
+    }
+    try {
+        if (const auto enabled = ReadKeyDword(key, L"Enabled")) result.enabled = *enabled != 0;
+        if (const auto log = ReadKeyDword(key, L"Log")) result.log = *log != 0;
+        if (const auto name = ReadKeyString(key, L"Name")) result.name = *name;
+    } catch (...) {
+    }
+    if (const auto port = ReadKeyDword(key, L"Port"); port && IsValidHostsPort(*port)) {
+        result.port = static_cast<int>(*port);
+    }
+    DWORD type = 0;
+    std::uint64_t id = 0;
+    DWORD size = sizeof(id);
+    if (RegQueryValueExW(key, L"PeerId", nullptr, &type, reinterpret_cast<BYTE*>(&id), &size) ==
+            ERROR_SUCCESS &&
+        type == REG_QWORD && size == sizeof(id)) {
+        result.peer_id = id;
+    }
+    RegCloseKey(key);
+    return result;
+}
+
+bool SaveHostsEnabled(const bool enabled, std::wstring& error) {
+    const DWORD value = enabled ? 1 : 0;
+    return WriteHostsValue(kHostsPath, L"Enabled", REG_DWORD, &value, sizeof(value), error);
+}
+
+bool SaveHostsName(const std::wstring_view name, std::wstring& error) {
+    const std::wstring value(name.substr(0, kMaxNameChars));
+    return WriteHostsValue(kHostsPath, L"Name", REG_SZ, value.c_str(),
+                           static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)), error);
+}
+
+bool SaveHostsPort(const int port, std::wstring& error) {
+    if (port != 0 && !IsValidHostsPort(static_cast<std::uint32_t>(port))) {
+        error = localization::Select(L"連接埠須介於 1024 與 65535 之間。",
+                                     L"The port must be between 1024 and 65535.");
+        return false;
+    }
+    const DWORD value = static_cast<DWORD>(port);
+    return WriteHostsValue(kHostsPath, L"Port", REG_DWORD, &value, sizeof(value), error);
+}
+
+bool SaveHostsPeerId(const std::uint64_t id, std::wstring& error) {
+    return WriteHostsValue(kHostsPath, L"PeerId", REG_QWORD, &id, sizeof(id), error);
+}
+
+bool SaveHostsLog(const bool on, std::wstring& error) {
+    const DWORD value = on ? 1 : 0;
+    return WriteHostsValue(kHostsPath, L"Log", REG_DWORD, &value, sizeof(value), error);
+}
+
+std::vector<StoredHost> LoadHosts() {
+    std::vector<StoredHost> hosts;
+    HKEY pairs = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kPairsPath, 0, KEY_READ, &pairs) != ERROR_SUCCESS) {
+        return hosts;
+    }
+    for (DWORD index = 0; hosts.size() < kMaxStoredHosts * 4; ++index) {
+        wchar_t name[64]{};
+        DWORD length = static_cast<DWORD>(std::size(name));
+        const LSTATUS status =
+            RegEnumKeyExW(pairs, index, name, &length, nullptr, nullptr, nullptr, nullptr);
+        if (status == ERROR_NO_MORE_ITEMS) break;
+        if (status != ERROR_SUCCESS) continue;
+        const auto peer = ParsePairKeyName(std::wstring_view(name, length));
+        if (!peer) continue;
+        HKEY entry = nullptr;
+        if (RegOpenKeyExW(pairs, name, 0, KEY_READ, &entry) != ERROR_SUCCESS) continue;
+        StoredHost host;
+        host.peer = *peer;
+        const auto key = ReadKeyBinary(entry, L"Key");
+        const auto order = ReadKeyDword(entry, L"Order");
+        host.name = ReadKeyString(entry, L"Name").value_or(std::wstring());
+        host.issued = ReadKeyDword(entry, L"Issued").value_or(0) != 0;
+        if (const auto endpoint = ReadKeyBinary(entry, L"Endpoint");
+            endpoint && endpoint->size() == 6) {
+            host.has_endpoint = true;
+            std::memcpy(host.address.data(), endpoint->data(), 4);
+            host.port = static_cast<std::uint16_t>(((*endpoint)[4] << 8) | (*endpoint)[5]);
+        }
+        RegCloseKey(entry);
+        // Without a key there is no pair, whatever else the entry holds.
+        if (!key) continue;
+        host.protected_key = *key;
+        host.order = order.value_or(0xFFFF'FFFF);
+        hosts.push_back(std::move(host));
+    }
+    RegCloseKey(pairs);
+    std::sort(hosts.begin(), hosts.end(), [](const StoredHost& a, const StoredHost& b) {
+        return a.order != b.order ? a.order < b.order : a.peer < b.peer;
+    });
+    if (hosts.size() > kMaxStoredHosts) hosts.resize(kMaxStoredHosts);
+    return hosts;
+}
+
+bool SaveHost(const StoredHost& host, std::wstring& error) {
+    if (host.peer == 0 || host.protected_key.empty() || host.protected_key.size() > kMaxBlobBytes) {
+        error =
+            localization::Select(L"主機配對資料不完整。", L"The paired host's data is incomplete.");
+        return false;
+    }
+    const std::wstring path = std::wstring(kPairsPath) + L"\\" + PairKeyName(host.peer);
+    // A new pair goes last in the reader's order; a known one keeps its place.
+    bool known = false;
+    HKEY existing = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ, &existing) == ERROR_SUCCESS) {
+        known = ReadKeyDword(existing, L"Order").has_value();
+        RegCloseKey(existing);
+    }
+    if (!known) {
+        DWORD next = 0;
+        for (const StoredHost& other : LoadHosts()) {
+            if (other.peer != host.peer && other.order != 0xFFFF'FFFF) {
+                next = std::max<DWORD>(next, other.order + 1);
+            }
+        }
+        if (!WriteHostsValue(path.c_str(), L"Order", REG_DWORD, &next, sizeof(next), error)) {
+            return false;
+        }
+    }
+    const std::wstring name = host.name.substr(0, kMaxNameChars);
+    const DWORD issued = host.issued ? 1 : 0;
+    if (!WriteHostsValue(path.c_str(), L"Name", REG_SZ, name.c_str(),
+                         static_cast<DWORD>((name.size() + 1) * sizeof(wchar_t)), error) ||
+        !WriteHostsValue(path.c_str(), L"Issued", REG_DWORD, &issued, sizeof(issued), error) ||
+        !WriteHostsValue(path.c_str(), L"Key", REG_BINARY, host.protected_key.data(),
+                         static_cast<DWORD>(host.protected_key.size()), error)) {
+        return false;
+    }
+    if (host.has_endpoint) {
+        const std::uint8_t endpoint[6]{host.address[0],
+                                       host.address[1],
+                                       host.address[2],
+                                       host.address[3],
+                                       static_cast<std::uint8_t>(host.port >> 8),
+                                       static_cast<std::uint8_t>(host.port & 0xFF)};
+        return WriteHostsValue(path.c_str(), L"Endpoint", REG_BINARY, endpoint, sizeof(endpoint),
+                               error);
+    }
+    return true;
+}
+
+bool RemoveHost(const std::uint64_t peer, std::wstring& error) {
+    HKEY pairs = nullptr;
+    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, kPairsPath, 0, KEY_WRITE | KEY_READ, &pairs);
+    if (status == ERROR_FILE_NOT_FOUND) return true;
+    if (status != ERROR_SUCCESS) return HostsWriteFailed(L"Pairs", status, error);
+    status = RegDeleteTreeW(pairs, PairKeyName(peer).c_str());
+    RegCloseKey(pairs);
+    if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) {
+        return HostsWriteFailed(L"Pairs", status, error);
+    }
+    return true;
+}
+
+bool SaveHostsOrder(const std::vector<std::uint64_t>& order, std::wstring& error) {
+    DWORD position = 0;
+    for (const std::uint64_t peer : order) {
+        const std::wstring path = std::wstring(kPairsPath) + L"\\" + PairKeyName(peer);
+        HKEY entry = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ, &entry) != ERROR_SUCCESS) {
+            continue;
+        }
+        RegCloseKey(entry);
+        if (!WriteHostsValue(path.c_str(), L"Order", REG_DWORD, &position, sizeof(position),
+                             error)) {
+            return false;
+        }
+        ++position;
+    }
+    return true;
 }
 
 }  // namespace gtg::settings

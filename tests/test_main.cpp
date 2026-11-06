@@ -10,6 +10,7 @@
 #include "timing/ui_phase_timing.hpp"
 #include "tray/osd_compact.hpp"
 #include "tray/osd_placement.hpp"
+#include "tray/osd_tiny.hpp"
 #include "tray/trip_markers.hpp"
 #include "tray/timeline_track.hpp"
 #include "tray/hotkey_capture.hpp"
@@ -37,13 +38,43 @@
 #include "sysmem/host_memory.hpp"
 #include "sysmem/reclaim.hpp"
 #include "tray/osd_animation.hpp"
+#include "topapp/alert_rule.hpp"
+#include "topapp/app_name.hpp"
+#include "topapp/board.hpp"
+#include "topapp/cpu_ledger.hpp"
+#include "topapp/leader.hpp"
+#include "topapp/marquee.hpp"
+#include "topapp/pdh_instance.hpp"
+#include "topapp/sweep_budget.hpp"
+#include "topapp/system_process.hpp"
+#include "peer/admission.hpp"
+#include "peer/crypto.hpp"
+#include "peer/hosts_view.hpp"
+#include "peer/keys.hpp"
+#include "peer/link.hpp"
+#include "peer/pairing.hpp"
+#include "peer/pairing_code.hpp"
+#include "peer/protocol.hpp"
+#include "peer/replay.hpp"
+#include "hostlog/frame.hpp"
+#include "hostlog/writer.hpp"
+#include "tray/hosts_bridge.hpp"
+#include "tray/osd_hosts.hpp"
 
+#include <winsock2.h>
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
 
+#include <bit>
+#include <cmath>
 #include <cstdlib>
+#include <cwctype>
+#include <limits>
+#include <span>
 #include <array>
+#include <deque>
+#include <optional>
 #include <cstring>
 #include <exception>
 #include <algorithm>
@@ -56,6 +87,10 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <chrono>
+#include <format>
+#include <fstream>
+#include <iterator>
 
 bool WtlHeadersAvailable();
 
@@ -135,11 +170,17 @@ void TestOsdCompact() {
         "a work area too narrow keeps the arrangement and shrinks the cells");
     Require(cramped.width == 320, "and clamps to the narrow width");
     const auto expanded = ChooseFootprint(false, false, true, 1366, 768);
-    Require(expanded.height > 330 && expanded.height <= 384 &&
-            expanded.columns == 1, "roomy expanded OSD adds FPS without exceeding half height");
-    const auto expanded_grid = ChooseFootprint(false, false, true, 683, 384);
-    Require(expanded_grid.height <= 220 && expanded_grid.columns == 2,
-        "small high-DPI expanded OSD reflows to two columns");
+    Require(expanded.width == 388 && expanded.height == ExpandedHeight(6) && expanded.columns == 1,
+            "the expanded OSD is the lanes' window where the screen holds it");
+    // A work area too short for the window no longer turns the lanes into
+    // a narrow card view: the window takes the height there is, down to its
+    // floor, and stays the lanes' width.
+    const auto expanded_short = ChooseFootprint(false, false, true, 683, 300);
+    Require(
+        expanded_short.width == 388 && expanded_short.height == 300 && expanded_short.columns == 1,
+        "a short work area shortens the expanded window instead of switching view");
+    Require(ChooseFootprint(false, false, true, 683, 100).height == ExpandedMinimumHeight(6),
+            "and never below the floor");
     for (int dpi : {96, 120, 144, 192}) {
         const int work_width_dip = 1366 * 96 / dpi;
         const int work_height_dip = 768 * 96 / dpi;
@@ -153,6 +194,223 @@ void TestOsdCompact() {
             }
         }
     }
+}
+
+// Tiny: one size whatever the records, every bar inside the cell and apart
+// from the next, the fold control below every curve and clear of the header,
+// and FPS judged for its steadiness against its own recent median.
+void TestOsdTiny() {
+    using namespace gtg::tray;
+    const auto footprint = tiny::Footprint();
+    Require(footprint.width == 84 && footprint.height == 101 && footprint.columns == 1 &&
+                footprint.rows == 1,
+            "tiny is the one-column header over one cell");
+    Require(footprint.width == compact::CollapsedWidth(1) &&
+                !compact::HeaderShowsTitle(footprint.columns),
+            "tiny's header is the one-column compact header");
+    Require(footprint.height < compact::kCollapsedSingleRowHeight + compact::kCollapsedRowPitch,
+            "tiny stays shorter than two compact rows");
+
+    const float cell_left = static_cast<float>(compact::kCellsMarginDip);
+    const float cell_right = cell_left + static_cast<float>(compact::kCellWidthDip);
+    for (int count = compact::kCellsPerRow; count <= compact::kRecordCount; ++count) {
+        float previous_right = 0.0F;
+        for (int i = 0; i < count; ++i) {
+            const auto bar = tiny::BarAt(i, count);
+            Require(bar.width >= 5.0F && bar.width <= tiny::kBarMaxWidthDip,
+                    "bars are wide enough to see and never blocks");
+            Require(bar.x >= cell_left + tiny::kBarInsetDip - 0.01F &&
+                        bar.x + bar.width <= cell_right - tiny::kBarInsetDip + 0.01F,
+                    "bars stay inside the cell across");
+            Require(bar.y >= compact::kCellsTopDip &&
+                        bar.y + bar.height + tiny::kLetterRowDip <=
+                            compact::kCellsTopDip + tiny::kCellHeightDip - tiny::kBarInsetDip,
+                    "bars and their letters stay inside the cell down");
+            Require(bar.height >= 40.0F, "the letters leave the bars room to move");
+            if (i > 0)
+                Require(bar.x - previous_right >= tiny::kBarGapDip - 0.01F, "bars never touch");
+            previous_right = bar.x + bar.width;
+        }
+        const auto first = tiny::BarAt(0, count);
+        const auto last = tiny::BarAt(count - 1, count);
+        Require(std::abs((first.x - cell_left) - (cell_right - last.x - last.width)) < 0.01F,
+                "the bars are centred in the cell");
+    }
+    Require(tiny::BarAt(0, 8).width == 6.0F, "eight records give 6 dip bars");
+    std::wstring letters;
+    for (int i = 0; i < compact::kRecordCount; ++i) {
+        const wchar_t letter = tiny::Letter(static_cast<compact::Metric>(i));
+        Require(letter >= L'A' && letter <= L'Z' && letters.find(letter) == std::wstring::npos,
+                "every record has its own capital letter");
+        letters.push_back(letter);
+    }
+    Require(tiny::Letter(compact::Metric::Gpu) == L'G' &&
+                tiny::Letter(compact::Metric::Vram) == L'V' &&
+                tiny::Letter(compact::Metric::Temperature) == L'T',
+            "the letters are the records' initials");
+
+    Require(tiny::Level(50.0, 0.0, 100.0) == 0.5, "a reading stands at its place on the axis");
+    Require(tiny::Level(-5.0, 0.0, 100.0) == 0.0 && tiny::Level(150.0, 0.0, 100.0) == 1.0,
+            "a bar never leaves its track");
+    Require(tiny::Level(std::nan(""), 0.0, 100.0) == 0.0,
+            "a reading that is not a number stands at the bottom");
+    Require(tiny::Level(5.0, 10.0, 10.0) == 0.0, "an empty axis draws nothing");
+    Require(
+        tiny::Level(85.0, compact::kTemperatureAxisBottomC, compact::kTemperatureAxisTopC) > 0.7 &&
+            tiny::Level(85.0, compact::kTemperatureAxisBottomC, compact::kTemperatureAxisTopC) <
+                0.75,
+        "temperature stands on the expanded lane's axis");
+    Require(compact::PowerAxisTop(std::nullopt, 300) == 600.0 &&
+                compact::PowerAxisTop(600.0, 300) == 600.0 &&
+                compact::PowerAxisTop(50.0, 300) == 100.0,
+            "power stands on the expanded lane's axis");
+
+    // The fold control, in every window it sits in: Tiny, one row of five and
+    // of eight, a single column, two rows.
+    const std::pair<int, int> windows[]{{84, 95}, {388, 88}, {540, 88}, {84, 418}, {388, 143}};
+    for (const float scale : {1.0F, 1.25F, 1.5F, 1.75F, 2.0F, 2.5F}) {
+        for (const auto& [width_dip, height_dip] : windows) {
+            const int width = compact::ToPixels(static_cast<float>(width_dip), scale);
+            const int height = compact::ToPixels(static_cast<float>(height_dip), scale);
+            const int x = width / 2;
+            const int y =
+                static_cast<int>(static_cast<float>(height) - tiny::kFoldFromBottomDip * scale);
+            Require(tiny::FoldHit(x, y, width, height, scale), "the drawn control can be pressed");
+            const int half =
+                static_cast<int>(std::floor(tiny::kFoldPressWidthDip / 2.0F * scale)) - 1;
+            Require(tiny::FoldHit(x - half, y, width, height, scale) &&
+                        tiny::FoldHit(x + half, y, width, height, scale),
+                    "roughly the bottom middle is enough");
+            Require(!tiny::FoldHit(x - half - 3, y, width, height, scale) &&
+                        !tiny::FoldHit(x + half + 3, y, width, height, scale),
+                    "but not the bottom corners");
+            Require(!tiny::FoldHit(x, compact::ToPixels(25.0F, scale) - 1, width, height, scale),
+                    "the control never takes a press in the header");
+            const int above =
+                height - static_cast<int>(std::ceil(tiny::kFoldPressHeightDip * scale));
+            Require(!tiny::FoldHit(x, above - 1, width, height, scale),
+                    "the control ends below the curves");
+            Require(!tiny::FoldHit(x, height, width, height, scale), "the bottom is exclusive");
+            Require(!compact::ToggleHit(x, y, width, compact::ToPixels(25.0F, scale)) &&
+                        !compact::LockHit(x, y, width, compact::ToPixels(25.0F, scale)),
+                    "the control is not the chevron or the lock");
+        }
+    }
+    // A compact cell's curve is 10 dip tall at 37 dip into the cell.
+    Require(compact::kCellsTopDip + 47.0F <=
+                static_cast<float>(compact::kCollapsedSingleRowHeight) - tiny::kFoldPressHeightDip,
+            "the press area is below a compact cell's curve");
+    const auto bar = tiny::BarAt(0, compact::kCellsPerRow);
+    Require(bar.y + bar.height + tiny::kLetterRowDip <=
+                static_cast<float>(tiny::kHeightDip) - tiny::kFoldPressHeightDip,
+            "in Tiny the press area is below the letters");
+
+    // Folding keeps the top-right corner, as the chevron does, and unfolding
+    // returns to where it was.
+    const POINT folded = placement::ToggleKeepingButton({1000, 500}, 540, footprint.width);
+    Require(folded.x + footprint.width == 1000 + 540 && folded.y == 500,
+            "folding keeps the top-right corner still");
+    const POINT unfolded = placement::ToggleKeepingButton(folded, footprint.width, 540);
+    Require(unfolded.x == 1000 && unfolded.y == 500, "unfolding returns to where it was");
+}
+
+void TestTinyFpsStability() {
+    using gtg::fps::HistorySample;
+    using gtg::fps::Identity;
+    namespace tiny = gtg::tray::tiny;
+    const Identity game{1234, 5678};
+    const auto push = [](std::deque<HistorySample>& samples, const std::uint64_t ms,
+                         const std::optional<double> fps, const Identity id,
+                         const std::uint64_t surface) {
+        HistorySample sample;
+        sample.monotonic_ms = ms;
+        sample.displayed_fps = fps;
+        sample.identity = id;
+        sample.surface = surface;
+        samples.push_back(sample);
+    };
+    const auto steady = [&](const double fps) {
+        std::deque<HistorySample> samples;
+        for (int i = 0; i < 40; ++i)
+            push(samples, 1'000 + static_cast<std::uint64_t>(i) * 500, fps, game, 7);
+        return samples;
+    };
+    const std::uint64_t newest = 1'000 + 39 * 500;
+    const auto equal = [](const double a, const double b) {
+        return std::abs(a - b) < 1e-9;
+    };
+
+    for (const double fps : {30.0, 60.0, 120.0}) {
+        const auto result = tiny::MeasureFpsStability(steady(fps), newest);
+        Require(result && equal(result->reference, fps) && equal(result->deviation, 0.0) &&
+                    equal(result->level, tiny::kFpsReferenceLevel) &&
+                    result->severity == tiny::Severity::Steady,
+                "a steady game rests on its reference whatever its rate");
+    }
+
+    const auto with_newest = [&](const double fps) {
+        auto samples = steady(60.0);
+        samples.back().displayed_fps = fps;
+        return tiny::MeasureFpsStability(samples, newest);
+    };
+    const auto dip = with_newest(55.0);
+    Require(dip && equal(dip->reference, 60.0) && equal(dip->level, 0.5) &&
+                dip->severity == tiny::Severity::Steady,
+            "55 against 60 drops the bar from two thirds to a half");
+    const auto drop = with_newest(48.0);
+    Require(drop && equal(drop->level, 2.0 / 3.0 * 0.4) && drop->severity == tiny::Severity::Warn,
+            "48 against 60 is a warning");
+    const auto crash = with_newest(42.0);
+    Require(crash && crash->severity == tiny::Severity::Alarm && crash->level < 0.1,
+            "a 30 % drop is an alarm");
+    const auto leap = with_newest(78.0);
+    Require(leap && leap->severity == tiny::Severity::Alarm && equal(leap->level, 1.0),
+            "a leap is as unsteady as a fall, and the bar stays in its track");
+    Require(tiny::FpsSeverity(0.10) == tiny::Severity::Warn &&
+                tiny::FpsSeverity(-0.10) == tiny::Severity::Warn &&
+                tiny::FpsSeverity(0.0999) == tiny::Severity::Steady &&
+                tiny::FpsSeverity(-0.25) == tiny::Severity::Alarm,
+            "severity bounds hold in both directions");
+
+    Require(!tiny::MeasureFpsStability(steady(60.0), newest + 2'000),
+            "an old newest reading is not now");
+    auto missing = steady(60.0);
+    missing.back().displayed_fps.reset();
+    Require(!tiny::MeasureFpsStability(missing, newest), "no reading is an empty bar, not zero");
+    Require(!tiny::MeasureFpsStability({}, newest), "no history is an empty bar");
+
+    // Another program starts over: its rate says nothing about this one's.
+    auto switched = steady(120.0);
+    const Identity other{4321, 8765};
+    for (int i = 1; i <= 3; ++i)
+        push(switched, newest + static_cast<std::uint64_t>(i) * 500, 60.0, other, 7);
+    const auto early = tiny::MeasureFpsStability(switched, newest + 1'500);
+    Require(early && equal(early->reference, 60.0) && equal(early->deviation, 0.0),
+            "too few samples of the new program: the bar rests on its reference");
+    push(switched, newest + 2'000, 45.0, other, 7);
+    const auto later = tiny::MeasureFpsStability(switched, newest + 2'000);
+    Require(later && equal(later->reference, 60.0) && later->severity == tiny::Severity::Alarm,
+            "the new program is judged against its own median, not the last one's");
+    auto moved = steady(120.0);
+    push(moved, newest + 500, 60.0, game, 8);
+    const auto other_surface = tiny::MeasureFpsStability(moved, newest + 500);
+    Require(other_surface && equal(other_surface->reference, 60.0),
+            "the same program presenting elsewhere starts over too");
+
+    // Only the last 20 s count.
+    std::deque<HistorySample> aged;
+    for (int i = 0; i <= 10; ++i)
+        push(aged, static_cast<std::uint64_t>(i) * 500, 100.0, game, 7);
+    for (int i = 0; i < 4; ++i)
+        push(aged, 25'500 + static_cast<std::uint64_t>(i) * 500, 60.0, game, 7);
+    const auto windowed = tiny::MeasureFpsStability(aged, 27'000);
+    Require(windowed && equal(windowed->reference, 60.0), "readings older than 20 s do not count");
+
+    std::deque<HistorySample> even;
+    for (const double fps : {50.0, 60.0, 70.0, 80.0})
+        push(even, 1'000 + even.size() * 500, fps, game, 7);
+    const auto middle = tiny::MeasureFpsStability(even, 2'500);
+    Require(middle && equal(middle->reference, 65.0), "an even count takes the middle pair");
 }
 
 // The backend label as the design defines it: the
@@ -1867,73 +2125,336 @@ void TestHeaderStatusTextThreshold() {
             "two cells genuinely cannot fit the longest status");
 }
 
-void TestEighthRecordFillsTheWord() {
+// The REG_DWORD the first eight records were stored in, built here the way
+// the build before Hosts wrote it: eight three-bit indices, seven breaks, the
+// tag at bit 31.
+std::uint32_t LegacyPack(const std::array<gtg::tray::compact::Metric, 8>& order,
+                         const unsigned breaks) {
+    std::uint32_t packed = 1u << 31;
+    for (unsigned i = 0; i < 8; ++i) {
+        packed |= (static_cast<std::uint32_t>(order[i]) & 7u) << (i * 3u);
+    }
+    return packed | ((breaks & 0x7Fu) << 24);
+}
+
+bool SameLayout(const gtg::tray::compact::Layout& a, const gtg::tray::compact::Layout& b) {
+    return a.order == b.order && a.breaks == b.breaks;
+}
+
+void TestNinthRecordMovesTheStore() {
     using namespace gtg::tray::compact;
 
-    Require(kRecordCount == 8, "network is the eighth record");
-    Require(IsOptional(Metric::Network), "and it is optional, like RAM and FPS");
+    Require(kRecordCount == 9, "Hosts is the ninth record");
+    Require(IsOptional(Metric::Hosts) && IsOptional(Metric::Network),
+            "optional, like RAM, FPS and network");
     Require(!IsOptional(Metric::Temperature), "while the thermal five are not");
+    Require(DefaultOrder()[8] == Metric::Hosts, "and last in the default order");
 
-    // Off unless asked for, which is the shipped default and also what keeps
-    // every caller written before the eighth record meaning what it meant.
+    // Off unless placed, which keeps every caller written before it meaning
+    // what it meant.
     Require(Resolve(Layout{}, true, true).count == 7,
-            "the default arrangement does not place network");
-    const auto all = Resolve(Layout{}, true, true, true);
-    Require(all.count == 8, "and placing it gives eight records");
+            "the default places neither network nor hosts");
+    Require(Resolve(Layout{}, true, true, true).count == 8, "network makes eight");
+    const auto all = Resolve(Layout{}, true, true, true, true);
+    Require(all.count == 9, "and hosts nine");
     {
         unsigned seen = 0;
         for (int slot = 0; slot < all.count; ++slot)
             seen |= 1u << static_cast<unsigned>(all.cells[static_cast<std::size_t>(slot)]);
-        Require(seen == (1u << kRecordCount) - 1u,
-                "each record exactly once, network included");
+        Require(seen == (1u << kRecordCount) - 1u, "each record exactly once");
     }
 
-    // Every break set of eight records survives the stored form. 128 of them
-    // now, where there were 64.
+    // Every break set of nine records survives the REG_QWORD: all 256.
     for (unsigned breaks = 0; breaks < (1u << kMaxBreaks); ++breaks) {
         Layout layout;
         layout.breaks = static_cast<std::uint8_t>(breaks);
         Require(IsValidLayout(layout), "every break set is legal");
         const auto restored = UnpackLayout(PackLayout(layout));
-        Require(restored.has_value(), "and round-trips");
-        Require(restored->breaks == layout.breaks, "with its breaks intact");
-        Require(restored->order == layout.order, "and its order intact");
+        Require(restored && SameLayout(*restored, layout), "and round-trips whole");
     }
-
-    // A non-default order round-trips too, so the 24 bits really are all read.
+    // A reversed order round-trips too, so all 36 bits of it are read.
     {
         Layout layout;
-        layout.order = {Metric::Network, Metric::Fps, Metric::Ram, Metric::Cpu,
-                        Metric::Gpu, Metric::Vram, Metric::Power,
-                        Metric::Temperature};
-        layout.breaks = 0b1010101;
+        layout.order = {Metric::Hosts, Metric::Network, Metric::Fps,
+                        Metric::Ram,   Metric::Cpu,     Metric::Gpu,
+                        Metric::Vram,  Metric::Power,   Metric::Temperature};
+        layout.breaks = 0b10101010;
         const auto restored = UnpackLayout(PackLayout(layout));
-        Require(restored.has_value() && restored->order == layout.order,
-                "a fully reversed order survives the stored form");
-        Require(restored->breaks == layout.breaks, "and so do all seven breaks");
+        Require(restored && SameLayout(*restored, layout),
+                "a reversed order and every other break survive the stored form");
     }
 
-    // The tag moved from four bits at 28 to one bit at 31, because eight
-    // records leave exactly one bit. Everything the old schema wrote carried
-    // 1 << 28, so bit 31 was clear in all of it and is still rejected.
-    {
-        const std::uint32_t old_schema = (1u << 28) | 0b010101u | (0b101010u << 21);
-        Require(!UnpackLayout(old_schema).has_value(),
-                "a value from the four-bit tag schema is refused");
-        Require(SanitizeLayout(old_schema).order == DefaultOrder(),
-                "and the reader gets the default rather than a reshuffle");
-        Require(!UnpackLayout(0u).has_value(), "an empty value is refused");
-        Require(!UnpackLayout(0x7FFFFFFFu).has_value(),
-                "and so is anything with the tag bit clear");
-    }
+    // Anything that is not exactly the format is discarded whole.
+    const std::uint64_t packed = PackLayout(Layout{});
+    Require((packed >> 60) == 2 && UnpackLayout(packed).has_value(), "the format is 2");
+    Require(!UnpackLayout(packed | (std::uint64_t{1} << 50)), "a bit outside the fields");
+    Require(!UnpackLayout((packed & ~(std::uint64_t{0xF} << 60)) | (std::uint64_t{3} << 60)),
+            "another format");
+    Require(!UnpackLayout((packed & ~std::uint64_t{0xF}) | 0x9), "an index past the records");
+    Require(!UnpackLayout((packed & ~std::uint64_t{0xF}) | 0x1), "a record twice");
+    Require(!UnpackLayout(0) && !UnpackLayout(~std::uint64_t{0}), "nothing, and everything");
+    Require(!UnpackLayout(LegacyPack({}, 0)), "the old REG_DWORD is not read as the new store");
+    Require(SanitizeLayout(packed | (std::uint64_t{1} << 50)).order == DefaultOrder(),
+            "and a discarded value is the default, never a reshuffle");
 
-    // The word is full. A ninth record needs four-bit indices, and 36 + 8 + 1
-    // does not fit; this is the assertion that says so out loud rather than
-    // leaving it in a comment.
-    Require(kRecordCount * static_cast<int>(kRecordBits) + kMaxBreaks + 1 == 32,
-            "eight records use every bit of the stored word");
-    Require((kRecordCount + 1) * 4 + kRecordCount + 1 > 32,
-            "and a ninth cannot fit under any arrangement");
+    // The old REG_DWORD: translated, its order with Hosts appended, its breaks
+    // kept. Every permutation of the eight, under four break sets, and every
+    // break set under the default order.
+    std::array<Metric, 8> eight{Metric::Temperature, Metric::Power, Metric::Vram, Metric::Gpu,
+                                Metric::Cpu,         Metric::Ram,   Metric::Fps,  Metric::Network};
+    int permutations = 0;
+    do {
+        for (const unsigned breaks :
+             {0u, 0x7Fu, 0x55u, static_cast<unsigned>(permutations) & 0x7Fu}) {
+            const auto translated = UnpackLegacyLayout(LegacyPack(eight, breaks));
+            if (!translated || translated->breaks != breaks ||
+                translated->order[8] != Metric::Hosts ||
+                !std::equal(eight.begin(), eight.end(), translated->order.begin())) {
+                Require(false, "every valid old value translates to its order, Hosts last");
+            }
+        }
+        ++permutations;
+    } while (std::next_permutation(eight.begin(), eight.end(), [](Metric a, Metric b) {
+        return static_cast<int>(a) < static_cast<int>(b);
+    }));
+    Require(permutations == 40'320, "all of them");
+    const std::array<Metric, 8> plain{Metric::Temperature, Metric::Power,  Metric::Vram,
+                                      Metric::Gpu,         Metric::Cpu,    Metric::Ram,
+                                      Metric::Fps,         Metric::Network};
+    for (unsigned breaks = 0; breaks < 128; ++breaks) {
+        const auto translated = UnpackLegacyLayout(LegacyPack(plain, breaks));
+        Require(translated && translated->breaks == breaks && translated->order == DefaultOrder(),
+                "every old break set is kept");
+    }
+    Require(!UnpackLegacyLayout(LegacyPack(plain, 0) & ~(1u << 31)),
+            "an old value without its tag");
+    std::array<Metric, 8> twice = plain;
+    twice[3] = twice[2];
+    Require(!UnpackLegacyLayout(LegacyPack(twice, 0)), "an old value with a record twice");
+
+    // Hosts last keeps every row: unplaced, nothing moves; placed, it joins
+    // the last row.
+    Layout two_rows;
+    two_rows.breaks = 1u << 4;   // (5, 3)
+    const auto old_value = LegacyPack(plain, two_rows.breaks);
+    const Layout upgraded = *UnpackLegacyLayout(old_value);
+    const auto before = Resolve(two_rows, true, true, true);
+    const auto without = Resolve(upgraded, true, true, true, false);
+    const auto with = Resolve(upgraded, true, true, true, true);
+    Require(without.rows == before.rows && without.row_length == before.row_length,
+            "the upgrade moves nothing while Hosts is not placed");
+    Require(with.rows == 2 && with.row_length[0] == 5 && with.row_length[1] == 4,
+            "and Hosts joins the last row when it is");
+
+    // Which stored value wins.
+    Layout custom;
+    custom.order = MoveInsert(DefaultOrder(), 8, 0);
+    custom.breaks = 0b1000;
+    const std::uint64_t garbage = PackLayout(custom) | (std::uint64_t{1} << 55);
+    Require(SameLayout(RestoreLayout(PackLayout(custom), old_value), custom),
+            "the REG_QWORD when it validates");
+    Require(SameLayout(RestoreLayout(std::nullopt, old_value), upgraded),
+            "the old REG_DWORD translated when there is none");
+    Require(SameLayout(RestoreLayout(garbage, old_value), upgraded),
+            "and when it does not validate");
+    Require(SameLayout(RestoreLayout(std::nullopt, 0), Layout{}), "nothing stored: the default");
+    Require(SameLayout(RestoreLayout(garbage, 0x12345678u), Layout{}),
+            "nothing valid: the default");
+}
+
+// The expanded view's cards: two columns in the reader's order, an odd last
+// card across both, the rows filling the window to its bottom margin, nothing
+// overlapping, and room for a label and a reading even at the floor.
+void TestOsdCards() {
+    using namespace gtg::tray::compact;
+    constexpr float kTolerance = 0.01F;
+    for (int count = kCellsPerRow; count <= kRecordCount; ++count) {
+        for (const int height : {ExpandedHeight(count), ExpandedMinimumHeight(count)}) {
+            const float width = 388.0F;
+            const float bottom = static_cast<float>(height) - kCardsMarginDip;
+            const float inner = width - kCardsMarginDip * 2.0F;
+            float last_bottom = 0.0F;
+            for (int slot = 0; slot < count; ++slot) {
+                const CardBox box = CardAt(slot, count, width, static_cast<float>(height));
+                Require(box.width > 0.0F && box.height > 0.0F, "every card has a size");
+                Require(box.x >= kCardsMarginDip - kTolerance &&
+                            box.x + box.width <= width - kCardsMarginDip + kTolerance,
+                        "every card is inside the side margins");
+                Require(
+                    box.y >= kCardsTopDip - kTolerance && box.y + box.height <= bottom + kTolerance,
+                    "every card is under the header and above the bottom margin");
+                Require(box.height >= 44.0F,
+                        "a card always has room for its label and its reading");
+                const bool last_odd = slot == count - 1 && count % 2 != 0;
+                Require(
+                    last_odd ? std::abs(box.width - inner) < kTolerance : box.width < inner / 2.0F,
+                    "only an odd last card spans both columns");
+                Require(std::abs(box.x - (slot % 2 == 0 ? kCardsMarginDip
+                                                        : kCardsMarginDip + box.width +
+                                                              kCardGapDip)) < kTolerance,
+                        "even slots on the left, odd slots on the right");
+                for (int other = 0; other < slot; ++other) {
+                    const CardBox seen = CardAt(other, count, width, static_cast<float>(height));
+                    const bool apart = box.x >= seen.x + seen.width - kTolerance ||
+                                       seen.x >= box.x + box.width - kTolerance ||
+                                       box.y >= seen.y + seen.height - kTolerance ||
+                                       seen.y >= box.y + box.height - kTolerance;
+                    Require(apart, "no two cards overlap");
+                    if (other / 2 == slot / 2) {
+                        Require(std::abs(seen.y - box.y) < kTolerance, "a row shares its top");
+                    }
+                }
+                last_bottom = std::max(last_bottom, box.y + box.height);
+            }
+            Require(std::abs(last_bottom - bottom) < kTolerance,
+                    "the last row ends at the bottom margin: the window ends with the cards");
+        }
+    }
+    const CardBox none = CardAt(9, 9, 388.0F, 452.0F);
+    Require(none.width == 0.0F && none.height == 0.0F, "a slot that does not exist is empty");
+    Require(CardAt(-1, 9, 388.0F, 452.0F).width == 0.0F, "and so is a negative one");
+    Require(CardRows(9) == 5 && CardRows(8) == 4 && CardRows(5) == 3 && CardRows(0) == 0,
+            "rows are the records two to a row");
+    // Cards draw in the lanes' window: there is one footprint, whatever the
+    // view, so turning cards on cannot move or resize the OSD.
+    const auto placed = Resolve(Layout{}, true, true, true, true);
+    Require(ChooseFootprint(false, placed, 1536, 830).width == 388,
+            "the cards' window is the lanes' window");
+}
+
+void TestExpandedHeightRule() {
+    using namespace gtg::tray::compact;
+    Require(ExpandedHeight(5) == 330 && ExpandedHeight(6) == 355 && ExpandedHeight(7) == 380 &&
+                ExpandedHeight(8) == 405,
+            "up to eight records the window is as it was");
+    Require(ExpandedHeight(9) == 452, "the ninth adds a lane: 405 to 452 dip");
+    for (int count = 5; count <= kRecordCount; ++count) {
+        const double lane = (ExpandedHeight(count) - 31.0) / count - 2.0;
+        Require(lane >= 44.75 - 1e-9, "no lane is shorter than at eight records");
+    }
+    const auto placed = Resolve(Layout{}, true, true, true, true);
+    Require(ChooseFootprint(false, placed, 1920, 1080).height == 452,
+            "the expanded footprint takes the rule");
+    // The owner's case: x2.50 on a 4K screen (work area 3840 x 2076 px) is
+    // 1536 x 830 dip. The lanes need 452, more than half of 830, which used to
+    // switch the view to the old cards.
+    const auto large = ChooseFootprint(false, placed, 1536, 830);
+    Require(large.width == 388 && large.height == 452 && large.columns == 1,
+            "x2.50 on 4K keeps the lanes' window");
+    // x2.50 on a 1080p screen (1032 px of work area) is 412 dip: too short.
+    Require(ChooseFootprint(false, placed, 768, 412).height == 412,
+            "a screen too short for it gets the height it has");
+    for (int count = kCellsPerRow; count <= kRecordCount; ++count) {
+        Require(ExpandedMinimumHeight(count) < ExpandedHeight(count),
+                "the floor is below the natural height for every record count");
+    }
+    Require(ChooseFootprint(true, placed, 1920, 1080).width == 692,
+            "and one row of nine cells is 692 dip");
+    Require(CollapsedWidth(kRecordCount) == 692, "the widest compact row");
+
+    using gtg::tray::tiny::BarAt;
+    using gtg::tray::tiny::Letter;
+    const float left = static_cast<float>(kCellsMarginDip) + gtg::tray::tiny::kBarInsetDip;
+    const float right =
+        static_cast<float>(kCellsMarginDip + kCellWidthDip) - gtg::tray::tiny::kBarInsetDip;
+    for (int i = 0; i < kRecordCount; ++i) {
+        const auto bar = BarAt(i, kRecordCount);
+        Require(bar.x >= left - 1e-4F && bar.x + bar.width <= right + 1e-4F,
+                "nine Tiny bars stay inside the cell");
+        Require(bar.width > 5.0F, "and are about 5.1 dip wide");
+        if (i + 1 < kRecordCount) {
+            Require(BarAt(i + 1, kRecordCount).x - (bar.x + bar.width) >=
+                        gtg::tray::tiny::kBarGapDip - 1e-4F,
+                    "and apart");
+        }
+    }
+    Require(Letter(Metric::Hosts) == L'H', "Hosts is H");
+    unsigned letters = 0;
+    for (int i = 0; i < kRecordCount; ++i)
+        letters |= 1u << (Letter(static_cast<Metric>(i)) - L'A');
+    Require(std::popcount(letters) == kRecordCount, "and no two records share a letter");
+}
+
+void TestOsdHostsView() {
+    using namespace gtg;
+    using tray::osd_hosts::Frame;
+    const std::uint64_t now = 1'000'000;
+    const auto row = [&](const std::uint64_t peer, const wchar_t* name,
+                         std::optional<std::uint64_t> state_ms,
+                         std::optional<std::uint64_t> goodbye_ms, const peer::Protection protection,
+                         const bool raised) {
+        peer::HostRow host;
+        host.peer = peer;
+        host.name = name;
+        host.heard = {state_ms, goodbye_ms};
+        if (state_ms) {
+            peer::HostState state;
+            state.name = name;
+            state.protection = protection;
+            state.records[static_cast<std::size_t>(peer::Record::Gpu)] = {0.5F,  0.7F,  raised,
+                                                                          false, 50.0F, {}};
+            host.state = state;
+        }
+        return host;
+    };
+    peer::Table table;
+    table.hosts = {
+        row(1, L"Calm", now - 500, {}, peer::Protection::Normal, false),
+        row(2, L"Gone", now - 42'500, {}, peer::Protection::Normal, false),
+        row(3, L"Asleep", now - 60'000, now - 30'000, peer::Protection::SafePower, false),
+        row(4, L"Never", {}, {}, peer::Protection::Normal, false),
+        row(5, L"Busy", now - 800, {}, peer::Protection::Normal, true),
+        row(6, L"Hot", now - 4'000, {}, peer::Protection::SafePower, false),
+    };
+    const auto view = tray::osd_hosts::MakeView(table, now);
+    Require(view.paired == 6 && view.shown.size() == 4, "four of six shown");
+    std::vector<std::wstring> names;
+    for (const auto& host : view.shown)
+        names.push_back(host.name);
+    Require(names == std::vector<std::wstring>{L"Calm", L"Gone", L"Busy", L"Hot"},
+            "the three in alert and the one present, in the reader's order");
+    const auto& calm = view.shown[0];
+    const auto& gone = view.shown[1];
+    const auto& busy = view.shown[2];
+    const auto& hot = view.shown[3];
+    Require(gone.presence == peer::Presence::Lost && gone.silent_s == 42 && gone.alert &&
+                !gone.protection,
+            "a lost host: its silence counted, its old state not drawn as current");
+    Require(busy.alert && busy.records[static_cast<std::size_t>(peer::Record::Gpu)].raised,
+            "a host raises what it raised itself");
+    Require(hot.presence == peer::Presence::Dim && hot.alert,
+            "a late host still carries its alert");
+    Require(view.AnyAlert(), "the record has a host in alert");
+    Require(tray::osd_hosts::FrameFor(calm) == Frame::Quiet &&
+                tray::osd_hosts::FrameFor(gone) == Frame::Red &&
+                tray::osd_hosts::FrameFor(hot) == Frame::Amber,
+            "frames: quiet, red when lost, amber on safe power");
+    tray::osd_hosts::Host faulted = calm;
+    faulted.protection = peer::Protection::Fault;
+    tray::osd_hosts::Host offline = calm;
+    offline.presence = peer::Presence::Offline;
+    Require(tray::osd_hosts::FrameFor(faulted) == Frame::Red &&
+                tray::osd_hosts::FrameFor(offline) == Frame::Offline,
+            "red for a fault, quiet and dimmer offline");
+    Require(tray::osd_hosts::MakeView(table, now) == view, "the same table reads the same");
+    Require(!(tray::osd_hosts::MakeView(table, now + 1'000) == view),
+            "and a second later the lost host's count has moved");
+
+    using tray::compact::Metric;
+    const auto placed = tray::compact::Resolve(tray::compact::Layout{}, true, true, true, true);
+    Require(tray::osd_hosts::CellMetrics(placed) ==
+                std::vector<Metric>{Metric::Temperature, Metric::Vram, Metric::Gpu, Metric::Cpu},
+            "the cell shows T V G C in the reader's order");
+    const auto lane = tray::osd_hosts::LaneMetrics(placed);
+    Require(lane.size() == 8 && std::find(lane.begin(), lane.end(), Metric::Hosts) == lane.end(),
+            "the lane shows every placed record but Hosts");
+    const auto reduced = tray::compact::Resolve(tray::compact::Layout{}, false, false, false, true);
+    Require(tray::osd_hosts::LaneMetrics(reduced).size() == 5,
+            "only the records the reader has on");
+    Require(tray::osd_hosts::RecordOf(calm, Metric::Hosts) == nullptr &&
+                tray::osd_hosts::RecordOf(calm, Metric::Gpu)->level == 0.5F,
+            "a host's records by the reader's record");
+    Require(tray::osd_hosts::MakeView(peer::Table{}, now).shown.empty(), "no hosts, nothing shown");
 }
 
 void TestNetworkVerdictJudgesTheWorst() {
@@ -2605,7 +3126,8 @@ void TestCompactLayoutStoredValueCannotHideARecord() {
             ++seen[static_cast<int>(metric)];
         for (int i = 0; i < kRecordCount; ++i)
             Require(seen[i] == 1, "every record present exactly once after sanitizing");
-        Require((safe.breaks >> kMaxBreaks) == 0, "no break bit outside the field");
+        Require((static_cast<unsigned>(safe.breaks) >> kMaxBreaks) == 0u,
+                "no break bit outside the field");
     }
 }
 
@@ -4001,6 +4523,1633 @@ void TestOsdSnap() {
             "anchored snapping lets go and follows the cursor on the way out");
 }
 
+// --- top-app alert ----------------------------------------------------------
+
+// The sampler's cost guard: charged with the sweep's own CPU time, doubling the
+// interval over budget, pausing a minute after five overruns and trying again
+// -- never stopping for as long as an alert lasts.
+void TestTopAppSweepBudget() {
+    using gtg::topapp::SweepBudget;
+    SweepBudget budget;
+    auto next = budget.Charge(20.0);
+    Require(!next.paused && next.wait_ms == 1'000, "a sweep within budget keeps the cadence");
+    Require(!budget.Charge(SweepBudget::kBudgetMs).paused, "the budget itself is within budget");
+
+    const std::uint32_t backed_off[]{2'000, 4'000, 8'000, 8'000};
+    for (const std::uint32_t wait : backed_off) {
+        next = budget.Charge(60.0);
+        Require(!next.paused && next.wait_ms == wait, "an overrun doubles the interval up to 8 s");
+    }
+    next = budget.Charge(60.0);
+    Require(next.paused && next.first_pause && next.wait_ms == SweepBudget::kPauseMs,
+            "the fifth overrun in a row pauses for a minute");
+
+    next = budget.Charge(60.0);
+    Require(!next.paused && next.wait_ms == 2'000 && !next.resumed,
+            "after the pause it tries again from the start of the run");
+    next = budget.Charge(20.0);
+    Require(next.resumed && next.wait_ms == 1'000, "the first sweep within budget says so");
+    Require(!budget.Charge(20.0).resumed, "and only the first");
+
+    for (int i = 0; i < SweepBudget::kOverLimit - 1; ++i)
+        (void)budget.Charge(60.0);
+    next = budget.Charge(60.0);
+    Require(next.paused && !next.first_pause,
+            "a later pause in the same alert is not logged again");
+
+    for (int i = 0; i < SweepBudget::kOverLimit - 1; ++i)
+        (void)budget.Charge(60.0);
+    (void)budget.Charge(20.0);
+    for (int i = 0; i < SweepBudget::kOverLimit - 1; ++i)
+        Require(!budget.Charge(60.0).paused, "a sweep within budget breaks the run");
+
+    budget.Reset();
+    for (int i = 0; i < SweepBudget::kOverLimit - 1; ++i)
+        (void)budget.Charge(60.0);
+    next = budget.Charge(60.0);
+    Require(next.paused && next.first_pause, "a new alert logs its first pause again");
+}
+
+// Feeds `value` every 200 ms from `from` up to and including `to`; returns the
+// rule's state after the last reading.
+bool FeedTopApp(gtg::topapp::AlertRule& rule, const std::uint64_t from, const std::uint64_t to,
+                const std::optional<double> value) {
+    bool active = rule.Active();
+    for (std::uint64_t t = from; t <= to; t += 200)
+        active = rule.Observe(t, value);
+    return active;
+}
+
+void TestTopAppAlertRule() {
+    using gtg::topapp::AlertRule;
+    // The rule, pinned with its own numbers: the tuned constants are
+    // TestTopAppThresholds's business.
+    const gtg::topapp::Thresholds kGpuThresholds{85.0, 70.0};
+    {
+        AlertRule rule(kGpuThresholds);
+        Require(!FeedTopApp(rule, 1'000, 8'800, 95.0), "7.8 s of load is not yet an alert");
+        Require(FeedTopApp(rule, 9'000, 9'000, 95.0), "8 s of sustained load enters");
+    }
+    {
+        // Jitter that averages above the line and never dips below leave.
+        AlertRule rule(kGpuThresholds);
+        bool active = false;
+        for (std::uint64_t t = 1'000; t <= 9'000; t += 200) {
+            active = rule.Observe(t, (t / 200) % 2 == 0 ? 80.0 : 96.0);
+        }
+        Require(active, "jitter averaging 88 with no dip below 70 enters");
+    }
+    {
+        // One dip below leave vetoes until it has aged out of the 8 s window.
+        AlertRule rule(kGpuThresholds);
+        FeedTopApp(rule, 1'000, 4'800, 95.0);
+        rule.Observe(5'000, 60.0);
+        Require(!FeedTopApp(rule, 5'200, 12'800, 95.0), "a dip below leave holds entry off");
+        Require(FeedTopApp(rule, 13'000, 13'200, 95.0), "and entry follows once it has aged out");
+    }
+    {
+        // A hard drop leaves exactly ten seconds later.
+        AlertRule rule(kGpuThresholds);
+        FeedTopApp(rule, 1'000, 9'000, 95.0);
+        Require(rule.Active(), "precondition: in alert");
+        Require(FeedTopApp(rule, 9'200, 19'000, 10.0), "still in alert 9.8 s after the drop");
+        Require(!FeedTopApp(rule, 19'200, 19'200, 10.0), "left 10 s after the drop");
+    }
+    {
+        // A spike back to enter restarts the ten seconds.
+        AlertRule rule(kGpuThresholds);
+        FeedTopApp(rule, 1'000, 9'000, 95.0);
+        FeedTopApp(rule, 9'200, 14'000, 10.0);
+        rule.Observe(14'200, 90.0);
+        Require(FeedTopApp(rule, 14'400, 24'000, 10.0), "a spike to enter keeps the alert");
+        Require(!FeedTopApp(rule, 24'200, 24'400, 10.0), "until 10 s after the spike");
+    }
+    {
+        // Load between leave and enter keeps an alert up: it has not let go.
+        AlertRule rule(kGpuThresholds);
+        FeedTopApp(rule, 1'000, 9'000, 95.0);
+        Require(FeedTopApp(rule, 9'200, 40'000, 75.0), "load above leave keeps the alert");
+    }
+    {
+        // Missing readings: a short hole is survived, three seconds is not.
+        AlertRule rule(kGpuThresholds);
+        FeedTopApp(rule, 1'000, 9'000, 95.0);
+        Require(FeedTopApp(rule, 9'200, 11'800, std::nullopt), "2.8 s without data keeps it");
+        Require(!rule.Observe(12'000, std::nullopt), "3 s without data takes it down");
+    }
+    {
+        // Before entry a missing reading restarts the run.
+        AlertRule rule(kGpuThresholds);
+        FeedTopApp(rule, 1'000, 6'000, 95.0);
+        rule.Observe(6'200, std::nullopt);
+        Require(!FeedTopApp(rule, 6'400, 14'200, 95.0), "the run restarts after a hole");
+        Require(FeedTopApp(rule, 14'400, 14'400, 95.0), "8 s after the hole it enters");
+    }
+    {
+        // A stalled caller is a gap, not a continuation.
+        AlertRule rule(kGpuThresholds);
+        FeedTopApp(rule, 1'000, 5'000, 95.0);
+        Require(!FeedTopApp(rule, 7'000, 12'000, 95.0), "a 2 s silence restarts the run");
+        Require(!rule.Observe(20'000, std::nullopt) && !rule.Active(), "stale and idle");
+    }
+}
+
+void TestTopAppLeader() {
+    using gtg::topapp::Candidate;
+    using gtg::topapp::Dominance;
+    using gtg::topapp::Leader;
+    const auto apps = [](std::initializer_list<std::pair<const wchar_t*, double>> list) {
+        std::vector<Candidate> out;
+        for (const auto& [key, value] : list)
+            out.push_back({key, value});
+        return out;
+    };
+    {
+        Leader leader(Dominance::ShareOfTotal);
+        Require(!leader.Update(1'000, apps({{L"a", 60}, {L"b", 10}})), "one sweep names nobody");
+        Require(leader.Update(2'000, apps({{L"a", 60}, {L"b", 10}})) == std::wstring(L"a"),
+                "two agreeing sweeps name the leader");
+    }
+    {
+        Leader leader(Dominance::ShareOfTotal);
+        for (std::uint64_t t = 1'000; t <= 6'000; t += 1'000) {
+            Require(!leader.Update(
+                        t, apps({{L"a", 20}, {L"b", 20}, {L"c", 20}, {L"d", 21}, {L"e", 19}})),
+                    "spread load names nobody");
+        }
+    }
+    {
+        // A challenger leading by more than a quarter for three sweeps, but
+        // only once the shown name has been up five seconds.
+        Leader leader(Dominance::ShareOfTotal);
+        leader.Update(1'000, apps({{L"a", 50}, {L"b", 5}}));
+        leader.Update(2'000, apps({{L"a", 50}, {L"b", 5}}));
+        Require(leader.Shown() == std::wstring(L"a"), "precondition: a shown at 2 s");
+        std::uint64_t t = 3'000;
+        for (; t <= 6'000; t += 1'000)
+            leader.Update(t, apps({{L"a", 10}, {L"b", 200}}));
+        Require(leader.Shown() == std::wstring(L"a"), "not before five seconds shown");
+        leader.Update(7'000, apps({{L"a", 10}, {L"b", 200}}));
+        Require(leader.Shown() == std::wstring(L"b"), "switches once five seconds have passed");
+    }
+    {
+        // Leading by less than a quarter never switches.
+        Leader leader(Dominance::ShareOfTotal);
+        leader.Update(1'000, apps({{L"a", 50}, {L"b", 45}}));
+        leader.Update(2'000, apps({{L"a", 50}, {L"b", 45}}));
+        for (std::uint64_t t = 3'000; t <= 20'000; t += 1'000) {
+            leader.Update(t, apps({{L"a", 50}, {L"b", 60}}));
+        }
+        Require(leader.Shown() == std::wstring(L"a"), "a 20 % lead is not enough");
+    }
+    {
+        // One busy sweep does not win: smoothing.
+        Leader leader(Dominance::ShareOfTotal);
+        for (std::uint64_t t = 1'000; t <= 8'000; t += 1'000) {
+            leader.Update(t, apps({{L"a", 50}, {L"b", 10}}));
+        }
+        leader.Update(9'000, apps({{L"a", 50}, {L"b", 200}}));
+        leader.Update(10'000, apps({{L"a", 50}, {L"b", 10}}));
+        leader.Update(11'000, apps({{L"a", 50}, {L"b", 10}}));
+        leader.Update(12'000, apps({{L"a", 50}, {L"b", 10}}));
+        Require(leader.Shown() == std::wstring(L"a"), "one spike does not switch");
+    }
+    {
+        // The shown app exits: gone at once.
+        Leader leader(Dominance::ShareOfTotal);
+        leader.Update(1'000, apps({{L"a", 50}, {L"b", 5}}));
+        leader.Update(2'000, apps({{L"a", 50}, {L"b", 5}}));
+        Require(leader.Update(3'000, apps({{L"b", 5}, {L"c", 4}})) != std::wstring(L"a"),
+                "an exited app leaves at once");
+    }
+    {
+        // Absolute dominance, as GPU uses it.
+        Leader leader(Dominance::Absolute);
+        leader.Update(1'000, apps({{L"a", 20}}));
+        Require(!leader.Update(2'000, apps({{L"a", 20}})), "20 % busiest engine is not named");
+        leader.Update(3'000, apps({{L"a", 90}}));
+        Require(leader.Update(4'000, apps({{L"a", 90}})) == std::wstring(L"a"),
+                "a busy engine is named");
+    }
+    {
+        // The shown app stops being dominant: it goes, with the same patience.
+        Leader leader(Dominance::ShareOfTotal);
+        leader.Update(1'000, apps({{L"a", 50}, {L"b", 5}}));
+        leader.Update(2'000, apps({{L"a", 50}, {L"b", 5}}));
+        std::uint64_t t = 3'000;
+        for (; t <= 30'000 && leader.Shown(); t += 1'000) {
+            leader.Update(t,
+                          apps({{L"a", 5}, {L"b", 5}, {L"c", 5}, {L"d", 5}, {L"e", 5}, {L"f", 5}}));
+        }
+        Require(!leader.Shown(), "spread load takes the name down");
+    }
+}
+
+void TestTopAppNames() {
+    using namespace gtg::topapp;
+    Require(ExecutableStem(L"C:\\x\\vllm-server.exe") == L"vllm-server",
+            "stem drops the extension");
+    Require(ExecutableStem(L"C:/x/y/app") == L"app", "stem without an extension");
+    Require(ExecutableStem(L"C:\\x\\.hidden") == L".hidden", "a leading dot is not an extension");
+    Require(GroupKey(L"C:\\Program Files\\App\\App.EXE") ==
+                GroupKey(L"c:\\program files\\app\\app.exe"),
+            "the group key ignores case");
+    Require(GroupKey(L"C:/a/b.exe") == GroupKey(L"C:\\a\\b.exe"), "and slash direction");
+    Require(DisplayName(L"Firefox", L"C:\\x\\firefox.exe") == L"Firefox",
+            "the description comes first");
+    Require(DisplayName(L"", L"C:\\x\\vllm-server.exe") == L"vllm-server",
+            "the executable name when there is no description");
+    Require(DisplayName(L"  \t  ", L"C:\\x\\tool.exe") == L"tool", "a blank description is none");
+    Require(DisplayName(L"  Visual\r\nStudio   Code ", L"") == L"Visual Studio Code",
+            "control characters and runs of spaces collapse");
+    Require(DisplayName(L"桌面視窗管理員", L"C:\\Windows\\dwm.exe") == L"桌面視窗管理員",
+            "a localised description is kept as it is");
+    // The short name (owner, 2026-10-16): the app's name, not its tagline.
+    Require(DisplayName(L"qBittorrent - A Bittorrent Client", L"C:\\q\\qbittorrent.exe") ==
+                L"qBittorrent",
+            "a tagline after a spaced dash goes");
+    Require(DisplayName(L"Foo Tool (x64)", L"") == L"Foo Tool", "a trailing bracket goes");
+    Require(DisplayName(L"Foo\u00AE Studio\u2122", L"") == L"Foo Studio", "trademark marks go");
+    Require(DisplayName(L"NVIDIA cicc, Version 12.4.131 ", L"C:\\c\\cicc.exe") == L"NVIDIA cicc",
+            "a trailing version note goes");
+    Require(DisplayName(L"Foo Tool version 2", L"") == L"Foo Tool",
+            "in any case, with or without the comma");
+    Require(DisplayName(L"Windows 11", L"") == L"Windows 11",
+            "a bare number stays: it may be part of the name");
+    Require(DisplayName(L"Foo, Version 1.2a", L"") == L"Foo, Version 1.2a",
+            "only a plain number is a version");
+    Require(DisplayName(L"Version 2", L"C:\\t\\tool.exe") == L"Version 2",
+            "the version rule never leaves nothing");
+    Require(DisplayName(L"Click-to-Run", L"") == L"Click-to-Run", "an unspaced hyphen stays");
+    Require(DisplayName(L"(x64)", L"C:\\t\\tool.exe") == L"(x64)",
+            "a rule that would leave nothing does not apply");
+    Require(DisplayName(L"", L"C:\\g\\GameName-Win64-Shipping.exe") == L"GameName",
+            "a game build's suffix goes from the executable name");
+    Require(DisplayName(L"", L"C:\\t\\Tool_x64.exe") == L"Tool", "and an architecture suffix");
+    Require(DisplayName(L"", L"C:\\t\\x64.exe") == L"x64", "but never the whole name");
+
+    // The cap: 20 Latin letters' width, CJK counted 1.5, cut at a word.
+    Require(NameWidth(L"abc") == 6 && NameWidth(L"\u684C\u9762") == 6, "CJK is 1.5 letters");
+    Require(DisplayName(L"Google Chrome for Testing", L"") == L"Google Chrome for\u2026",
+            "cut at a word, with an ellipsis");
+    Require(DisplayName(L"Host Process for Windows Services", L"") == L"Host Process for\u2026",
+            "a long description is cut the same way");
+    Require(DisplayName(L"桌面視窗管理員", L"C:\\Windows\\dwm.exe") == L"桌面視窗管理員",
+            "seven CJK characters fit");
+    const std::wstring cjk = DisplayName(L"一二三四五六七八九十一二三四五", L"");
+    Require(cjk.size() == 13 && cjk.back() == kEllipsis && NameWidth(cjk) <= kMaxNameWidth,
+            "fifteen CJK characters are cut to twelve");
+    const std::wstring long_name(80, L'x');
+    const std::wstring cut = DisplayName(long_name, L"");
+    Require(NameWidth(cut) <= kMaxNameWidth && cut.back() == kEllipsis,
+            "a word longer than the cap is cut mid-word");
+    std::wstring pair(17, L'y');
+    pair += L"\U0001F600zzzz";
+    const std::wstring kept = DisplayName(pair, L"");
+    Require(kept.size() == 20 && kept[17] == 0xD83D && kept[18] == 0xDE00,
+            "a surrogate pair that fits is kept whole");
+    std::wstring straddle(18, L'y');
+    straddle += L"\U0001F600zzzz";
+    const std::wstring dropped = DisplayName(straddle, L"");
+    Require(dropped.size() == 19 && dropped[17] == L'y', "one that does not is dropped whole");
+}
+
+void TestTopAppServiceHost() {
+    using namespace gtg::topapp;
+    Require(IsServiceHost(L"C:\\Windows\\System32\\svchost.exe"), "svchost is a service host");
+    Require(IsServiceHost(L"C:\\Windows\\SysWOW64\\SvcHost.EXE"), "in any case");
+    Require(!IsServiceHost(L"C:\\x\\svchostx.exe"), "but not a name that contains it");
+    Require(ServiceHostName({L"Windows Update"}) == L"Windows Update", "one service: its name");
+    Require(ServiceHostName({L"Remote Procedure Call (RPC)", L"DCOM Server Process Launcher",
+                             L"RPC Endpoint Mapper"}) == L"Remote Procedure\u2026 +2",
+            "several: the first, short, and how many more");
+    Require(NameWidth(ServiceHostName({std::wstring(60, L'a'), L"b"})) <= kMaxNameWidth,
+            "the count fits inside the cap");
+    Require(ServiceHostName({}).empty(), "no services, no name");
+}
+
+void TestTopAppSystemProcesses() {
+    using namespace gtg::topapp;
+    const std::vector<ProcessEntry> list = {
+        {8, 4, L"vmcompute.exe"},
+        {100, 8, L"vmwp.exe"},
+        {200, 100, L"vmmemWSL"},
+        {300, 8, L"VMWP.EXE"},
+        {400, 300, L"vmmem"},
+        {500, 8, L"vmwp.exe"},
+        {600, 999, L"vmmemCmZygote"},
+        {700, 4, L"Memory Compression"},
+        {4, 0, L"System"},
+        {800, 4, L""},
+        {900, 4, L"explorer.exe"},
+        {950, 900, L"VMMEMWSL"},
+    };
+    const auto map = ClassifySystemProcesses(list);
+    const auto at = [&](const std::uint32_t pid) {
+        return map.at(pid);
+    };
+    Require(at(200).kind == SystemKind::Wsl && at(100).kind == SystemKind::Wsl,
+            "vmmemWSL and its worker are WSL");
+    Require(at(100).key == at(200).key, "one app: GPU from the worker, CPU and RAM from memory");
+    Require(at(300).kind == SystemKind::VirtualMachine && at(300).key == at(400).key,
+            "another VM is one app too, in any case");
+    Require(at(500).kind == SystemKind::VirtualMachine && at(500).key != at(300).key &&
+                at(300).key != at(100).key,
+            "two VMs never merge, nor with WSL");
+    Require(at(600).kind == SystemKind::VirtualMachine && at(600).key != at(500).key,
+            "a memory process without a worker is a VM of its own");
+    Require(at(700).kind == SystemKind::Kernel && at(700).name == L"Memory Compression",
+            "a kernel process keeps its own name");
+    Require(at(4).name == L"System" && at(4).key != at(700).key, "each under its own key");
+    Require(!map.contains(800), "no name, not ranked");
+    Require(at(950).kind == SystemKind::Wsl && at(900).kind == SystemKind::Kernel,
+            "a parent that is no VM worker is not claimed");
+    Require(KernelProcessName(L"foo.exe") == L"foo", "an executable's name loses .exe");
+    Require(NameWidth(KernelProcessName(std::wstring(60, L'k'))) <= kMaxNameWidth, "and is cut");
+
+    Require(IsVmWorker(L"C:\\Windows\\System32\\vmwp.exe"), "the system's worker");
+    Require(IsVmWorker(L"c:\\windows\\SYSTEM32\\VMWP.EXE"), "in any case");
+    Require(!IsVmWorker(L"C:\\Tools\\vmwp.exe"), "not a copy elsewhere");
+
+    // The list is read only for processes newer than it, at most every 10
+    // sweeps, and a reused pid never inherits the list's name.
+    SystemProcessMap names;
+    int reads = 0;
+    std::uint64_t now = 1'000;
+    const auto take = [&](std::vector<ProcessEntry>& entries) -> std::optional<std::uint64_t> {
+        ++reads;
+        entries = list;
+        return now;
+    };
+    const SystemProcess* found = names.Find(200, 500, 1, take);
+    Require(found != nullptr && found->kind == SystemKind::Wsl && reads == 1,
+            "the first question reads the list");
+    Require(names.Find(700, 900, 1, take) != nullptr && reads == 1, "an older process: no read");
+    Require(names.Find(123, 900, 2, take) == nullptr && reads == 1,
+            "a process the list does not name stays unnamed without a read");
+    now = 3'000;
+    Require(names.Find(200, 2'000, 5, take) == nullptr && reads == 1,
+            "a newer process with a reused pid waits for the next read");
+    Require(names.Find(200, 2'000, 11, take) != nullptr && reads == 2,
+            "ten sweeps on, the list is read again");
+    const auto fail = [&](std::vector<ProcessEntry>&) -> std::optional<std::uint64_t> {
+        ++reads;
+        return std::nullopt;
+    };
+    Require(names.Find(400, 5'000, 21, fail) == nullptr && reads == 3, "a failed read names none");
+    Require(names.Find(700, 900, 22, fail) != nullptr && reads == 3,
+            "and the list before it still holds");
+}
+
+void TestTopAppThresholds() {
+    using namespace gtg::topapp;
+    // Owner, 2026-10-16: GPU and VRAM name their app from 70 %.
+    Require(kGpuThresholds.enter == 70.0 && kVramThresholds.enter == 70.0,
+            "GPU and VRAM enter at 70 %");
+    for (const Thresholds t : {kGpuThresholds, kVramThresholds, kCpuThresholds, kRamThresholds}) {
+        Require(t.leave < t.enter, "every record leaves below where it enters");
+    }
+}
+
+void TestTopAppCpuLedger() {
+    using gtg::topapp::CpuLedger;
+    using gtg::topapp::Identity;
+    CpuLedger ledger;
+    const Identity a{100, 1};
+    ledger.BeginSweep(1'000);
+    Require(!ledger.Update(a, 0, 4), "nothing on first sight");
+    ledger.EndSweep();
+    ledger.BeginSweep(2'000);
+    // 2 s of busy time over 1 s on 4 processors is half the machine.
+    const auto half = ledger.Update(a, 20'000'000, 4);
+    Require(half && *half > 49.9 && *half < 50.1, "busy over wall over processors");
+    ledger.EndSweep();
+    ledger.BeginSweep(3'000);
+    const Identity reused{100, 2};
+    Require(!ledger.Update(reused, 50'000'000, 4), "a reused pid is a new process");
+    ledger.EndSweep();
+    ledger.BeginSweep(4'000);
+    Require(!ledger.Update(a, 30'000'000, 4), "a process missed for a sweep starts over");
+    ledger.EndSweep();
+    ledger.BeginSweep(5'000);
+    Require(!ledger.Update(a, 10'000'000, 4), "a counter going backwards is not a rate");
+    ledger.EndSweep();
+}
+
+void TestTopAppMarquee() {
+    using namespace gtg::topapp::marquee;
+    Require(ScrollOffset(5'000, 50.0F, 60.0F, 24.0F, 24.0F, kPauseMs) == 0.0F,
+            "a name that fits never moves");
+    Require(ScrollOffset(500, 100.0F, 60.0F, 24.0F, 24.0F, 1'200) == 0.0F,
+            "still during the pause");
+    const float moved = ScrollOffset(2'200, 100.0F, 60.0F, 24.0F, 24.0F, 1'200);
+    Require(moved > 23.9F && moved < 24.1F, "24 per second after the pause");
+    // One cycle is the text and the gap: 124 at 24/s is 5166 ms, plus the pause.
+    Require(ScrollOffset(1'200 + 5'166 + 1, 100.0F, 60.0F, 24.0F, 24.0F, 1'200) == 0.0F,
+            "the loop starts over with a pause");
+    Require(PageOffset(10'000, 50.0F, 60.0F, kPageMs) == 0.0F, "a fitting name does not page");
+    Require(PageOffset(0, 100.0F, 60.0F, 2'000) == 0.0F, "first page at the start");
+    Require(PageOffset(2'000, 100.0F, 60.0F, 2'000) == 40.0F,
+            "the last page ends flush with the box");
+    Require(PageOffset(4'000, 100.0F, 60.0F, 2'000) == 0.0F, "then it starts over");
+    Require(PageOffset(2'000, 200.0F, 60.0F, 2'000) == 48.0F, "a page advances four fifths");
+}
+
+void TestTopAppPdhInstance() {
+    using gtg::topapp::EqualsFolded;
+    using gtg::topapp::InstanceId;
+    using gtg::topapp::ParseInstance;
+    InstanceId id;
+    Require(ParseInstance(L"pid_1234_luid_0x00000000_0x01A121AC_phys_0_eng_0_engtype_3D", id) &&
+                id.pid == 1234 && id.luid == L"0x00000000_0x01A121AC",
+            "an engine instance");
+    Require(ParseInstance(L"pid_8_luid_0x00000000_0x0001E692_phys_0", id) && id.pid == 8,
+            "a memory instance");
+    Require(EqualsFolded(id.luid, L"0x00000000_0x0001e692"), "LUIDs compare without case");
+    Require(!EqualsFolded(id.luid, L"0x00000000_0x0001e693"), "but do compare");
+    Require(!ParseInstance(L"_Total", id), "the total is not a process");
+    Require(!ParseInstance(L"pid__luid_0x00000000_0x0001E692", id), "no digits");
+    Require(!ParseInstance(L"pid_99999999999_luid_0x00000000_0x0001E692", id), "too long a pid");
+    Require(!ParseInstance(L"pid_1_luid_0x0000", id), "a cut-off LUID");
+    Require(!ParseInstance(L"pid_1_luid_zz00000000_0x0001E692_phys_0", id), "a malformed LUID");
+}
+
+void TestTopAppBoard() {
+    using gtg::topapp::Carry;
+    using gtg::topapp::Shown;
+    std::optional<Shown> slot;
+    Carry(slot, std::wstring(L"Firefox"), 1'000);
+    Require(slot && slot->since_ms == 1'000, "a new name starts its clock");
+    Carry(slot, std::wstring(L"Firefox"), 5'000);
+    Require(slot && slot->since_ms == 1'000, "the same name keeps it");
+    Carry(slot, std::wstring(L"vllm-server"), 6'000);
+    Require(slot && slot->since_ms == 6'000 && slot->name == L"vllm-server",
+            "a changed name starts over");
+    Carry(slot, std::nullopt, 7'000);
+    Require(!slot, "no name clears the slot");
+    Require(gtg::settings::ResolveTopAppPreference(false, 0), "absent means on");
+    Require(!gtg::settings::ResolveTopAppPreference(true, 0), "an explicit zero is off");
+}
+
+gtg::peer::PairingCode SamplePairingCode(const std::uint8_t seed) {
+    gtg::peer::PairingCode code;
+    code.address = {192, 168, 1, static_cast<std::uint8_t>(10 + seed)};
+    code.port = static_cast<std::uint16_t>(47'800 + seed);
+    for (std::size_t i = 0; i < code.secret.size(); ++i) {
+        code.secret[i] = static_cast<std::uint8_t>(seed * 37 + i * 11);
+    }
+    return code;
+}
+
+void TestPeerPairingCode() {
+    using namespace gtg::peer;
+    const std::string_view qr_alphanumeric = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+    for (std::uint8_t seed = 0; seed < 32; ++seed) {
+        const PairingCode code = SamplePairingCode(seed);
+        const std::string text = FormatCode(code);
+        Require(text.size() == 51 && text.rfind("GTG-", 0) == 0, "the code's shape");
+        for (std::size_t i = 3; i < text.size(); i += 6) {
+            Require(text[i] == '-', "groups of five");
+        }
+        for (const char c : text) {
+            Require(qr_alphanumeric.find(c) != std::string_view::npos,
+                    "every character is in the QR alphanumeric set");
+        }
+        const auto parsed = ParseCode(std::string_view(text));
+        Require(parsed.code && *parsed.code == code, "a code reads back as it was written");
+    }
+
+    const PairingCode code = SamplePairingCode(3);
+    const std::string text = FormatCode(code);
+    const auto reads = [&](const std::wstring& typed) {
+        const auto parsed = ParseCode(std::wstring_view(typed));
+        return parsed.code && *parsed.code == code;
+    };
+    const std::wstring wide(text.begin(), text.end());
+    std::wstring lower = wide;
+    for (wchar_t& c : lower)
+        c = static_cast<wchar_t>(towlower(c));
+    Require(reads(lower), "case is ignored");
+    std::wstring bare;
+    for (const wchar_t c : wide.substr(3)) {
+        if (c != L'-') bare.push_back(c);
+    }
+    Require(reads(bare), "the prefix and the dashes are optional");
+    std::wstring spaced = L"  " + wide.substr(0, 20) + L"\r\n" + wide.substr(20, 11) + L" \t" +
+                          wide.substr(31) + L"\n";
+    Require(reads(spaced), "spaces and line breaks are ignored");
+    std::wstring full_width;
+    for (const wchar_t c : wide) {
+        full_width.push_back(c == L'-' ? L'\uFF0D' : static_cast<wchar_t>(c + 0xFEE0));
+    }
+    Require(reads(full_width), "full-width characters from an input method are read");
+    std::wstring dashes = wide;
+    for (wchar_t& c : dashes) {
+        if (c == L'-') c = L'\u2013';
+    }
+    Require(reads(dashes), "a chat window's en dashes are read as dashes");
+    std::wstring confusable = wide;
+    for (std::size_t i = 4; i < confusable.size(); ++i) {
+        if (confusable[i] == L'0') confusable[i] = L'O';
+        if (confusable[i] == L'1') confusable[i] = (i % 2 == 0) ? L'I' : L'l';
+    }
+    Require(confusable != wide && reads(confusable), "O reads as 0, I and L as 1");
+
+    // Any one symbol mistyped, and any two neighbours swapped, are caught by
+    // the checksum before anything is sent.
+    const std::string alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    for (std::size_t i = 4; i < text.size(); ++i) {
+        if (text[i] == '-') continue;
+        for (const char replacement : alphabet) {
+            if (replacement == text[i]) continue;
+            std::string typo = text;
+            typo[i] = replacement;
+            Require(ParseCode(std::string_view(typo)).error == CodeError::Checksum,
+                    "a mistyped symbol is caught");
+        }
+    }
+    std::string symbols;
+    for (const char c : text.substr(4)) {
+        if (c != '-') symbols.push_back(c);
+    }
+    for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
+        if (symbols[i] == symbols[i + 1]) continue;
+        std::string swapped = symbols;
+        std::swap(swapped[i], swapped[i + 1]);
+        Require(ParseCode(std::string_view(swapped)).error == CodeError::Checksum,
+                "two swapped symbols are caught");
+    }
+    Require(ParseCode(std::string_view(symbols.substr(0, symbols.size() - 1))).error ==
+                CodeError::Length,
+            "a truncated code is incomplete");
+    Require(ParseCode(std::string_view(symbols + "0")).error == CodeError::Length,
+            "one symbol too many is not a code");
+    Require(ParseCode(std::string_view(text + text)).error == CodeError::Length,
+            "two codes are not one");
+    std::string with_u = text;
+    with_u[10] = 'U';
+    Require(ParseCode(std::string_view(with_u)).error == CodeError::Character, "U is not a symbol");
+    Require(ParseCode(std::string_view("GTG-@")).error == CodeError::Character,
+            "punctuation is not a symbol");
+    Require(ParseCode(std::string_view("")).error == CodeError::Empty &&
+                ParseCode(std::wstring_view(L" - \r\n")).error == CodeError::Empty,
+            "nothing pasted is empty");
+
+    // Content that checksums but is not a code this version reads.
+    std::array<std::uint8_t, kCodeBytes> bytes{};
+    bytes[0] = 0x26;  // format 2, IPv6
+    bytes[1] = 10;
+    bytes[6] = 1;
+    Require(ParseCode(std::string_view(code_detail::Encode(bytes))).error == CodeError::Format,
+            "a later format is refused");
+    for (const auto& address :
+         {std::array<std::uint8_t, 4>{0, 0, 0, 0}, std::array<std::uint8_t, 4>{224, 0, 0, 1},
+          std::array<std::uint8_t, 4>{255, 255, 255, 255}}) {
+        PairingCode bad = code;
+        bad.address = address;
+        Require(ParseCode(std::string_view(FormatCode(bad))).error == CodeError::Address,
+                "an address no host has is refused");
+    }
+    PairingCode no_port = code;
+    no_port.port = 0;
+    Require(ParseCode(std::string_view(FormatCode(no_port))).error == CodeError::Address,
+            "port 0 is refused");
+    PairingCode loopback = code;
+    loopback.address = {127, 0, 0, 1};
+    Require(ParseCode(std::string_view(FormatCode(loopback))).code.has_value(),
+            "loopback is a host: two GTGs on one machine");
+}
+
+gtg::peer::HostState SampleHostState() {
+    using namespace gtg::peer;
+    HostState state;
+    state.name = L"Render-01";
+    state.version = {1, 2, 0};
+    state.protection = Protection::Warning;
+    state.stale = true;
+    state.records[0] = {0.5F, 0.75F, true, false, 83.5F, std::nullopt};
+    state.records[1] = {0.25F, 0.5F, false, false, 412.0F, std::nullopt};
+    state.records[2] = {std::nullopt, 0.7F, false, false, std::nullopt, std::nullopt};
+    state.records[6] = {0.6667F, 0.6667F, true, true, 59.9F, std::nullopt};
+    state.records[7] = {0.125F, std::nullopt, false, false, 1.5e6F, 2.5e5F};
+    return state;
+}
+
+void TestPeerProtocol() {
+    using namespace gtg::peer;
+    Require(DatagramBytes(Type::PairRequest) == 160 && DatagramBytes(Type::PairAccept) == 168 &&
+                DatagramBytes(Type::State) == 244 && DatagramBytes(Type::Goodbye) == 60,
+            "each type has one exact size");
+
+    const HostState state = SampleHostState();
+    const auto body = WriteStateBody(state);
+    const auto read = ReadStateBody(body);
+    Require(read && *read == state, "a state reads back as it was written");
+
+    // Every check refuses the whole datagram.
+    const auto refused = [&](const std::size_t offset, const std::uint8_t value, const char* what) {
+        auto bad = body;
+        bad[offset] = value;
+        Require(!ReadStateBody(bad), what);
+    };
+    const std::size_t records = kNameBytes + 8;
+    const auto record = [&](const std::size_t index) {
+        return records + index * kRecordBytes;
+    };
+    refused(kNameBytes + 4, kProtectionCount, "a protection state that does not exist");
+    refused(kNameBytes + 5, 0x02, "an unknown state flag");
+    refused(kNameBytes + 6, 9, "another record count");
+    refused(kNameBytes + 3, 1, "a reserved byte");
+    refused(record(0), 0x40, "an unknown record flag");
+    refused(record(0) + 1, 1, "a reserved record byte");
+    refused(record(0) + 3, 0x28, "a level above 1");  // 10'240
+    refused(record(2) + 2, 1, "a level without its flag");
+    refused(
+        record(1),
+        record_flags::kLevel | record_flags::kTick | record_flags::kValue | record_flags::kAlarm,
+        "an alarm on a record that has none");
+    refused(record(0),
+            record_flags::kLevel | record_flags::kTick | record_flags::kRaised |
+                record_flags::kValue | record_flags::kValue2,
+            "a second value on a record that has none");
+    const auto set_float = [&](const std::size_t index, const std::size_t at, const float value,
+                               const char* what) {
+        auto bad = body;
+        const auto raw = std::bit_cast<std::uint32_t>(value);
+        for (std::size_t i = 0; i < 4; ++i) {
+            bad[record(index) + at + i] = static_cast<std::uint8_t>(raw >> (8 * i));
+        }
+        Require(!ReadStateBody(bad), what);
+    };
+    set_float(0, 8, std::numeric_limits<float>::quiet_NaN(), "NaN");
+    set_float(0, 8, std::numeric_limits<float>::infinity(), "infinity");
+    set_float(3, 8, 5.0F, "a value without its flag must be zero");
+    {
+        auto bad = body;
+        bad[record(3)] = record_flags::kValue;
+        const auto raw = std::bit_cast<std::uint32_t>(100.5F);
+        for (std::size_t i = 0; i < 4; ++i) {
+            bad[record(3) + 8 + i] = static_cast<std::uint8_t>(raw >> (8 * i));
+        }
+        Require(!ReadStateBody(bad), "a percentage above 100");
+    }
+    Require(!ReadStateBody(std::span(body).first(body.size() - 1)), "a body one byte short");
+
+    // Names: UTF-8 only, no controls, nothing after the padding.
+    HostState named = state;
+    named.name = L"\u5DE5\u4F5C\u7AD9 \u2014 GPU";
+    Require(ReadStateBody(WriteStateBody(named))->name == named.name, "a CJK name round trips");
+    named.name = std::wstring(60, L'\u5DE5');
+    Require(ReadStateBody(WriteStateBody(named))->name == std::wstring(16, L'\u5DE5'),
+            "a long name is cut at a character boundary");
+    // Built from its code unit: a literal override trips the compiler's own
+    // bidirectional-text warning.
+    named.name = std::wstring(L"evil") + static_cast<wchar_t>(0x202E) + L"gnp.exe\r\n";
+    Require(ReadStateBody(WriteStateBody(named))->name == L"evilgnp.exe",
+            "direction overrides and controls are dropped");
+    refused(0, 0xC0, "an overlong UTF-8 lead");
+    refused(0, 0xFF, "a byte that is never UTF-8");
+    {
+        auto bad = body;
+        bad[kNameBytes - 1] = 'x';
+        Require(!ReadStateBody(bad), "bytes after the name's padding");
+    }
+    {
+        auto bad = body;
+        const std::uint8_t surrogate[3] = {0xED, 0xA0, 0x80};
+        std::memcpy(bad.data(), surrogate, 3);
+        Require(!ReadStateBody(bad), "an encoded surrogate");
+    }
+
+    // The sender clamps rather than sending what the receiver refuses.
+    HostState wild = state;
+    wild.records[3].value = 140.0F;
+    wild.records[4].value = std::numeric_limits<float>::quiet_NaN();
+    wild.records[0].level = 3.0F;
+    wild.records[2].value2 = 7.0F;
+    const auto clamped = ReadStateBody(WriteStateBody(wild));
+    Require(clamped && clamped->records[3].value == 100.0F && !clamped->records[4].value &&
+                clamped->records[0].level == 1.0F && !clamped->records[2].value2,
+            "the sender clamps to what the receiver accepts");
+
+    // Headers and prefixes.
+    SealedHeader header;
+    header.type = Type::State;
+    header.sender = 0x0102030405060708ULL;
+    header.salt.fill(0xA5);
+    header.sequence = 77;
+    header.sent_ms = 1'790'000'000'000;
+    std::array<std::uint8_t, kStateBytes> datagram{};
+    const auto header_bytes = WriteSealedHeader(header);
+    std::memcpy(datagram.data(), header_bytes.data(), header_bytes.size());
+    const auto back = ReadSealedHeader(datagram);
+    Require(back && back->sender == header.sender && back->salt == header.salt &&
+                back->sequence == 77 && back->sent_ms == header.sent_ms,
+            "a sealed header reads back");
+    Require(!ReadSealedHeader(std::span(datagram).first(kStateBytes - 1)),
+            "a state datagram one byte short is dropped before anything else");
+    Require(!ReadPrefix(std::span(datagram).first(kGoodbyeBytes)),
+            "a state header on a goodbye's size is dropped");
+    auto other = datagram;
+    other[2] = kProtocolVersion + 1;
+    Require(!ReadPrefix(other), "another protocol version");
+    other = datagram;
+    other[0] = 'X';
+    Require(!ReadPrefix(other), "not ours");
+    other = datagram;
+    other[3] = 9;
+    Require(!ReadPrefix(other), "a type that does not exist");
+#ifndef GTG_FEATURE_UPDATE
+    // A newer GTG may send types this one does not know: each is dropped
+    // before anything else is read, so the state beside them carries on.
+    for (int type = 5; type < 256; ++type) {
+        other = datagram;
+        other[3] = static_cast<std::uint8_t>(type);
+        Require(!ReadPrefix(other), "a type from a newer GTG is dropped first");
+    }
+#endif
+
+    PairRequest request;
+    request.joiner = 42;
+    request.code_id = {1, 2, 3, 4};
+    request.public_key.fill(7);
+    request.name = NameField(L"Joiner");
+    request.mac.fill(9);
+    const auto request_bytes = WritePairRequest(request);
+    const auto request_back = ReadPairRequest(request_bytes);
+    Require(request_back && request_back->joiner == 42 &&
+                request_back->code_id == request.code_id &&
+                request_back->public_key == request.public_key && request_back->mac == request.mac,
+            "a pair request reads back");
+    Require(MacInput(request_bytes).size() == kPairRequestBytes - kMacBytes,
+            "the MAC covers everything before it");
+    PairAccept accept;
+    accept.issuer = 5;
+    accept.status = AcceptStatus::Used;
+    accept.joiner = 42;
+    auto accept_bytes = WritePairAccept(accept);
+    Require(
+        ReadPairAccept(accept_bytes) && ReadPairAccept(accept_bytes)->status == AcceptStatus::Used,
+        "a refusal reads back");
+    accept_bytes[kPrefixBytes] = kAcceptStatusCount;
+    Require(!ReadPairAccept(accept_bytes), "a status that does not exist");
+    accept_bytes[kPrefixBytes] = 0;
+    accept_bytes[kPrefixBytes + 1] = 1;
+    Require(!ReadPairAccept(accept_bytes), "an accept's reserved byte");
+}
+
+void TestPeerHostsView() {
+    using namespace gtg::peer;
+    Require(PresenceAt({}, 50'000) == Presence::NotHeard, "never heard is not lost");
+    Require(PresenceAt({1'000, std::nullopt}, 4'000) == Presence::Online, "3 s is still online");
+    Require(PresenceAt({1'000, std::nullopt}, 4'001) == Presence::Dim, "after 3 s it dims");
+    Require(PresenceAt({1'000, std::nullopt}, 11'000) == Presence::Dim, "10 s is still dim");
+    Require(PresenceAt({1'000, std::nullopt}, 11'001) == Presence::Lost, "after 10 s it is lost");
+    Require(PresenceAt({1'000, 1'500}, 60'000) == Presence::Offline, "a goodbye is offline, quiet");
+    Require(PresenceAt({std::nullopt, 1'500}, 60'000) == Presence::Offline,
+            "a goodbye before any state is offline");
+    Require(PresenceAt({2'000, 1'500}, 2'500) == Presence::Online, "a state after goodbye is back");
+    Require(PresenceAt({5'000, std::nullopt}, 1'000) == Presence::Online,
+            "a clock read before the state is not silence");
+
+    HostState calm;
+    calm.protection = Protection::Normal;
+    Require(InAlert(Presence::Lost, nullptr), "lost is an alert");
+    Require(!InAlert(Presence::Online, &calm), "normal and nothing raised is quiet");
+    Require(!InAlert(Presence::Offline, nullptr) && !InAlert(Presence::NotHeard, nullptr),
+            "offline is quiet");
+    for (const Protection protection :
+         {Protection::Warning, Protection::SafePower, Protection::Fault}) {
+        HostState protecting = calm;
+        protecting.protection = protection;
+        Require(InAlert(Presence::Online, &protecting) && InAlert(Presence::Dim, &protecting),
+                "protection that is not normal is an alert");
+        Require(!InAlert(Presence::Offline, &protecting), "an offline host's last state is past");
+    }
+    HostState unknown = calm;
+    unknown.protection = Protection::Unknown;
+    Require(!InAlert(Presence::Online, &unknown), "no protection running is not an alert");
+    HostState raised = calm;
+    raised.records[5].raised = true;
+    Require(InAlert(Presence::Online, &raised), "a record raised by the host's rules");
+
+    const auto shown = [](const std::vector<Candidate>& hosts) {
+        const Shown result = ChooseShown(hosts);
+        return std::vector<std::size_t>(
+            result.index.begin(), result.index.begin() + static_cast<std::ptrdiff_t>(result.count));
+    };
+    const Candidate on{Presence::Online, false};
+    const Candidate off{Presence::Offline, false};
+    const Candidate alert{Presence::Online, true};
+    const Candidate lost{Presence::Lost, true};
+    Require(shown({}).empty(), "no hosts, nothing shown");
+    Require(shown({off, on}) == std::vector<std::size_t>{0, 1}, "fewer than four: all, in order");
+    Require(shown({on, on, on, on, on, on}) == std::vector<std::size_t>{0, 1, 2, 3},
+            "the first four in the reader's order");
+    Require(shown({on, on, on, on, alert, on}) == std::vector<std::size_t>{0, 1, 2, 4},
+            "a host in alert takes a place");
+    Require(shown({on, on, on, on, lost, lost, lost, lost, lost}) ==
+                std::vector<std::size_t>{4, 5, 6, 7},
+            "alerts take every place when there are four");
+    Require(shown({off, off, on, off, on, on, on}) == std::vector<std::size_t>{2, 4, 5, 6},
+            "present hosts before offline ones");
+    Require(shown({off, off, off, off, off}) == std::vector<std::size_t>{0, 1, 2, 3},
+            "all offline: the first four");
+    Require(shown({alert, off, off, on}) == std::vector<std::size_t>{0, 1, 2, 3},
+            "chosen hosts keep the reader's order");
+
+    Require(SegmentFor(off) == Segment::Offline && SegmentFor(on) == Segment::Online &&
+                SegmentFor(alert) == Segment::Alert && SegmentFor(lost) == Segment::Alert &&
+                SegmentFor({Presence::Dim, false}) == Segment::Online &&
+                SegmentFor({Presence::NotHeard, false}) == Segment::Offline,
+            "Tiny's segments");
+    Require(SilenceText(42'900) == L"0:42" && SilenceText(725'000) == L"12:05" &&
+                SilenceText(3'723'000) == L"1:02:03",
+            "how long a host has been silent");
+}
+
+void TestPeerReplay() {
+    using namespace gtg::peer;
+    const std::int64_t now = 1'790'000'000'000;
+    SealedHeader first;
+    first.salt.fill(1);
+    first.sequence = 1;
+    first.sent_ms = now;
+    ReplayGuard guard;
+    Require(guard.Classify(first, now) == Verdict::NewSession, "the first session");
+    guard.Accept(first);
+    Require(guard.Classify(first, now) == Verdict::Replayed, "the same datagram again");
+    SealedHeader next = first;
+    next.sequence = 2;
+    next.sent_ms = now + 1'000;
+    Require(guard.Classify(next, now + 1'000) == Verdict::Current, "the next number");
+    guard.Accept(next);
+    Require(guard.Classify(first, now + 1'000) == Verdict::Replayed, "an older number");
+    // Nothing moves before the tag verifies: classifying is not accepting.
+    SealedHeader skip = next;
+    skip.sequence = 1'000;
+    Require(guard.Classify(skip, now) == Verdict::Current, "a later number is current");
+    Require(guard.Classify(next, now) == Verdict::Replayed, "classifying moved nothing");
+
+    SealedHeader restart;
+    restart.salt.fill(2);
+    restart.sequence = 1;
+    restart.sent_ms = now + 5'000;
+    Require(guard.Classify(restart, now + 5'000) == Verdict::NewSession,
+            "a restarted sender is a new session");
+    restart.sent_ms = now + 500;
+    Require(guard.Classify(restart, now + 5'000) == Verdict::Older,
+            "a session from before the one in use is refused");
+    restart.sent_ms = now + 5'000 + kSessionWindowMs + 1;
+    Require(guard.Classify(restart, now + 5'000) == Verdict::OutOfWindow, "a clock too far ahead");
+    restart.sent_ms = now + 5'000 - kSessionWindowMs - 1;
+    Require(guard.Classify(restart, now + 5'000) == Verdict::OutOfWindow, "a clock too far behind");
+
+    // A receiver that restarted knows no session: a recording older than the
+    // window is refused, one inside it is the accepted two-minute exposure.
+    ReplayGuard fresh;
+    Require(fresh.Classify(first, now + kSessionWindowMs + 1) == Verdict::OutOfWindow,
+            "a recording older than two minutes");
+    Require(fresh.Classify(first, now + kSessionWindowMs) == Verdict::NewSession,
+            "a recording inside the window");
+}
+
+std::vector<std::uint8_t> Hex(const std::string_view text) {
+    std::vector<std::uint8_t> bytes;
+    const auto nibble = [](const char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return c - 'A' + 10;
+    };
+    for (std::size_t i = 0; i + 1 < text.size(); i += 2) {
+        bytes.push_back(static_cast<std::uint8_t>(nibble(text[i]) * 16 + nibble(text[i + 1])));
+    }
+    return bytes;
+}
+
+template <std::size_t N>
+std::vector<std::uint8_t> AsVector(const std::array<std::uint8_t, N>& bytes) {
+    return {bytes.begin(), bytes.end()};
+}
+
+void TestPeerCryptoVectors() {
+    using namespace gtg::peer;
+    Crypto crypto;
+    Require(crypto.Load(), "CNG and DPAPI load from System32");
+
+    // RFC 4231, test case 2.
+    const std::string_view jefe = "Jefe";
+    const std::string_view question = "what do ya want for nothing?";
+    const auto hmac = crypto.Hmac(
+        Bytes(reinterpret_cast<const std::uint8_t*>(jefe.data()), jefe.size()),
+        {Bytes(reinterpret_cast<const std::uint8_t*>(question.data()), 10),
+         Bytes(reinterpret_cast<const std::uint8_t*>(question.data()) + 10, question.size() - 10)});
+    Require(hmac && AsVector(*hmac) ==
+                        Hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+            "HMAC-SHA256 over parts as one message (RFC 4231)");
+
+    // RFC 5869, test cases 1 and 3: the first 32 bytes of output.
+    const auto ikm = Hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    const auto hkdf =
+        crypto.Hkdf(ikm, Hex("000102030405060708090a0b0c"), Hex("f0f1f2f3f4f5f6f7f8f9"));
+    Require(hkdf && AsVector(*hkdf) ==
+                        Hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"),
+            "HKDF-SHA256 (RFC 5869, case 1)");
+    const auto unsalted = crypto.Hkdf(ikm, {}, {});
+    Require(unsalted && AsVector(*unsalted) ==
+                            Hex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"),
+            "HKDF-SHA256 without salt or info (RFC 5869, case 3)");
+
+    // The GCM specification's test case 16: AES-256, 96-bit IV, with AAD.
+    Key key{};
+    const auto key_bytes = Hex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308");
+    std::copy(key_bytes.begin(), key_bytes.end(), key.begin());
+    std::array<std::uint8_t, kNonceBytes> iv{};
+    const auto iv_bytes = Hex("cafebabefacedbaddecaf888");
+    std::copy(iv_bytes.begin(), iv_bytes.end(), iv.begin());
+    const auto plaintext = Hex(
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6"
+        "b525b16aedf5aa0de657ba637b39");
+    const auto aad = Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+    const auto expected = Hex(
+        "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056"
+        "828838c5f61e6393ba7a0abcc9f662");
+    const auto expected_tag = Hex("76fc6ece0f4e1768cddf8853bb2d551b");
+    std::vector<std::uint8_t> ciphertext(plaintext.size());
+    std::array<std::uint8_t, 16> tag{};
+    Require(crypto.Seal(key, iv, aad, plaintext, ciphertext, tag) && ciphertext == expected &&
+                AsVector(tag) == expected_tag,
+            "AES-256-GCM (GCM test case 16)");
+    std::vector<std::uint8_t> opened(ciphertext.size());
+    Require(crypto.Open(key, iv, aad, ciphertext, tag, opened) && opened == plaintext,
+            "AES-256-GCM opens what it sealed");
+    for (std::size_t i = 0; i < ciphertext.size() + aad.size() + tag.size(); ++i) {
+        auto c = ciphertext;
+        auto a = aad;
+        auto t = tag;
+        if (i < c.size()) {
+            c[i] ^= 0x01;
+        } else if (i < c.size() + a.size()) {
+            a[i - c.size()] ^= 0x80;
+        } else {
+            t[i - c.size() - a.size()] ^= 0x10;
+        }
+        std::vector<std::uint8_t> out(c.size(), 0xEE);
+        Require(
+            !crypto.Open(key, iv, a, c, t, out) &&
+                std::all_of(out.begin(), out.end(), [](const std::uint8_t b) { return b == 0; }),
+            "any bit flipped in ciphertext, data or tag is refused and nothing is released");
+    }
+    Key other_key = key;
+    other_key[31] ^= 1;
+    std::vector<std::uint8_t> wrong(ciphertext.size());
+    Require(!crypto.Open(other_key, iv, aad, ciphertext, tag, wrong), "a wrong key is refused");
+
+    // RFC 5903, 8.1: ECDH on P-256 from both sides.
+    const auto i = Hex("C88F01F510D9AC3F70A292DAA2316DE544E9AAB8AFE84049C62A9C57862D1433");
+    const auto gix = Hex("DAD0B65394221CF9B051E1FECA5787D098DFE637FC90B9EF945D0C3772581180");
+    const auto giy = Hex("5271A0461CDB8252D61F1C456FA3E59AB1F45B33ACCF5F58389E0577B8990BB3");
+    const auto r = Hex("C6EF9C5D78AE012A011164ACB397CE2088685D8F06BF9BE0B283AB46476BEE53");
+    const auto grx = Hex("D12DFB5289C8D4F81208B70270398C342296970A0BCCB74C736FC7554494BF63");
+    const auto gry = Hex("56FBF3CA366CC23E8157854C13C58D6AAC23F046ADA30F8353E74F33039872AB");
+    const auto girx = Hex("D6840F6B42F6EDAFD13116E0E12565202FEF8E9ECE7DCE03812464D04B9442DE");
+    const auto initiator = crypto.ImportEphemeral(i, gix, giy);
+    const auto responder = crypto.ImportEphemeral(r, grx, gry);
+    Require(initiator && responder, "known ECDH keys import");
+    Require(
+        AsVector(initiator->PublicKey()) ==
+            [&] {
+                auto both = gix;
+                both.insert(both.end(), giy.begin(), giy.end());
+                return both;
+            }(),
+        "a public key is X then Y, big-endian");
+    const auto shared_i = crypto.Agree(*initiator, responder->PublicKey());
+    const auto shared_r = crypto.Agree(*responder, initiator->PublicKey());
+    Require(shared_i && shared_r && AsVector(*shared_i) == girx && AsVector(*shared_r) == girx,
+            "ECDH P-256 agrees on the RFC 5903 secret from both sides");
+    std::array<std::uint8_t, 64> off_curve{};
+    off_curve[31] = 1;
+    off_curve[63] = 1;
+    Require(!crypto.Agree(*initiator, off_curve), "a point not on the curve is refused");
+
+    const auto a = crypto.GenerateEphemeral();
+    const auto b = crypto.GenerateEphemeral();
+    Require(a && b && a->PublicKey() != b->PublicKey(), "fresh ephemeral keys differ");
+    const auto ab = crypto.Agree(*a, b->PublicKey());
+    const auto ba = crypto.Agree(*b, a->PublicKey());
+    Require(ab && ba && *ab == *ba, "fresh keys agree");
+    std::array<std::uint8_t, 32> first{};
+    std::array<std::uint8_t, 32> second{};
+    Require(crypto.Random(first) && crypto.Random(second) && first != second, "randomness");
+
+    const auto blob = crypto.Protect(key);
+    Require(blob && blob->size() > key.size() &&
+                std::search(blob->begin(), blob->end(), key.begin(), key.end()) == blob->end(),
+            "DPAPI protects a key without carrying it in the clear");
+    const auto back = crypto.Unprotect(*blob);
+    Require(back && *back == std::vector<std::uint8_t>(key.begin(), key.end()),
+            "DPAPI gives the key back");
+    auto damaged = *blob;
+    damaged[damaged.size() / 2] ^= 0x01;
+    Require(!crypto.Unprotect(damaged), "a damaged blob gives nothing back");
+}
+
+void TestPeerPairing() {
+    using namespace gtg::peer;
+    Crypto crypto;
+    Require(crypto.Load(), "crypto loads");
+    const Self issuer{0x1111, L"Issuer"};
+    const Self joiner{0x2222, L"Joiner"};
+    const Self late{0x3333, L"Late"};
+    const std::uint64_t now = 5'000'000;
+
+    auto invitation = Invitation::Create(crypto, {127, 0, 0, 1}, 47'810, now);
+    Require(invitation && invitation->StatusAt(now) == Invitation::Status::Live, "a live code");
+    const auto pasted = ParseCode(std::string_view(FormatCode(invitation->Code())));
+    Require(pasted.code.has_value(), "the shown code reads");
+    const auto joining = Joining::Start(crypto, joiner, *pasted.code);
+    Require(joining.has_value(), "a joiner starts");
+    const auto request = ReadPairRequest(joining->Request());
+    Require(request.has_value(), "the request reads");
+
+    const auto answer =
+        invitation->Handle(crypto, issuer, *request, joining->Request(), now + 2'000);
+    Require(answer.reply && answer.paired && answer.paired->peer == joiner.id &&
+                answer.paired->name == L"Joiner",
+            "the issuer accepts and learns the joiner");
+    Require(invitation->StatusAt(now + 2'000) == Invitation::Status::Spent &&
+                invitation->JoinedBy() == L"Joiner",
+            "the code is spent");
+    const auto accept = ReadPairAccept(*answer.reply);
+    Require(accept.has_value(), "the accept reads");
+    const auto joined = joining->Handle(crypto, joiner, *accept, *answer.reply);
+    Require(joined.outcome == Joining::Outcome::Paired && joined.paired &&
+                joined.paired->peer == issuer.id && joined.paired->name == L"Issuer",
+            "the joiner learns the issuer");
+    Require(joined.paired->key == answer.paired->key, "both sides derive one pair key");
+
+    const auto again =
+        invitation->Handle(crypto, issuer, *request, joining->Request(), now + 3'000);
+    Require(again.reply && *again.reply == *answer.reply && !again.paired,
+            "a repeated request gets the same accept and pairs nothing more");
+
+    // Someone else who has the code, after it was spent, is told so.
+    const auto second = Joining::Start(crypto, late, *pasted.code);
+    const auto refused = invitation->Handle(crypto, issuer, *ReadPairRequest(second->Request()),
+                                            second->Request(), now + 4'000);
+    Require(refused.reply && !refused.paired, "a spent code answers without pairing");
+    Require(second->Handle(crypto, late, *ReadPairAccept(*refused.reply), *refused.reply).outcome ==
+                Joining::Outcome::Used,
+            "the late joiner reads 'already used'");
+
+    // Every byte of the accept is covered: a changed accept pairs nothing.
+    for (std::size_t i = 0; i < kPairAcceptBytes; ++i) {
+        auto bad = *answer.reply;
+        bad[i] ^= 0x04;
+        const auto parsed = ReadPairAccept(bad);
+        if (!parsed) continue;
+        Require(joining->Handle(crypto, joiner, *parsed, bad).outcome == Joining::Outcome::Ignored,
+                "a changed accept is ignored");
+    }
+    Require(
+        second->Handle(crypto, late, *accept, *answer.reply).outcome == Joining::Outcome::Ignored,
+        "an accept for another joiner is ignored");
+
+    // A request for another code is not counted against this one; a request
+    // with this code's id and a bad MAC is, and the fifth spends it.
+    auto fresh = Invitation::Create(crypto, {127, 0, 0, 1}, 47'811, now);
+    const auto stranger = Joining::Start(crypto, late, invitation->Code());
+    Require(!fresh->Handle(crypto, issuer, *ReadPairRequest(stranger->Request()),
+                           stranger->Request(), now)
+                    .reply &&
+                fresh->BadMacs() == 0,
+            "a request for another code is ignored and not counted");
+    const auto honest = Joining::Start(crypto, joiner, fresh->Code());
+    for (int attempt = 1; attempt <= kBadMacLimit; ++attempt) {
+        auto forged = honest->Request();
+        forged[kPrefixBytes + kCodeIdBytes + attempt] ^= 0x01;  // the public key
+        const auto answer_forged =
+            fresh->Handle(crypto, issuer, *ReadPairRequest(forged), forged, now + 1'000);
+        Require(!answer_forged.reply && !answer_forged.paired, "a bad MAC gets no answer");
+        Require(
+            fresh->StatusAt(now + 1'000) ==
+                (attempt < kBadMacLimit ? Invitation::Status::Live : Invitation::Status::Burned),
+            "the fifth bad MAC spends the code");
+    }
+    const auto too_late = fresh->Handle(crypto, issuer, *ReadPairRequest(honest->Request()),
+                                        honest->Request(), now + 2'000);
+    Require(!too_late.paired &&
+                honest->Handle(crypto, joiner, *ReadPairAccept(*too_late.reply), *too_late.reply)
+                        .outcome == Joining::Outcome::Used,
+            "after five bad MACs the holder is told the code is used");
+
+    // Ten minutes.
+    auto expiring = Invitation::Create(crypto, {127, 0, 0, 1}, 47'812, now);
+    const auto slow = Joining::Start(crypto, joiner, expiring->Code());
+    Require(expiring->StatusAt(now + kCodeLifetimeMs - 1) == Invitation::Status::Live,
+            "live until ten minutes");
+    const auto expired = expiring->Handle(crypto, issuer, *ReadPairRequest(slow->Request()),
+                                          slow->Request(), now + kCodeLifetimeMs);
+    Require(
+        !expired.paired &&
+            slow->Handle(crypto, joiner, *ReadPairAccept(*expired.reply), *expired.reply).outcome ==
+                Joining::Outcome::Expired,
+        "an expired code says so");
+
+    // A GTG that pastes its own code pairs with nothing.
+    auto own = Invitation::Create(crypto, {127, 0, 0, 1}, 47'813, now);
+    const auto self_join = Joining::Start(crypto, issuer, own->Code());
+    const auto self_answer = own->Handle(crypto, issuer, *ReadPairRequest(self_join->Request()),
+                                         self_join->Request(), now);
+    Require(
+        !self_answer.reply && !self_answer.paired && own->StatusAt(now) == Invitation::Status::Live,
+        "its own code is not spent on itself");
+
+    // Sealed traffic under the pair key.
+    const Key pair_key = answer.paired->key;
+    SealedHeader header;
+    header.sender = issuer.id;
+    header.salt.fill(0x5A);
+    header.sequence = 9;
+    header.sent_ms = 1'790'000'000'000;
+    const auto to_joiner = DirectionKey(crypto, pair_key, header.salt, issuer.id, joiner.id);
+    const auto to_issuer = DirectionKey(crypto, pair_key, header.salt, joiner.id, issuer.id);
+    Require(to_joiner && to_issuer && *to_joiner != *to_issuer, "each direction has its own key");
+    const HostState state = SampleHostState();
+    const auto sealed = SealState(crypto, *to_joiner, header, state);
+    Require(sealed.has_value(), "a state seals");
+    const auto read_header = ReadSealedHeader(*sealed);
+    const auto opened = OpenSealed(crypto, *to_joiner, *read_header, *sealed);
+    Require(opened.authentic && opened.state && *opened.state == state, "and opens");
+    Require(!OpenSealed(crypto, *to_issuer, *read_header, *sealed).authentic,
+            "the other direction's key does not open it");
+    for (std::size_t at = 0; at < sealed->size(); ++at) {
+        auto bad = *sealed;
+        bad[at] ^= 0x20;
+        const auto bad_header = ReadSealedHeader(bad);
+        if (!bad_header) continue;
+        const auto key_for = DirectionKey(crypto, pair_key, bad_header->salt, issuer.id, joiner.id);
+        Require(!OpenSealed(crypto, *key_for, *bad_header, bad).authentic,
+                "any byte changed in a state datagram is refused");
+    }
+    const auto goodbye = SealGoodbye(crypto, *to_joiner, header);
+    const auto goodbye_header = ReadSealedHeader(*goodbye);
+    const auto bye = OpenSealed(crypto, *to_joiner, *goodbye_header, *goodbye);
+    Require(goodbye && bye.authentic && !bye.state, "a goodbye is sealed too");
+    auto forged_bye = *goodbye;
+    forged_bye[kGoodbyeBytes - 1] ^= 1;
+    Require(!OpenSealed(crypto, *to_joiner, *goodbye_header, forged_bye).authentic,
+            "a forged goodbye is refused");
+}
+
+// The link's table once `ready` holds, publishing each link's local state on
+// every try as the dashboard does once a second.
+template <typename Ready>
+std::optional<gtg::peer::Table> AwaitTable(
+    gtg::peer::Link& link, Ready ready,
+    const std::vector<std::pair<gtg::peer::Link*, gtg::peer::HostState>>& feed,
+    const std::uint64_t timeout_ms = 5'000) {
+    const std::uint64_t deadline = GetTickCount64() + timeout_ms;
+    while (GetTickCount64() < deadline) {
+        for (const auto& [sender, state] : feed)
+            sender->Publish(state);
+        if (auto table = link.TryRead(); table && ready(*table)) return table;
+        Sleep(20);
+    }
+    return std::nullopt;
+}
+
+void TestPeerLoopback() {
+    using namespace gtg::peer;
+    const std::array<std::uint8_t, 4> loopback{127, 0, 0, 1};
+    // A port nothing holds right now: one Windows just handed out and took back.
+    WSADATA wsa{};
+    Require(WSAStartup(MAKEWORD(2, 2), &wsa) == 0, "the test's own socket");
+    const auto free_port = [] {
+        const SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int size = sizeof(local);
+        bind(probe, reinterpret_cast<const sockaddr*>(&local), sizeof(local));
+        getsockname(probe, reinterpret_cast<sockaddr*>(&local), &size);
+        closesocket(probe);
+        return ntohs(local.sin_port);
+    };
+    const std::uint16_t port = free_port();
+    std::mutex saved_mutex;
+    std::vector<Pair> saved_b;
+    Link a;
+    Link b;
+    Link::Options alpha;
+    alpha.self = {0xA1, L"Alpha"};
+    alpha.port = port;
+    alpha.bind_address = loopback;
+    Link::Options bravo;
+    bravo.self = {0xB2, L"Bravo"};
+    bravo.port = static_cast<std::uint16_t>(port + 1);
+    bravo.bind_address = loopback;
+    bravo.save = [&](const Pair& pair) {
+        std::lock_guard lock(saved_mutex);
+        const auto found = std::find_if(saved_b.begin(), saved_b.end(),
+                                        [&](const Pair& p) { return p.peer == pair.peer; });
+        if (found != saved_b.end()) {
+            *found = pair;
+        } else {
+            saved_b.push_back(pair);
+        }
+    };
+    Require(a.Start(alpha) && b.Start(bravo), "two links start");
+
+    HostState from_a = SampleHostState();
+    HostState from_b = SampleHostState();
+    from_b.protection = Protection::Normal;
+    from_b.records[0].raised = false;
+    const std::vector<std::pair<Link*, HostState>> feed{{&a, from_a}, {&b, from_b}};
+
+    const auto started =
+        AwaitTable(a, [](const Table& t) { return t.status == LinkStatus::Running; }, feed);
+    Require(started && !started->listening && started->port != port,
+            "a GTG that has issued no code does not bind the fixed port");
+    a.CreateCode();
+    const auto issued =
+        AwaitTable(a, [](const Table& t) { return t.invitation.has_value(); }, feed);
+    Require(issued && issued->listening && issued->port == port,
+            "issuing a code binds the fixed port");
+    const auto code = ParseCode(std::string_view(issued->invitation->code));
+    Require(code.code && code.code->address == loopback && code.code->port == port,
+            "the code says where to go");
+
+    b.Join(*code.code);
+    const auto joined = AwaitTable(
+        b, [](const Table& t) { return t.joining && t.joining->status == JoinStatus::Paired; },
+        feed);
+    Require(joined && joined->joining->issuer == L"Alpha" && joined->hosts.size() == 1 &&
+                !joined->listening,
+            "the joiner pairs, sending from an ephemeral port");
+    const auto spent = AwaitTable(
+        a,
+        [](const Table& t) {
+            return t.hosts.size() == 1 && t.invitation &&
+                   t.invitation->status == Invitation::Status::Spent;
+        },
+        feed);
+    Require(spent && spent->hosts[0].name == L"Bravo" && spent->invitation->joined_by == L"Bravo",
+            "the issuer has the joiner and its code is spent");
+
+    // State, both ways, with each sender's own name.
+    const auto a_hears_b = AwaitTable(
+        a,
+        [](const Table& t) {
+            return t.hosts.size() == 1 && t.hosts[0].state && t.hosts[0].state->name == L"Bravo";
+        },
+        feed);
+    Require(a_hears_b && a_hears_b->hosts[0].state->protection == Protection::Normal &&
+                a_hears_b->hosts[0].state->records == from_b.records,
+            "the issuer receives the joiner's state");
+    const auto b_hears_a = AwaitTable(
+        b,
+        [](const Table& t) {
+            return t.hosts.size() == 1 && t.hosts[0].state && t.hosts[0].state->name == L"Alpha";
+        },
+        feed);
+    Require(b_hears_a && b_hears_a->hosts[0].state->records == from_a.records &&
+                b_hears_a->hosts[0].state->protection == Protection::Warning,
+            "the joiner receives the issuer's state");
+    Require(PresenceAt(a_hears_b->hosts[0].heard, GetTickCount64()) == Presence::Online,
+            "both online");
+    Require(a_hears_b->hosts[0].endpoint && a_hears_b->hosts[0].endpoint->port == joined->port,
+            "the issuer learned the joiner's port from its datagrams");
+
+    // A second code holder after it was spent, and a GTG's own code.
+    Link c;
+    Link::Options charlie;
+    charlie.self = {0xC3, L"Charlie"};
+    charlie.port = static_cast<std::uint16_t>(port + 2);
+    charlie.bind_address = loopback;
+    Require(c.Start(charlie), "a third link starts");
+    c.Join(*code.code);
+    const auto late = AwaitTable(
+        c, [](const Table& t) { return t.joining && t.joining->status == JoinStatus::Used; }, feed);
+    Require(late && late->hosts.empty(), "a spent code tells its holder it is used");
+    c.Stop();
+    a.CreateCode();
+    const auto second_code = AwaitTable(
+        a,
+        [](const Table& t) {
+            return t.invitation && t.invitation->status == Invitation::Status::Live;
+        },
+        feed);
+    const auto own = ParseCode(std::string_view(second_code->invitation->code));
+    a.Join(*own.code);
+    const auto refused_own = AwaitTable(
+        a, [](const Table& t) { return t.joining && t.joining->status == JoinStatus::Own; }, feed);
+    Require(refused_own && refused_own->hosts.size() == 1, "a GTG does not pair with itself");
+    a.CancelCode();
+
+    // Traffic that is not a paired host's changes nothing.
+    const SOCKET raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port);
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const auto send_raw = [&](const std::span<const std::uint8_t> bytes) {
+        sendto(raw, reinterpret_cast<const char*>(bytes.data()), static_cast<int>(bytes.size()), 0,
+               reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+    };
+    std::array<std::uint8_t, 300> junk{};
+    for (std::size_t i = 0; i < junk.size(); ++i)
+        junk[i] = static_cast<std::uint8_t>(i * 7);
+    send_raw(junk);
+    SealedHeader forged;
+    forged.sender = 0xB2;
+    forged.salt.fill(0x33);
+    forged.sequence = 1;
+    forged.sent_ms = 1'790'000'000'000;
+    std::array<std::uint8_t, kStateBytes> fake{};
+    const auto fake_head = WriteSealedHeader(forged);
+    std::memcpy(fake.data(), fake_head.data(), fake_head.size());
+    send_raw(fake);
+    for (int i = 0; i < 300; ++i)
+        send_raw(fake);
+    closesocket(raw);
+    const std::uint64_t after_flood = GetTickCount64();
+    const auto still = AwaitTable(
+        a,
+        [after_flood](const Table& t) {
+            return t.hosts.size() == 1 && t.hosts[0].heard.state_ms &&
+                   *t.hosts[0].heard.state_ms > after_flood + 1'000;
+        },
+        feed);
+    Require(still && still->hosts[0].state->name == L"Bravo" &&
+                still->hosts[0].state->records == from_b.records,
+            "after junk, a forged state and a flood, the host is still heard as itself");
+
+    // A goodbye is offline; the host comes back from its stored pair.
+    b.Stop();
+    const auto gone = AwaitTable(
+        a, [](const Table& t) { return t.hosts.size() == 1 && t.hosts[0].heard.goodbye_ms; },
+        {{&a, from_a}});
+    Require(gone && PresenceAt(gone->hosts[0].heard, GetTickCount64()) == Presence::Offline,
+            "a host that stops says goodbye: offline, not lost");
+    {
+        std::lock_guard lock(saved_mutex);
+        Require(saved_b.size() == 1 && saved_b[0].peer == 0xA1 && !saved_b[0].issued &&
+                    saved_b[0].endpoint && saved_b[0].endpoint->port == port,
+                "the joiner saved the pair with the issuer's address");
+        bravo.pairs = saved_b;
+    }
+    Link b2;
+    Require(b2.Start(bravo), "the joiner starts again");
+    const std::vector<std::pair<Link*, HostState>> feed2{{&a, from_a}, {&b2, from_b}};
+    const auto back = AwaitTable(
+        a,
+        [](const Table& t) {
+            return t.hosts.size() == 1 &&
+                   PresenceAt(t.hosts[0].heard, GetTickCount64()) == Presence::Online;
+        },
+        feed2);
+    Require(back.has_value(), "a host that restarts is back, in a new session");
+
+    // Silence without a goodbye is what becomes lost.
+    b2.Mute();
+    Sleep(300);
+    const auto before = a.TryRead();
+    Sleep(1'500);
+    const auto after = a.TryRead();
+    // The goodbye heard is the first instance's, from before the restart.
+    Require(before && after && after->hosts[0].heard.state_ms == before->hosts[0].heard.state_ms &&
+                *after->hosts[0].heard.goodbye_ms < *after->hosts[0].heard.state_ms &&
+                PresenceAt(after->hosts[0].heard,
+                           *after->hosts[0].heard.state_ms + kLostAfterMs + 1) == Presence::Lost,
+            "a host that goes silent without a goodbye becomes lost");
+
+    // The receiving side's replay rules, through the link: datagrams sealed
+    // with the real pair key, sent from somewhere else.
+    Crypto crypto;
+    Require(crypto.Load(), "crypto for the replay checks");
+    Key pair_key{};
+    {
+        std::lock_guard lock(saved_mutex);
+        pair_key = saved_b[0].key;
+    }
+    const SOCKET replayer = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    const auto seal_and_send = [&](const std::array<std::uint8_t, kSaltBytes>& salt,
+                                   const std::uint64_t sequence, const std::int64_t sent_ms,
+                                   const wchar_t* name) {
+        SealedHeader header;
+        header.sender = 0xB2;
+        header.salt = salt;
+        header.sequence = sequence;
+        header.sent_ms = sent_ms;
+        HostState state = from_b;
+        state.name = name;
+        const auto key = DirectionKey(crypto, pair_key, salt, 0xB2, 0xA1);
+        const auto datagram = SealState(crypto, *key, header, state);
+        sendto(replayer, reinterpret_cast<const char*>(datagram->data()),
+               static_cast<int>(datagram->size()), 0, reinterpret_cast<const sockaddr*>(&to),
+               sizeof(to));
+        return *datagram;
+    };
+    const auto shows = [&](const wchar_t* name) {
+        Sleep(250);
+        const auto table =
+            AwaitTable(a, [](const Table& t) { return t.hosts.size() == 1 && t.hosts[0].state; },
+                       {{&a, from_a}});
+        return table && table->hosts[0].state->name == name;
+    };
+    std::array<std::uint8_t, kSaltBytes> salt{};
+    salt.fill(0x77);
+    const std::int64_t wall = [] {
+        FILETIME time{};
+        GetSystemTimeAsFileTime(&time);
+        return static_cast<std::int64_t>(
+                   ((static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime) /
+                   10'000) -
+               11'644'473'600'000LL;
+    }();
+    const auto ten = seal_and_send(salt, 10, wall, L"Session-10");
+    Require(shows(L"Session-10"), "a new session sealed with the pair key is accepted");
+    seal_and_send(salt, 9, wall, L"Session-9");
+    Require(shows(L"Session-10"), "a lower number in the session is refused");
+    seal_and_send(salt, 11, wall, L"Session-11");
+    Require(shows(L"Session-11"), "a higher number is accepted");
+    sendto(replayer, reinterpret_cast<const char*>(ten.data()), static_cast<int>(ten.size()), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+    Require(shows(L"Session-11"), "a datagram sent again is refused");
+    std::array<std::uint8_t, kSaltBytes> earlier{};
+    earlier.fill(0x66);
+    seal_and_send(earlier, 50, wall - 5'000, L"Earlier");
+    Require(shows(L"Session-11"), "a session from before the one in use is refused");
+    std::array<std::uint8_t, kSaltBytes> skewed{};
+    skewed.fill(0x55);
+    seal_and_send(skewed, 1, wall + kSessionWindowMs + 60'000, L"Skewed");
+    Require(shows(L"Session-11"), "a session whose clock is too far ahead is refused");
+    const auto skew = AwaitTable(
+        a, [](const Table& t) { return t.hosts.size() == 1 && t.hosts[0].clock_skew_ms; },
+        {{&a, from_a}});
+    Require(skew && *skew->hosts[0].clock_skew_ms > kSessionWindowMs,
+            "and the dialog can say how far the clocks disagree");
+    closesocket(replayer);
+    WSACleanup();
+    b2.Stop();
+
+    a.Remove(0xB2);
+    const auto removed =
+        AwaitTable(a, [](const Table& t) { return t.hosts.empty(); }, {{&a, from_a}});
+    Require(removed && !removed->listening, "a removed pair is gone, and so is the fixed port");
+    a.Stop();
+}
+
+void TestPeerPortInUse() {
+    using namespace gtg::peer;
+    WSADATA wsa{};
+    Require(WSAStartup(MAKEWORD(2, 2), &wsa) == 0, "the test's own socket");
+    // Another program holds the fixed port.
+    const SOCKET holder = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    BOOL exclusive = TRUE;
+    setsockopt(holder, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
+               sizeof(exclusive));
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int size = sizeof(local);
+    Require(bind(holder, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == 0 &&
+                getsockname(holder, reinterpret_cast<sockaddr*>(&local), &size) == 0,
+            "a port is held");
+    Link link;
+    Link::Options options;
+    options.self = {0xD4, L"Delta"};
+    options.port = ntohs(local.sin_port);
+    options.bind_address = std::array<std::uint8_t, 4>{127, 0, 0, 1};
+    Require(link.Start(options), "the link starts");
+    link.CreateCode();
+    const auto taken = AwaitTable(
+        link, [](const Table& t) { return t.invitation && t.status == LinkStatus::PortInUse; }, {});
+    Require(taken && !taken->listening && taken->port != options.port,
+            "a taken port is said, and the link sends from another");
+    link.CancelCode();
+    const auto released = AwaitTable(
+        link, [](const Table& t) { return !t.invitation && t.status == LinkStatus::Running; }, {});
+    Require(released && !released->listening,
+            "without a code the fixed port is not wanted, and the warning goes");
+    link.Stop();
+    closesocket(holder);
+    WSACleanup();
+}
+
+void TestTinyDescribeBar() {
+    using namespace gtg::tray;
+    tiny::BarInputs in;
+    in.temperature_c = 85.0;
+    in.power_w = 450.0;
+    in.gpu_percent = 80.0;
+    in.cpu_percent = 10.0;
+    in.ram_percent = 50.0;
+    in.network_bytes_per_second = 0.5;
+    in.trigger_temperature_c = 85;
+    in.safe_power_w = 300;
+    const auto close_to = [](const std::optional<double> value, const double expected) {
+        return value && std::abs(*value - expected) < 1e-9;
+    };
+    auto bar = tiny::DescribeBar(compact::Metric::Temperature, in);
+    Require(close_to(bar.level, 55.0 / 75.0) && close_to(bar.tick, 55.0 / 75.0) && !bar.raised,
+            "temperature on its lane's axis, the trigger as its tick");
+    in.warning = true;
+    Require(tiny::DescribeBar(compact::Metric::Temperature, in).raised &&
+                !tiny::DescribeBar(compact::Metric::Power, in).raised,
+            "a warning raises temperature, not power");
+    in.warning = false;
+    in.safe_power = true;
+    bar = tiny::DescribeBar(compact::Metric::Power, in);
+    Require(close_to(bar.level, 0.75) && close_to(bar.tick, 0.5) && bar.raised &&
+                tiny::DescribeBar(compact::Metric::Temperature, in).raised,
+            "safe power raises power and temperature; power stands on a 600 W axis");
+    in.top_app_alerts = gtg::topapp::Bit(gtg::topapp::Record::Gpu);
+    bar = tiny::DescribeBar(compact::Metric::Gpu, in);
+    Require(close_to(bar.level, 0.8) && close_to(bar.tick, 0.7) && bar.raised &&
+                !tiny::DescribeBar(compact::Metric::Cpu, in).raised,
+            "a top-app alert raises its own record only");
+    bar = tiny::DescribeBar(compact::Metric::Vram, in);
+    Require(!bar.level && bar.tick && !bar.raised, "no reading: an empty track with its tick");
+    in.host_memory_low = true;
+    Require(tiny::DescribeBar(compact::Metric::Ram, in).raised, "Windows' low memory raises RAM");
+    in.ram_percent.reset();
+    Require(!tiny::DescribeBar(compact::Metric::Ram, in).raised, "but not without a reading");
+    bar = tiny::DescribeBar(compact::Metric::Network, in);
+    Require(close_to(bar.level, 0.5) && !bar.tick && !bar.raised, "network against a peak of 1");
+    Require(!tiny::DescribeBar(compact::Metric::Fps, in).level, "no FPS, no bar");
+    in.fps = tiny::FpsStability{30.0, 60.0, -0.5, tiny::FpsLevel(-0.5), tiny::Severity::Alarm};
+    bar = tiny::DescribeBar(compact::Metric::Fps, in);
+    Require(bar.raised && bar.alarm && close_to(bar.tick, tiny::kFpsReferenceLevel),
+            "FPS far from steady raises and turns white");
+}
+
+void TestHostsBridge() {
+    using namespace gtg::tray;
+    hosts::LocalState local;
+    local.bars.temperature_c = 70.0;
+    local.bars.power_w = 300.0;
+    local.bars.cpu_percent = 95.0;
+    local.bars.top_app_alerts = gtg::topapp::Bit(gtg::topapp::Record::Cpu);
+    local.bars.fps =
+        tiny::FpsStability{60.0, 60.0, 0.0, tiny::FpsLevel(0.0), tiny::Severity::Steady};
+    local.network_received = 1'000.0;
+    local.network_sent = 250.0;
+    local.bars.network_bytes_per_second = 1'000.0;
+    local.bars.network_peak = 2'000.0;
+    local.visual = hosts::Visual::Protected;
+    local.version = {1, 2, 0};
+    const auto state = hosts::Build(local);
+    using gtg::peer::Record;
+    const auto& cpu = state.records[static_cast<std::size_t>(Record::Cpu)];
+    const auto& temperature = state.records[static_cast<std::size_t>(Record::Temperature)];
+    const auto& network = state.records[static_cast<std::size_t>(Record::Network)];
+    const auto& fps = state.records[static_cast<std::size_t>(Record::Fps)];
+    Require(state.protection == gtg::peer::Protection::SafePower && state.version[1] == 2,
+            "protection and version");
+    Require(cpu.raised && cpu.value == 95.0F && temperature.raised && temperature.value == 70.0F,
+            "each record as this machine's Tiny draws it, with its reading");
+    Require(network.value == 1'000.0F && network.value2 == 250.0F && network.level == 0.5F,
+            "network carries both directions");
+    Require(fps.value == 60.0F && !fps.raised && fps.level, "a steady FPS");
+    Require(!state.records[static_cast<std::size_t>(Record::Vram)].value &&
+                !state.records[static_cast<std::size_t>(Record::Ram)].level,
+            "what this machine does not read is not sent as zero");
+    const auto read = gtg::peer::ReadStateBody(gtg::peer::WriteStateBody(state));
+    Require(read && read->records[static_cast<std::size_t>(Record::Cpu)].raised &&
+                read->protection == gtg::peer::Protection::SafePower,
+            "what is built is what the wire carries");
+    Require(hosts::ToWire(hosts::Visual::Neutral) == gtg::peer::Protection::Unknown &&
+                hosts::ToWire(hosts::Visual::Armed) == gtg::peer::Protection::Normal,
+            "no protection running is not normal");
+}
+
+void TestPeerAdmission() {
+    using gtg::peer::Admission;
+    using gtg::peer::Endpoint;
+    Admission admission;
+    const Endpoint a{{10, 0, 0, 1}, 5000};
+    const Endpoint b{{10, 0, 0, 2}, 5000};
+    for (int i = 0; i < Admission::kPerSourcePerSecond; ++i) {
+        Require(admission.Admit(a, 10'000), "a host's datagrams within its share");
+    }
+    Require(!admission.Admit(a, 10'500), "beyond its share in one second");
+    Require(admission.Admit(b, 10'500), "another source has its own share");
+    Require(admission.Admit(a, 11'000), "the next second starts over");
+    Admission flood;
+    int admitted = 0;
+    for (int i = 0; i < 1'000; ++i) {
+        const Endpoint source{
+            {10, 0, static_cast<std::uint8_t>(i / 250), static_cast<std::uint8_t>(i % 250)}, 4000};
+        if (flood.Admit(source, 20'000)) ++admitted;
+    }
+    Require(admitted == Admission::kTotalPerSecond, "a flood from many sources is capped");
+    Require(!flood.Admit(a, 20'999), "the cap holds for the whole second");
+    Require(flood.Admit(a, 21'000), "and lifts after it");
+}
+
 }  // namespace
 
 void TestFeatureNoticeSerial() {
@@ -4079,6 +6228,367 @@ void TestSettingsTextBaseline() {
     }
 }
 
+namespace {
+
+constexpr std::string_view kHostsLogRun = "11111111-1111-4111-8111-111111111111";
+
+gtg::hostlog::Frame HostsLogFrame(const gtg::hostlog::Status status) {
+    using namespace std::chrono;
+    gtg::hostlog::Frame frame;
+    frame.seq = 3;
+    frame.captured_at = sys_days{year{2026} / 11 / 1} + hours{4} + milliseconds{5};
+    frame.now_ms = 100'000;
+    frame.observer_id = 1;
+    frame.observer_name = L"Workstation";
+    frame.version = {1, 1, 0};
+    frame.enabled = status != gtg::hostlog::Status::Disabled;
+    frame.status = status;
+    frame.table_complete = status == gtg::hostlog::Status::Running;
+    return frame;
+}
+
+gtg::hostlog::Host HostsLogHost(const std::uint64_t id, std::wstring name,
+                                const std::optional<std::uint64_t> state_ms) {
+    gtg::hostlog::Host host;
+    host.id = id;
+    host.name = std::move(name);
+    host.heard.state_ms = state_ms;
+    if (state_ms) {
+        host.state.emplace();
+        host.state->name = host.name;
+        host.state->version = {1, 1, 0};
+        host.state->protection = gtg::peer::Protection::Normal;
+    }
+    return host;
+}
+
+std::string HostsLogField(const std::string& line, const std::string& host_id,
+                          const std::string& key) {
+    const auto host = line.find("{\"id\":\"" + host_id + "\"");
+    if (host == std::string::npos) return {};
+    const auto at = line.find("\"" + key + "\":", host);
+    if (at == std::string::npos) return {};
+    const auto begin = at + key.size() + 3;
+    return line.substr(begin, line.find_first_of(",}", begin) - begin);
+}
+
+}  // namespace
+
+void TestHostsLogFrame() {
+    using namespace gtg::hostlog;
+    using gtg::peer::Protection;
+
+    // Hosts off: what is known about this machine, and no table.
+    Frame off = HostsLogFrame(Status::Disabled);
+    off.hosts.push_back(HostsLogHost(10, L"Host-A", 99'000));
+    Require(FormatLine(off, kHostsLogRun) ==
+                R"({"v":1,"run_id":"11111111-1111-4111-8111-111111111111","seq":3,)"
+                R"("captured_at":"2026-11-01T04:00:00.005Z","observer_id":"0000000000000001",)"
+                R"("observer_name":"Workstation","gtg_version":"1.1.0","enabled":false,)"
+                R"("status":"disabled","table_complete":false,"export_dropped_total":0,)"
+                R"("hosts":[]})"
+                "\n",
+            "hosts log: Hosts off is the whole line, hosts unlisted");
+    for (const auto status : {Status::Starting, Status::Unavailable}) {
+        Frame frame = HostsLogFrame(status);
+        frame.hosts.push_back(HostsLogHost(10, L"Host-A", 99'000));
+        const std::string line = FormatLine(frame, kHostsLogRun);
+        Require(line.find("\"enabled\":true") != std::string::npos &&
+                    line.find("\"table_complete\":false") != std::string::npos &&
+                    line.find("\"hosts\":[]") != std::string::npos,
+                "hosts log: a table that is not complete lists no host");
+    }
+    const std::string starting = FormatLine(HostsLogFrame(Status::Starting), kHostsLogRun);
+    const std::string unavailable = FormatLine(HostsLogFrame(Status::Unavailable), kHostsLogRun);
+    Require(starting.find(R"("status":"starting")") != std::string::npos &&
+                unavailable.find(R"("status":"unavailable")") != std::string::npos,
+            "hosts log: status names");
+
+    // Running with no pair: complete and empty.
+    Frame empty = HostsLogFrame(Status::Running);
+    empty.observer_id = 0;
+    empty.observer_name = L" ";
+    empty.dropped = 7;
+    const std::string empty_line = FormatLine(empty, kHostsLogRun);
+    Require(empty_line.find(R"("observer_id":null,"observer_name":"GTG")") != std::string::npos,
+            "hosts log: no id yet is null, and a name is never empty");
+    Require(empty_line.find(R"("status":"running","table_complete":true,)"
+                            R"("export_dropped_total":7,"hosts":[]})") != std::string::npos,
+            "hosts log: no pairs is a complete, empty table");
+
+    // One host as the dashboard holds it, every record as received.
+    Frame running = HostsLogFrame(Status::Running);
+    Host a = HostsLogHost(10, L"Host-A", 99'650);
+    a.state->protection = Protection::SafePower;
+    auto& records = a.state->records;
+    records[0] = {0.51F, 0.94F, false, false, 51.0F, std::nullopt};
+    records[1].value = 120.5F;
+    records[2] = {0.4F, 0.9F, true, false, 40.0F, std::nullopt};
+    records[6].value = 0.0F;  // a real 0 fps, not a missing reading
+    records[6].alarm = true;
+    records[7] = {0.1F, std::nullopt, false, false, 12'500'000.0F, 500'000.0F};
+    running.hosts.push_back(a);
+    constexpr std::string_view kHostA =
+        R"({"id":"000000000000000a","name":"Host-A","presence":"online","age_ms":350,)"
+        R"("version":"1.1.0","protection":"safe_power","stale":false,"records":{)"
+        R"("temperature":[51,null,0.51,0.94,false,false],)"
+        R"("power":[120.5,null,null,null,false,false],)"
+        R"("vram":[40,null,0.4,0.9,true,false],)"
+        R"("gpu":[null,null,null,null,false,false],)"
+        R"("cpu":[null,null,null,null,false,false],)"
+        R"("ram":[null,null,null,null,false,false],)"
+        R"("fps":[0,null,null,null,false,true],)"
+        R"("network":[12500000,500000,0.1,null,false,false]}}]})";
+    Require(FormatLine(running, kHostsLogRun).find(kHostA) != std::string::npos,
+            "hosts log: a host and its eight records, exactly");
+
+    // Presence is PresenceAt at the frame's instant, edges included.
+    Frame edges = HostsLogFrame(Status::Running);
+    edges.hosts.push_back(HostsLogHost(1, L"three", 100'000 - 3'000));
+    edges.hosts.push_back(HostsLogHost(2, L"dims", 100'000 - 3'001));
+    edges.hosts.push_back(HostsLogHost(3, L"ten", 100'000 - 10'000));
+    edges.hosts.push_back(HostsLogHost(4, L"lost", 100'000 - 10'001));
+    Host gone = HostsLogHost(5, L"gone", 90'000);
+    gone.heard.goodbye_ms = 95'000;
+    edges.hosts.push_back(gone);
+    edges.hosts.push_back(HostsLogHost(6, L"never", std::nullopt));
+    Host ahead = HostsLogHost(7, L"ahead", 100'200);
+    edges.hosts.push_back(ahead);
+    const std::string edge_line = FormatLine(edges, kHostsLogRun);
+    const auto field = [&](const std::uint64_t id, const std::string& key) {
+        return HostsLogField(edge_line, std::format("{:016x}", id), key);
+    };
+    Require(field(1, "presence") == "\"online\"" && field(2, "presence") == "\"dim\"" &&
+                field(3, "presence") == "\"dim\"" && field(4, "presence") == "\"lost\"",
+            "hosts log: 3 s is online, 10 s is dim, past it lost");
+    Require(field(5, "presence") == "\"offline\"" && field(5, "age_ms") == "10000",
+            "hosts log: a goodbye is offline, aged from the last state");
+    Require(field(7, "age_ms") == "0", "hosts log: a state stamped after the frame is age 0");
+    constexpr std::string_view kNever =
+        R"({"id":"0000000000000006","name":"never","presence":"not_heard",)"
+        R"("age_ms":null,"version":null,"protection":"unknown","stale":true,"records":{)"
+        R"("temperature":[null,null,null,null,false,false],)";
+    Require(edge_line.find(kNever) != std::string::npos,
+            "hosts log: a host never heard has nothing, stale and unknown");
+    Require(edge_line.find(R"("hosts":[{"id":"0000000000000001")") != std::string::npos &&
+                edge_line.find("\"0000000000000006\"") < edge_line.find("\"0000000000000007\""),
+            "hosts log: hosts in the reader's order");
+
+    // Names: escaped, cleaned as the dashboard cleans them, cut at 48 bytes.
+    Frame names = HostsLogFrame(Status::Running);
+    names.hosts.push_back(HostsLogHost(1, L"a\"b\\c", 99'000));
+    names.hosts.push_back(HostsLogHost(2, L"a\tb", 99'000));
+    names.hosts.push_back(HostsLogHost(3, std::wstring(20, L'主'), 99'000));
+    names.hosts.push_back(HostsLogHost(12, L" ", 99'000));
+    const std::string name_line = FormatLine(names, kHostsLogRun);
+    std::string sixteen;
+    for (int i = 0; i < 16; ++i)
+        sixteen += gtg::peer::wire::EncodeUtf8(L"主", 4);
+    Require(name_line.find(R"("name":"a\"b\\c")") != std::string::npos,
+            "hosts log: quotes and backslashes are escaped");
+    Require(name_line.find(R"("name":"ab")") != std::string::npos,
+            "hosts log: a control character is dropped, as on the dashboard");
+    Require(name_line.find("\"name\":\"" + sixteen + "\"") != std::string::npos,
+            "hosts log: a long CJK name is cut at a character within 48 bytes");
+    Require(name_line.find(R"("name":"Host-000000000000000c")") != std::string::npos,
+            "hosts log: an empty name is Host-<id>");
+    Require(name_line.find('\n') == name_line.size() - 1, "hosts log: one line per frame");
+
+    // A negative reading, numbers without exponents, and the run id's form.
+    Frame cold = HostsLogFrame(Status::Running);
+    Host chilled = HostsLogHost(9, L"cold", 99'000);
+    chilled.state->records[0].value = -5.5F;
+    chilled.state->records[7] = {0.0001F, std::nullopt, false, false, 1.0e12F, 500'000.0F};
+    cold.hosts.push_back(chilled);
+    const std::string cold_line = FormatLine(cold, kHostsLogRun);
+    Require(cold_line.find(R"("temperature":[-5.5,)") != std::string::npos,
+            "hosts log: a negative temperature is written as it is");
+    Require(cold_line.find(R"("network":[999999995904,500000,0.0001,null,false,false])") !=
+                std::string::npos,
+            "hosts log: fixed-point numbers, never an exponent");
+    std::array<std::uint8_t, 16> ones{};
+    ones.fill(0xFF);
+    Require(FormatRunId({}) == "00000000-0000-4000-8000-000000000000" &&
+                FormatRunId(ones) == "ffffffff-ffff-4fff-bfff-ffffffffffff",
+            "hosts log: a run id is a version 4 UUID");
+
+    // Sixteen hosts at their longest stay one modest line.
+    Frame full = HostsLogFrame(Status::Running);
+    for (std::uint64_t id = 1; id <= gtg::peer::kMaxPairs; ++id) {
+        Host host = HostsLogHost(0xFFFF'FFFF'FFFF'FF00ULL + id, std::wstring(48, L'"'), 99'000);
+        host.state->stale = true;
+        for (auto& record : host.state->records)
+            record = {0.1235F, 0.9876F, false, false, -59.999996F, 123456790000.0F};
+        full.hosts.push_back(host);
+    }
+    const std::string full_line = FormatLine(full, kHostsLogRun);
+    Require(full_line.size() < 16 * 1024, "hosts log: sixteen hosts stay under 16 KiB");
+}
+
+void TestHostsLogMailbox() {
+    using Box = gtg::hostlog::Mailbox<int>;
+    Box box;
+    Require(box.TryPut(1) == Box::Put::Taken && box.TryPut(2) == Box::Put::Replaced,
+            "mailbox: a second value replaces one never taken");
+    Require(box.Take() == 2 && !box.Take(), "mailbox: the taker gets the latest, once");
+
+    // The giver never waits: a taker stopped inside Take, holding the slot,
+    // makes TryPut refuse at once. The value's move blocks only while armed,
+    // and Take is the only move made while it is.
+    {
+        static std::atomic<bool> armed{false};
+        static HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        static HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+        struct Slow {
+            Slow() = default;
+
+            Slow(Slow&&) noexcept {
+                if (!armed.load()) return;
+                SetEvent(entered);
+                (void)WaitForSingleObject(release, 5'000);
+            }
+
+            Slow& operator=(Slow&&) noexcept { return *this; }
+        };
+
+        gtg::hostlog::Mailbox<Slow> slow;
+        Require(slow.TryPut(Slow{}) == gtg::hostlog::Mailbox<Slow>::Put::Taken,
+                "mailbox: a slow value goes in");
+        armed.store(true);
+        std::thread taker([&] { (void)slow.Take(); });
+        Require(WaitForSingleObject(entered, 5'000) == WAIT_OBJECT_0,
+                "mailbox: the taker is inside Take");
+        armed.store(false);
+        const auto begin = GetTickCount64();
+        const auto put = slow.TryPut(Slow{});
+        const auto spent = GetTickCount64() - begin;
+        SetEvent(release);
+        taker.join();
+        Require(put == gtg::hostlog::Mailbox<Slow>::Put::Busy && spent < 1'000,
+                "mailbox: a held slot refuses at once, without waiting");
+    }
+
+    // Against a taker on another thread: every value is taken, replaced or
+    // refused, and nothing is lost without being counted.
+    std::atomic<bool> done{false};
+    int taken = 0;
+    std::thread taker([&] {
+        while (!done.load())
+            taken += box.Take() ? 1 : 0;
+        taken += box.Take() ? 1 : 0;
+    });
+    int fresh = 0;
+    int replaced = 0;
+    int busy = 0;
+    constexpr int kPuts = 200'000;
+    for (int i = 0; i < kPuts; ++i) {
+        switch (box.TryPut(i)) {
+            case Box::Put::Taken:
+                ++fresh;
+                break;
+            case Box::Put::Replaced:
+                ++replaced;
+                break;
+            case Box::Put::Busy:
+                ++busy;
+                break;
+        }
+    }
+    done.store(true);
+    taker.join();
+    Require(fresh + replaced + busy == kPuts && taken == fresh,
+            "mailbox: taken values are exactly the ones that found the slot empty");
+}
+
+void TestHostsLogWriter() {
+    namespace fs = std::filesystem;
+    using namespace gtg::hostlog;
+    const fs::path dir =
+        fs::temp_directory_path() / std::format(L"gtg-hosts-log-{}", GetCurrentProcessId());
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+    fs::create_directories(dir);
+    const fs::path file = dir / kFileName;
+    const auto wait_for = [](const auto& done) {
+        for (int i = 0; i < 5'000 && !done(); ++i)
+            Sleep(1);
+        return done();
+    };
+    const auto read_lines = [](const fs::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), {});
+        std::vector<std::string> lines;
+        std::size_t begin = 0;
+        for (std::size_t end; (end = text.find('\n', begin)) != std::string::npos;
+             begin = end + 1) {
+            lines.push_back(text.substr(begin, end - begin));
+        }
+        // Anything after the last '\n' is a line cut short.
+        if (begin != text.size()) lines.push_back("<cut>");
+        return lines;
+    };
+
+    constexpr std::uint64_t kBound = 1'000;
+    {
+        Writer writer;
+        Writer::Options options;
+        options.file = file;
+        options.rotate_at_bytes = kBound;
+        Require(writer.Start(options) && writer.Running(), "hosts log writer: starts");
+        Require(writer.RunId().size() == 36 && writer.RunId()[14] == '4',
+                "hosts log writer: a fresh UUID per run");
+        constexpr int kFrames = 20;
+        for (int i = 0; i < kFrames; ++i) {
+            Require(writer.Submit(HostsLogFrame(Status::Running)),
+                    "hosts log writer: an idle slot takes the frame");
+            const auto lines_so_far = static_cast<std::uint64_t>(i + 1);
+            Require(wait_for([&] { return writer.Written() == lines_so_far; }),
+                    "hosts log writer: each frame is written");
+        }
+        const auto older = read_lines(fs::path(file.wstring() + L".1"));
+        const auto current = read_lines(file);
+        Require(!older.empty() && !current.empty(), "hosts log writer: rotated to .1");
+        Require(fs::file_size(file) <= kBound &&
+                    fs::file_size(fs::path(file.wstring() + L".1")) <= kBound,
+                "hosts log writer: neither file passes the bound");
+        std::vector<std::string> lines = older;
+        lines.insert(lines.end(), current.begin(), current.end());
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            const auto seq = kFrames - static_cast<int>(lines.size() - 1 - i);
+            Require(lines[i].starts_with("{\"v\":1,\"run_id\":\"" + writer.RunId() +
+                                         "\",\"seq\":" + std::to_string(seq) + ","),
+                    "hosts log writer: whole lines, one run, seq rising without a gap");
+        }
+        Require(writer.Dropped() == 0, "hosts log writer: nothing dropped");
+
+        // A reader that holds the file without delete sharing: the rename
+        // fails, writing stops, and the bound holds.
+        const HANDLE holder =
+            CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Require(holder != INVALID_HANDLE_VALUE, "hosts log writer: test holds the file");
+        for (int i = 0; i < 6; ++i) {
+            const std::uint64_t before = writer.Written() + writer.Dropped();
+            (void)writer.Submit(HostsLogFrame(Status::Running));
+            Require(wait_for([&] { return writer.Written() + writer.Dropped() > before; }),
+                    "hosts log writer: each frame is written or counted");
+        }
+        CloseHandle(holder);
+        Require(writer.Dropped() > 0 && fs::file_size(file) <= kBound,
+                "hosts log writer: a failed rotation drops frames, never the bound");
+        Require(read_lines(file).back() != "<cut>", "hosts log writer: no line left cut");
+
+        const auto stop_begin = GetTickCount64();
+        writer.Stop();
+        Require(!writer.Running() && GetTickCount64() - stop_begin < 2'500,
+                "hosts log writer: stop returns");
+        Require(!writer.Submit(HostsLogFrame(Status::Running)),
+                "hosts log writer: nothing is taken after stop");
+    }
+    fs::remove_all(dir, ignored);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--supervised") {
         const std::string raw(argv[2]);
@@ -4110,6 +6620,8 @@ int main(int argc, char** argv) {
     }
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
         {"OsdCompact", TestOsdCompact},
+        {"OsdTiny", TestOsdTiny},
+        {"TinyFpsStability", TestTinyFpsStability},
         {"OsdModePositions", TestOsdModePositions},
         {"OsdSnap", TestOsdSnap},
         {"OsdIdleClock", TestOsdIdleClock},
@@ -4131,6 +6643,31 @@ int main(int argc, char** argv) {
         {"FpsIndependentFlipKeepsCorrelatorHealthy",
          TestFpsIndependentFlipKeepsCorrelatorHealthy},
         {"FpsPlayClock", TestFpsPlayClock},
+        {"TopAppAlertRule", TestTopAppAlertRule},
+        {"TopAppSweepBudget", TestTopAppSweepBudget},
+        {"TopAppLeader", TestTopAppLeader},
+        {"TopAppNames", TestTopAppNames},
+        {"TopAppServiceHost", TestTopAppServiceHost},
+        {"TopAppSystemProcesses", TestTopAppSystemProcesses},
+        {"TopAppThresholds", TestTopAppThresholds},
+        {"TopAppCpuLedger", TestTopAppCpuLedger},
+        {"TopAppMarquee", TestTopAppMarquee},
+        {"TopAppPdhInstance", TestTopAppPdhInstance},
+        {"TopAppBoard", TestTopAppBoard},
+        {"PeerPairingCode", TestPeerPairingCode},
+        {"PeerProtocol", TestPeerProtocol},
+        {"PeerHostsView", TestPeerHostsView},
+        {"HostsLogFrame", TestHostsLogFrame},
+        {"HostsLogMailbox", TestHostsLogMailbox},
+        {"HostsLogWriter", TestHostsLogWriter},
+        {"PeerReplay", TestPeerReplay},
+        {"PeerAdmission", TestPeerAdmission},
+        {"PeerCryptoVectors", TestPeerCryptoVectors},
+        {"PeerPairing", TestPeerPairing},
+        {"PeerLoopback", TestPeerLoopback},
+        {"PeerPortInUse", TestPeerPortInUse},
+        {"TinyDescribeBar", TestTinyDescribeBar},
+        {"HostsBridge", TestHostsBridge},
         {"AccessDeniedObserverProbation", TestAccessDeniedObserverProbation},
         {"FpsHistoryBreaksTargetAndSurfaceTransitions",
          TestFpsHistoryBreaksTargetAndSurfaceTransitions},
@@ -4176,7 +6713,10 @@ int main(int argc, char** argv) {
         {"CompactLockPreferenceDefaultsToLocked",
          TestCompactLockPreferenceDefaultsToLocked},
         {"CompactRowComposition", TestCompactRowComposition},
-        {"EighthRecordFillsTheWord", TestEighthRecordFillsTheWord},
+        {"NinthRecordMovesTheStore", TestNinthRecordMovesTheStore},
+        {"ExpandedHeightRule", TestExpandedHeightRule},
+        {"OsdCards", TestOsdCards},
+        {"OsdHostsView", TestOsdHostsView},
         {"LaneValueTakesWhatTheAnnotationLeaves",
          TestLaneValueTakesWhatTheAnnotationLeaves},
         {"NetworkVerdictJudgesTheWorst", TestNetworkVerdictJudgesTheWorst},

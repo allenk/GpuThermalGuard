@@ -83,6 +83,9 @@ struct Session {
     ipc::Section* bitmap{};
     ipc::Request* request{};
     std::uint64_t last_render{};
+    // The desktop OSD's size when the image was last drawn: a different size
+    // is a different shape, and draws at once (RenderDue).
+    int drawn_osd_width{}, drawn_osd_height{};
     unsigned width{}, height{}, image_serial{}, placement_serial{};
     bool image_valid{};
     tray::OsdOverlay::Bitmap image;
@@ -358,8 +361,13 @@ void Publish(Session& s, std::uint64_t now) {
         ipc::SetEnabled(*s.bitmap, false);
         return;
     }
-    if (!s.last_render || now - s.last_render >= 500) {
+    const int osd_width = rect.right - rect.left;
+    const int osd_height = rect.bottom - rect.top;
+    if (RenderDue(s.last_render, now, s.drawn_osd_width, s.drawn_osd_height, osd_width,
+                  osd_height)) {
         s.last_render = now;
+        s.drawn_osd_width = osd_width;
+        s.drawn_osd_height = osd_height;
         s.image_valid = false;
         float scale = settings::EffectiveOsdScale(runtime.source->ScalePercent(),
                                                   runtime.source->CurrentDpi()) *
@@ -607,14 +615,16 @@ bool Configure(bool enabled, unsigned modifiers, unsigned key) noexcept {
     if (enabled && !SetTimer(runtime.window, kTimer, 34, nullptr)) return false;
     if (enabled && (!runtime.hotkey || runtime.modifiers != modifiers || runtime.key != key)) {
         const int next = runtime.hotkey == 0x4740 ? 0x4741 : 0x4740;
-        if (!RegisterHotKey(runtime.window, next, modifiers | MOD_NOREPEAT, key)) {
-            if (!runtime.enabled && std::none_of(runtime.sessions.begin(), runtime.sessions.end(),
-                                                 [](const auto& s) { return s != nullptr; }))
-                KillTimer(runtime.window, kTimer);
+        if (RegisterHotKey(runtime.window, next, modifiers | MOD_NOREPEAT, key)) {
+            if (runtime.hotkey) UnregisterHotKey(runtime.window, runtime.hotkey);
+            runtime.hotkey = next;
+        } else if (runtime.hotkey) {
+            // A hotkey that works is not given up for one that cannot be had.
             return false;
         }
-        if (runtime.hotkey) UnregisterHotKey(runtime.window, runtime.hotkey);
-        runtime.hotkey = next;
+        // Without a hotkey when none was held: another program has the
+        // combination, and the O button does what it would. Asked again the
+        // next time the overlay is configured.
         runtime.modifiers = modifiers;
         runtime.key = key;
     }
@@ -643,6 +653,7 @@ void SetHidesOsd(const bool hides) noexcept {
 
 Status GetStatus() noexcept {
     Status status{runtime.enabled, runtime.modifiers, runtime.key};
+    status.hotkey_held = runtime.hotkey != 0;
     status.failed = static_cast<unsigned>(runtime.refused.Size());
     for (const auto& s : runtime.sessions)
         if (s) {

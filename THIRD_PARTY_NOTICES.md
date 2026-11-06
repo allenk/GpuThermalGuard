@@ -28,3 +28,8 @@ GpuThermalGuard itself is licensed under the MIT License. The following componen
 
 - Git submodule at `third_party/splice` (https://github.com/allenk/splice), compiled into `gtg_overlay.dll`.
 - Licensed under the MIT License. See `third_party/splice/LICENSE`.
+
+## QR Code generator library (qrcodegen) 1.8.0
+
+- Project Nayuki's QR Code generator library for C++ (https://www.nayuki.io/page/qr-code-generator-library), vendored unmodified under `third_party/qrcodegen` and compiled into `GpuThermalGuard.exe` to draw the Hosts pairing code.
+- Licensed under the MIT License, Copyright (c) Project Nayuki. The license text is included at `third_party/qrcodegen/LICENSE`.

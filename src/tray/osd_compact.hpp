@@ -19,9 +19,8 @@ struct Footprint {
     int rows{1};
 };
 
-// Record order is fixed. FPS is always the final cell and RAM sits immediately
-// before it, in every combination of the two preferences.
-enum class Metric { Temperature, Power, Vram, Gpu, Cpu, Ram, Fps, Network };
+// The records, in their default order. Hosts -- paired GTGs -- is the ninth.
+enum class Metric { Temperature, Power, Vram, Gpu, Cpu, Ram, Fps, Network, Hosts };
 
 // The five thermal records cannot be switched off, so five is both their
 // count and the smallest first row any arrangement may have.
@@ -109,6 +108,17 @@ constexpr float LaneScale(float row_height) noexcept {
     return row_height / kLaneNominalHeightDip;
 }
 
+// The axes the expanded temperature and power lanes are drawn on. Tiny's bars
+// stand on the same ones, so a bar and a lane showing one reading agree.
+inline constexpr double kTemperatureAxisBottomC = 30.0;
+inline constexpr double kTemperatureAxisTopC = 105.0;
+
+[[nodiscard]] constexpr double PowerAxisTop(const std::optional<double> maximum_power_w,
+                                            const int safe_power_w) noexcept {
+    return std::max(100.0,
+                    maximum_power_w.value_or(static_cast<double>(std::max(600, safe_power_w))));
+}
+
 struct LaneSpan {
     float x{};
     float width{};
@@ -172,20 +182,19 @@ constexpr int RowCount(bool show_ram, bool show_fps) noexcept {
 // of that rule rather than needing their own logic.
 //
 // A stored arrangement must never be able to hide a record, so the stored form
-// is one 32-bit value validated by pure integer arithmetic: seven three-bit
-// record indices and a three-bit row count. Anything that is not a permutation
-// of all seven with a legal row count is discarded whole.
+// is validated by pure integer arithmetic: a permutation of every record and a
+// set of row breaks. Anything else is discarded whole.
 // ---------------------------------------------------------------------------
 
-// Eight, and eight is the ceiling this stored form can reach -- see the format
-// tag below, which had to shrink to one bit to make room for the eighth.
-inline constexpr int kRecordCount = 8;
+// Nine. The ninth outgrew the REG_DWORD the first eight filled exactly; the
+// arrangement is now a REG_QWORD, below, with room for twelve.
+inline constexpr int kRecordCount = 9;
 
 using Order = std::array<Metric, kRecordCount>;
 
 constexpr Order DefaultOrder() noexcept {
-    return {Metric::Temperature, Metric::Power, Metric::Vram, Metric::Gpu,
-            Metric::Cpu, Metric::Ram, Metric::Fps, Metric::Network};
+    return {Metric::Temperature, Metric::Power, Metric::Vram,    Metric::Gpu,  Metric::Cpu,
+            Metric::Ram,         Metric::Fps,   Metric::Network, Metric::Hosts};
 }
 
 constexpr bool IsValidOrder(const Order& order) noexcept {
@@ -237,8 +246,9 @@ struct Layout {
 };
 
 constexpr bool IsValidLayout(const Layout& layout) noexcept {
-    return IsValidOrder(layout.order) &&
-           (layout.breaks >> kMaxBreaks) == 0;
+    // Eight breaks fill the byte, so today every break set is legal; the check
+    // stays for the day the field is wider than the records need.
+    return IsValidOrder(layout.order) && (static_cast<unsigned>(layout.breaks) >> kMaxBreaks) == 0u;
 }
 
 struct Placement {
@@ -250,8 +260,8 @@ struct Placement {
 };
 
 constexpr bool IsOptional(Metric metric) noexcept {
-    return metric == Metric::Ram || metric == Metric::Fps ||
-           metric == Metric::Network;
+    return metric == Metric::Ram || metric == Metric::Fps || metric == Metric::Network ||
+           metric == Metric::Hosts;
 }
 
 [[nodiscard]] constexpr int WidestRow(const Placement& placed) noexcept {
@@ -326,16 +336,17 @@ constexpr Placement Resolve(const Layout& layout, Enabled&& enabled) noexcept {
     return placed;
 }
 
-// `show_network` defaults to off, which is both the shipped default and what
-// keeps every existing caller meaning what it meant before the eighth record
-// existed. The five thermal records have no switch: falling through to `true`
-// is their answer.
+// `show_network` and `show_hosts` default to off, which keeps every existing
+// caller meaning what it meant before those records existed. Hosts is placed
+// only while Hosts is on and at least one host is paired. The five thermal
+// records have no switch: falling through to `true` is their answer.
 constexpr Placement Resolve(const Layout& layout, bool show_ram, bool show_fps,
-                            bool show_network = false) noexcept {
-    return Resolve(layout, [show_ram, show_fps, show_network](const Metric metric) {
+                            bool show_network = false, bool show_hosts = false) noexcept {
+    return Resolve(layout, [show_ram, show_fps, show_network, show_hosts](const Metric metric) {
         if (metric == Metric::Ram) return show_ram;
         if (metric == Metric::Fps) return show_fps;
         if (metric == Metric::Network) return show_network;
+        if (metric == Metric::Hosts) return show_hosts;
         return true;
     });
 }
@@ -666,65 +677,163 @@ inline constexpr std::uint64_t kHeaderIdleAfterMs = 2'000;
     return text;
 }
 
-inline constexpr unsigned kRecordBits = 3;
-inline constexpr unsigned kRecordMask = (1u << kRecordBits) - 1u;
-inline constexpr unsigned kBreakShift = kRecordCount * kRecordBits;   // 24
-inline constexpr unsigned kBreakMask = (1u << kMaxBreaks) - 1u;       // 7 bits
-
-// A one-bit format tag, at the top of the word.
+// The stored form: one REG_QWORD.
 //
-// Silently reinterpreting a reader's arrangement as a different one is worse
-// than losing it, so every schema before this one is rejected rather than
-// decoded. That has always been the rule; what changed is how much room the
-// tag gets.
+//   bits  0-35  nine four-bit record indices, in order
+//   bits 36-43  the eight breaks
+//   bits 60-63  the format, 2
 //
-// Eight records need 24 bits of order and 7 of breaks, which leaves exactly
-// one. It is enough, because every value the four-bit schema ever wrote
-// carried `1 << 28` in the top nibble -- bit 31 clear in all of them. A tag of
-// one at bit 31 therefore rejects them as cleanly as four bits did.
-//
-// An earlier design note published a table saying this scheme
-// would survive one more record than it does; that table omitted the tag it
-// had just introduced, and was corrected later. The word is
-// now full: a ninth record needs four-bit indices, which is 36 + 8 + 1, and no
-// arrangement of those fits. The record after this one changes the store.
-inline constexpr unsigned kFormatShift = 31;
-inline constexpr std::uint32_t kFormatVersion = 1;
+// Every other bit is zero. Silently reinterpreting a reader's arrangement as a
+// different one is worse than losing it, so a value that is not exactly this
+// is discarded whole, and every earlier schema is read only through its own
+// translation below or not at all.
+inline constexpr unsigned kRecordBits = 4;
+inline constexpr std::uint64_t kRecordMask = (1u << kRecordBits) - 1u;
+inline constexpr unsigned kBreakShift = kRecordCount * kRecordBits;   // 36
+inline constexpr std::uint64_t kBreakMask = (1u << kMaxBreaks) - 1u;   // 8 bits
+inline constexpr unsigned kFormatShift = 60;
+inline constexpr std::uint64_t kFormatVersion = 2;
+inline constexpr std::uint64_t kUsedBits = (std::uint64_t{1} << (kBreakShift + kMaxBreaks)) - 1u;
 
-static_assert(kRecordCount * kRecordBits + kMaxBreaks + 1 <= 32,
-              "the arrangement no longer fits a REG_DWORD");
+static_assert(kBreakShift + kMaxBreaks <= kFormatShift,
+              "the arrangement no longer fits its REG_QWORD");
 
-constexpr std::uint32_t PackLayout(const Layout& layout) noexcept {
-    std::uint32_t packed = kFormatVersion << kFormatShift;
+constexpr std::uint64_t PackLayout(const Layout& layout) noexcept {
+    std::uint64_t packed = kFormatVersion << kFormatShift;
     for (int i = 0; i < kRecordCount; ++i) {
-        packed |= (static_cast<std::uint32_t>(layout.order[
-                       static_cast<std::size_t>(i)]) &
-                   kRecordMask)
-                  << (static_cast<unsigned>(i) * kRecordBits);
+        packed |=
+            (static_cast<std::uint64_t>(layout.order[static_cast<std::size_t>(i)]) & kRecordMask)
+            << (static_cast<unsigned>(i) * kRecordBits);
     }
-    packed |= (static_cast<std::uint32_t>(layout.breaks) & kBreakMask)
-              << kBreakShift;
+    packed |= (static_cast<std::uint64_t>(layout.breaks) & kBreakMask) << kBreakShift;
     return packed;
 }
 
-constexpr std::optional<Layout> UnpackLayout(std::uint32_t packed) noexcept {
+constexpr std::optional<Layout> UnpackLayout(const std::uint64_t packed) noexcept {
     if ((packed >> kFormatShift) != kFormatVersion) return std::nullopt;
+    if ((packed & ~(kFormatVersion << kFormatShift) & ~kUsedBits) != 0) return std::nullopt;
     Layout layout;
     for (int i = 0; i < kRecordCount; ++i) {
-        layout.order[static_cast<std::size_t>(i)] = static_cast<Metric>(
-            (packed >> (static_cast<unsigned>(i) * kRecordBits)) & kRecordMask);
+        const auto index = (packed >> (static_cast<unsigned>(i) * kRecordBits)) & kRecordMask;
+        if (index >= static_cast<std::uint64_t>(kRecordCount)) return std::nullopt;
+        layout.order[static_cast<std::size_t>(i)] = static_cast<Metric>(index);
     }
-    layout.breaks =
-        static_cast<std::uint8_t>((packed >> kBreakShift) & kBreakMask);
+    layout.breaks = static_cast<std::uint8_t>((packed >> kBreakShift) & kBreakMask);
     if (!IsValidLayout(layout)) return std::nullopt;
     return layout;
 }
 
 // A stored value that cannot be trusted is discarded whole. The result always
 // contains every record exactly once.
-constexpr Layout SanitizeLayout(std::uint32_t packed) noexcept {
+constexpr Layout SanitizeLayout(const std::uint64_t packed) noexcept {
     const auto parsed = UnpackLayout(packed);
     return parsed ? *parsed : Layout{};
+}
+
+// The REG_DWORD that held the arrangement while there were eight records: eight
+// three-bit indices (bits 0-23), seven breaks (24-30) and a one-bit tag at 31.
+// It is translated rather than discarded -- its order with Hosts appended,
+// its breaks kept -- so no reader loses an arrangement to the upgrade; it is
+// never written again, so an older build run afterwards still finds its own.
+// Hosts last also keeps every row as it was: it joins the last row, and while
+// it is not placed nothing moves at all.
+inline constexpr int kLegacyRecordCount = 8;
+
+constexpr std::optional<Layout> UnpackLegacyLayout(const std::uint32_t packed) noexcept {
+    if ((packed >> 31) != 1u) return std::nullopt;
+    Layout layout;
+    unsigned seen = 0;
+    for (int i = 0; i < kLegacyRecordCount; ++i) {
+        const unsigned index = (packed >> (static_cast<unsigned>(i) * 3u)) & 7u;
+        if ((seen & (1u << index)) != 0) return std::nullopt;
+        seen |= 1u << index;
+        layout.order[static_cast<std::size_t>(i)] = static_cast<Metric>(index);
+    }
+    if (seen != (1u << kLegacyRecordCount) - 1u) return std::nullopt;
+    layout.order[static_cast<std::size_t>(kLegacyRecordCount)] = Metric::Hosts;
+    layout.breaks = static_cast<std::uint8_t>((packed >> 24) & 0x7Fu);
+    if (!IsValidLayout(layout)) return std::nullopt;
+    return layout;
+}
+
+// The arrangement to use: the stored REG_QWORD if it validates, else the old
+// REG_DWORD translated, else the default.
+constexpr Layout RestoreLayout(const std::optional<std::uint64_t> stored,
+                               const std::uint32_t legacy) noexcept {
+    if (stored) {
+        if (const auto parsed = UnpackLayout(*stored)) return *parsed;
+    }
+    if (const auto translated = UnpackLegacyLayout(legacy)) return *translated;
+    return Layout{};
+}
+
+// The expanded window's height for `count` lanes. Up to eight records each one
+// added 25 dip and the lanes gave up the rest, down to 44.75 dip at eight --
+// as short as they go (owner, 2026-10-27: 「OSD 現在已經夠扁了」). Past that the
+// window grows by a whole lane, as tall as the others: 31 dip of header and
+// 46.75 dip a lane with its gap, rounded up.
+inline constexpr int kLaneStrideQuarterDip = 187;   // 46.75 dip
+
+[[nodiscard]] constexpr int ExpandedHeight(const int count) noexcept {
+    const int squeezed = Height(false) + (count - kCellsPerRow) * 25;
+    const int stacked = 31 + (count * kLaneStrideQuarterDip + 3) / 4;
+    return squeezed > stacked ? squeezed : stacked;
+}
+
+// How short the expanded window may become where the space cannot hold it:
+// 30 dip a record under the header. Below that a lane's curve is a few pixels
+// tall and a card has no room left for one.
+inline constexpr int kExpandedMinimumRecordDip = 30;
+
+[[nodiscard]] constexpr int ExpandedMinimumHeight(const int count) noexcept {
+    return 31 + count * kExpandedMinimumRecordDip;
+}
+
+// ---------------------------------------------------------------------------
+// The expanded view's cards.
+//
+// Two columns in the arrangement's order, row by row, under the same header
+// the lanes have. With an odd number of records the last card spans both
+// columns rather than leaving a hole. The rows divide the window's height
+// between them down to the bottom margin, so the window always ends where the
+// last card does -- the old cards grew the window by a lane's height for every
+// record and left the difference empty under them.
+//
+// Everything is in dip; the painter multiplies by its scale.
+// ---------------------------------------------------------------------------
+inline constexpr float kCardsTopDip = 31.0F;   // where the first lane starts
+inline constexpr float kCardsMarginDip = 6.0F;   // left, right and bottom
+inline constexpr float kCardGapDip = 4.0F;
+inline constexpr int kCardColumns = 2;
+
+struct CardBox {
+    float x{};
+    float y{};
+    float width{};
+    float height{};
+};
+
+[[nodiscard]] constexpr int CardRows(const int count) noexcept {
+    return count <= 0 ? 0 : (count + kCardColumns - 1) / kCardColumns;
+}
+
+// The card at `slot` of `count`, in a window `width` x `height` dip. Empty for
+// a slot that does not exist.
+[[nodiscard]] constexpr CardBox CardAt(const int slot, const int count, const float width,
+                                       const float height) noexcept {
+    const int rows = CardRows(count);
+    if (slot < 0 || slot >= count) return {};
+    const float inner = width - kCardsMarginDip * 2.0F;
+    const float column_width = (inner - kCardGapDip) / static_cast<float>(kCardColumns);
+    const float row_height =
+        (height - kCardsTopDip - kCardsMarginDip - kCardGapDip * static_cast<float>(rows - 1)) /
+        static_cast<float>(rows);
+    const int row = slot / kCardColumns;
+    const int column = slot % kCardColumns;
+    const bool spans = slot == count - 1 && count % kCardColumns != 0;
+    return {kCardsMarginDip + static_cast<float>(column) * (column_width + kCardGapDip),
+            kCardsTopDip + static_cast<float>(row) * (row_height + kCardGapDip),
+            spans ? inner : column_width, row_height};
 }
 
 // Left margin, then (n-1) strides, then the last cell, then the right margin:
@@ -756,12 +865,18 @@ constexpr Footprint ChooseFootprint(bool collapsed, const Placement& placed,
                 placed.rows};
     }
     // Expanded is a vertical list, so the arrangement changes the order of the
-    // lanes but not the shape of the window.
-    const int height = Height(false) + (placed.count - kCellsPerRow) * 25;
-    if (work_height_dip >= height * 2 && work_width_dip >= 388)
-        return {388, height, 1, 1};
-    return {std::min(320, std::max(1, work_width_dip)),
-            190 + (placed.count - kCellsPerRow) * 25, 2, 1};
+    // lanes but not the shape of the window. The cards draw in the same window,
+    // so the reader's choice between them never moves or resizes the OSD.
+    //
+    // The view is never chosen here. It used to switch to a narrow two-column
+    // card view whenever the lanes would take more than half the work area --
+    // a rule written for a 1366 x 768 screen at 192 DPI before the OSD had a
+    // size of its own, which then turned x2.50 on a 4K screen into cards
+    // nobody had asked for (owner, 2026-11-02). A space too short for the
+    // window gets a shorter window instead, its rows sharing what there is.
+    const int natural = ExpandedHeight(placed.count);
+    if (work_height_dip >= natural) return {388, natural, 1, 1};
+    return {388, std::max(ExpandedMinimumHeight(placed.count), work_height_dip), 1, 1};
 }
 
 // Convenience for callers that have no stored arrangement yet.

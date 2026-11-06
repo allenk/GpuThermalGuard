@@ -23,17 +23,21 @@
 
 // Forward-declared rather than including <gdiplus.h> here. This header is
 // pulled in by the tray, the tests and the smoke harnesses; GDI+ is an
-// implementation detail of how the dashboard is drawn, and only the two
-// drawing entry points below mention it.
+// implementation detail of how the dashboard is drawn, and only the drawing
+// entry points below mention it.
 namespace Gdiplus {
+class Color;
 class Graphics;
+class RectF;
 }  // namespace Gdiplus
 
 #include "sysmem/host_memory.hpp"
 #include "net/action.hpp"
 #include "net/history.hpp"
 #include "sysmem/reclaim.hpp"
+#include "topapp/board.hpp"
 #include "tray/osd_animation.hpp"
+#include "tray/osd_hosts.hpp"
 
 namespace gtg::tray {
 
@@ -178,7 +182,10 @@ public:
     // A joinable std::thread member would call std::terminate if the overlay
     // were destroyed while an action was still running. Every worker is
     // bounded, so joining here is finite.
-    ~OsdOverlay() { EndAction(); }
+    ~OsdOverlay() {
+        EndAction();
+        ReleaseMarqueeSurface();
+    }
 
     // CS_DBLCLKS is required: without it Windows delivers no WM_LBUTTONDBLCLK
     // to this class at all, and a cell activation would simply never arrive.
@@ -214,6 +221,24 @@ public:
     // itself stays with the caller, beside the position it already saves --
     // the overlay draws, it does not own the registry.
     void RestoreCollapsed(const bool collapsed) noexcept { collapsed_ = collapsed; }
+
+    // Tiny: the compact dashboard folded into its header and one cell of bars.
+    // A form of the compact shape, not a third shape: the chevron still opens
+    // the expanded view, and collapsing returns to whichever form was showing.
+    // Restored before Initialize for the same reason the shape is.
+    [[nodiscard]] bool Tiny() const noexcept { return tiny_; }
+
+    void RestoreTiny(const bool tiny) noexcept { tiny_ = tiny; }
+
+    // Cards: the expanded view drawn as large cells, two across, each carrying
+    // what its lane carries. The reader's choice, off unless made. Lanes and
+    // cards share one window, so switching never moves or resizes the OSD;
+    // collapsing keeps the choice for the next expand, as Tiny's is kept.
+    [[nodiscard]] bool CardView() const noexcept { return cards_; }
+
+    void RestoreCardView(const bool cards) noexcept { cards_ = cards; }
+
+    void SetCardView(bool cards) noexcept;
     // Each shape's own remembered position, set before Initialize like the
     // shape itself. Initialize still takes the position to open at; the caller
     // passes the one for the restored shape.
@@ -383,12 +408,25 @@ public:
     // attempt found one, which sized the window for seven records while the
     // painter drew eight and put the last cell outside the window.
     [[nodiscard]] compact::Placement CurrentPlacement() const noexcept {
-        return compact::Resolve(layout_, ram_enabled_, fps_enabled_, net_enabled_);
+        return compact::Resolve(layout_, ram_enabled_, fps_enabled_, net_enabled_, hosts_enabled_);
     }
     void SetRamHistory(const sysmem::History* history) noexcept {
         ram_history_ = history;
         RequestRefresh();
     }
+
+    // The app behind each record in alert, floated over that record's curve.
+    // An empty board draws nothing.
+    void SetTopApps(const topapp::Board& board) noexcept;
+    // The records in alert under the top-app rule, as topapp::Bit flags,
+    // whether or not names are being looked for. Tiny raises their bars at the
+    // moments the cells would float a name, so the two forms never disagree.
+    void SetTopAppAlerts(std::uint32_t mask) noexcept;
+    // Paired GTGs: the record is placed while Hosts is on and a host is
+    // paired, and draws the view it is given, which says which four hosts and
+    // how each reads. The view is built on the UI thread from the link's table.
+    void SetHostsEnabled(bool enabled) noexcept;
+    void SetHosts(osd_hosts::View view) noexcept;
     [[nodiscard]] POINT Position() const noexcept;
 
 private:
@@ -408,7 +446,9 @@ private:
     void EndAction() noexcept;
     [[nodiscard]] bool ToggleHit(POINT point) const noexcept;
     [[nodiscard]] bool LockHit(POINT point) const noexcept;
+    [[nodiscard]] bool FoldHit(POINT point) const noexcept;
     void ToggleCollapsed() noexcept;
+    void ToggleTiny() noexcept;
     [[nodiscard]] bool Arrangeable() const noexcept {
         return ShowsLock() && !compact_locked_;
     }
@@ -430,7 +470,18 @@ private:
     }
     [[nodiscard]] bool OverlayHit(POINT point) const noexcept;
     [[nodiscard]] bool TitleShown() const noexcept;
+
+    // Tiny has nothing to arrange, so it has no lock.
     [[nodiscard]] bool ShowsLock() const noexcept {
+#if GTG_OSD_CLICK_THROUGH
+        return false;
+#else
+        return collapsed_ && !tiny_;
+#endif
+    }
+
+    // The fold control needs pointer input on the body, as the lock does.
+    [[nodiscard]] bool ShowsFold() const noexcept {
 #if GTG_OSD_CLICK_THROUGH
         return false;
 #else
@@ -438,6 +489,10 @@ private:
 #endif
     }
     bool collapsed_{};
+    bool tiny_{};
+    bool cards_{};
+    compact::Gesture fold_gesture_;
+    std::uint32_t top_app_alerts_{};
     // When the pointer was last over the window, and whether the header has
     // gone idle since.
     std::uint64_t last_pointer_ms_{};
@@ -532,10 +587,50 @@ private:
     // GameClock is the in-game copy: the clock, and no OVL badge, since that
     // copy is the overlay.
     enum class HeaderMode { Controls, Clock, GameClock };
+
+    // A name floated over a curve, in surface pixels. Plain numbers rather
+    // than GDI+ types, like the busy indicator's accent.
+    struct AlertLabel {
+        float x{};
+        float y{};
+        float width{};
+        float height{};
+        float em_px{};
+        float scale{};
+        std::uint32_t argb{};
+        std::wstring text;
+        std::uint64_t since_ms{};
+    };
+
     // The dashboard's pixels, with no output attached. See the definition
-    // for why this is const.
-    void DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
-                     std::uint64_t now_ms, HeaderMode header) const;
+    // for why this is const. With `deferred`, the alert labels are listed
+    // there instead of drawn, so the desktop can keep the pixels under them
+    // and move a long name without redrawing the dashboard.
+    void DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout, std::uint64_t now_ms,
+                     HeaderMode header, std::vector<AlertLabel>* deferred = nullptr) const;
+    // Tiny's one cell, under DrawSurface's header. `reading` is the sample the
+    // cells would show, or null; `stale` and the window come from the same
+    // freshness evaluation the cells use.
+    void DrawTinyCell(Gdiplus::Graphics& graphics, const Layout& layout, std::uint64_t now_ms,
+                      const telemetry::Sample* reading, bool stale, std::uint64_t start,
+                      std::uint64_t end) const;
+    // The expanded view as cards, under DrawSurface's header. The arguments
+    // are DrawTinyCell's, plus DrawSurface's `deferred` for the names floated
+    // over the curves.
+    void DrawCards(Gdiplus::Graphics& graphics, const Layout& layout, std::uint64_t now_ms,
+                   const telemetry::Sample* reading, bool stale, std::uint64_t start,
+                   std::uint64_t end, std::vector<AlertLabel>* deferred) const;
+    // An app name over a curve: drawn now, or listed in `deferred` for the
+    // desktop to draw over pixels it keeps.
+    void FloatName(Gdiplus::Graphics& graphics, topapp::Record record, const Gdiplus::RectF& band,
+                   float em_px, const Gdiplus::Color& accent, float scale, std::uint64_t now_ms,
+                   std::vector<AlertLabel>* deferred) const;
+    void DrawFoldControl(Gdiplus::Graphics& graphics, const Layout& layout,
+                         HeaderMode header) const;
+    // One marquee frame on the desktop: the last render's pixels with the
+    // labels drawn again where they are now.
+    void RenderMarqueeFrame() noexcept;
+    void StopMarquee() noexcept;
     // The pointer is over the window now: wake the header if it was idle.
     void NotePointer() noexcept;
     // On the refresh tick: decide whether the header is idle.
@@ -550,6 +645,12 @@ private:
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kTopmostRepairTimerId = 2;
     static constexpr UINT_PTR kActionTimerId = 3;
+    // Runs only while a name too long for its box is on the visible desktop
+    // OSD. The 500 ms render timer is unchanged. Six ticks of the 15.6 ms
+    // system timer, about 10.7 fps (owner: at most 10-15); an interval that is
+    // not a whole number of ticks is rounded up, which is how 33 ms became 47.
+    static constexpr UINT_PTR kMarqueeTimerId = 4;
+    static constexpr UINT kMarqueeIntervalMs = 93;
     // Coarse on purpose: this poll only notices that the work finished and
     // that the floor elapsed. The animation runs on the indicator own timer.
     static constexpr UINT kActionPollIntervalMs = 50;
@@ -587,8 +688,47 @@ private:
     const sysmem::History* ram_history_{nullptr};
     const net::History* net_history_{nullptr};
     bool net_enabled_{false};
+    bool hosts_enabled_{false};
+    osd_hosts::View hosts_;
     bool fps_enabled_{false};
     fps::Snapshot fps_snapshot_{};
+    topapp::Board top_apps_{};
+
+    // A name that moves, laid out once: where its plate and its window are,
+    // and its text drawn alone into a strip, so a frame composites the strip
+    // instead of laying the text out again.
+    struct MarqueeStrip {
+        AlertLabel label;
+        float window_x{};
+        float window_y{};
+        float window_width{};
+        float window_height{};
+        float text_width{};
+        int pixels_width{};
+        int pixels_height{};
+        std::vector<std::uint8_t> pixels;   // premultiplied BGRA, the text alone
+    };
+
+    // What the marquee needs between renders: the moving names, and the last
+    // render's pixels with everything but their text. Empty unless a name is
+    // moving.
+    std::vector<MarqueeStrip> marquee_strips_;
+    std::vector<std::uint8_t> marquee_base_;
+    int marquee_base_width_{};
+    int marquee_base_height_{};
+    std::uint64_t marquee_base_serial_{};
+    bool marquee_running_{};
+    // The surface frames are drawn into, kept between frames: re-creating it
+    // and copying the whole base each frame was most of what a frame cost.
+    // Refreshed from the base once per render.
+    HDC marquee_dc_{};
+    HBITMAP marquee_bitmap_{};
+    HGDIOBJ marquee_previous_{};
+    void* marquee_pixels_{};
+    int marquee_surface_width_{};
+    int marquee_surface_height_{};
+    std::uint64_t marquee_surface_serial_{};
+    void ReleaseMarqueeSurface() noexcept;
     OsdDragHandle drag_handle_;
     bool synchronizing_position_{false};
     bool refresh_pending_{false};

@@ -135,8 +135,11 @@ int wmain(int argc, wchar_t** argv) {
         Require(!Configure(true, MOD_ALT, VK_F12), "reserved hotkey refused");
         Require(RegisterHotKey(window, 19, MOD_ALT | MOD_CONTROL, VK_F10),
                 "conflict fixture registration");
-        Require(!Configure(true, MOD_ALT | MOD_CONTROL, VK_F10), "conflicting hotkey refused");
-        Require(Configure(true, MOD_ALT | MOD_CONTROL, VK_F11), "alternate hotkey registered");
+        Require(Configure(true, MOD_ALT | MOD_CONTROL, VK_F10) && GetStatus().enabled &&
+                    !GetStatus().hotkey_held && runtime.hotkey == 0,
+                "a hotkey held elsewhere: on without it");
+        Require(Configure(true, MOD_ALT | MOD_CONTROL, VK_F11) && GetStatus().hotkey_held,
+                "alternate hotkey registered");
         const auto id = runtime.hotkey;
         Require(!Configure(true, MOD_ALT | MOD_CONTROL, VK_F10) && runtime.hotkey == id,
                 "failed replacement retains old binding");

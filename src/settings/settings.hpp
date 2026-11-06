@@ -1,7 +1,12 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "core/protection.hpp"
 #include "localization/localization.hpp"
@@ -27,6 +32,14 @@ struct OsdPreference {
     // Absent means expanded, which is what every install does today, so no
     // reader's window changes shape on upgrade.
     bool collapsed{false};
+    // CompactTiny: whether the compact dashboard is folded into Tiny. A form of
+    // the compact shape, so it means nothing while expanded and is kept for
+    // the next collapse. Absent means the cells.
+    bool tiny{false};
+    // OsdCard: whether the expanded view draws cards instead of lanes. Its
+    // counterpart of Tiny: meaningless while collapsed, kept for the next
+    // expand. Absent means the lanes.
+    bool card{false};
     // OsdX/OsdY: the expanded shape's position. Before each shape had its own
     // it was the shape last exited in, which is why a missing compact
     // position falls back to it (placement::FromStored).
@@ -95,12 +108,54 @@ struct TriggerTestRun {
     return !has_valid_value || value != 0;
 }
 
+// Same rule again: an absent value names the app behind a sustained high
+// load. With no such load nothing runs, so on costs nothing until it matters.
+[[nodiscard]] constexpr bool ResolveTopAppPreference(bool has_valid_value,
+                                                     std::uint32_t value) noexcept {
+    return !has_valid_value || value != 0;
+}
+
 // An absent value leaves the compact dashboard locked, so an arrangement
 // cannot be disturbed by a reader who has never opened it.
 [[nodiscard]] constexpr bool ResolveCompactLockPreference(
     bool has_valid_value, std::uint32_t value) noexcept {
     return !has_valid_value || value != 0;
 }
+
+// Hosts: paired GTGs on each other's dashboards.
+inline constexpr std::size_t kMaxStoredHosts = 16;
+
+[[nodiscard]] constexpr bool IsValidHostsPort(const std::uint32_t port) noexcept {
+    return port >= 1024 && port <= 65535;
+}
+
+struct HostsPreference {
+    // Absent means off: a network feature is never on until the reader turns
+    // it on.
+    bool enabled{false};
+    // Empty: the computer's name.
+    std::wstring name;
+    // 0: the default port.
+    int port{};
+    // This GTG's id among its pairs; 0 until one is made.
+    std::uint64_t peer_id{};
+    // The Hosts log, for another program on this machine to read. Off unless
+    // the reader turns it on; independent of `enabled`.
+    bool log{false};
+};
+
+// A pair as stored. The key arrives already protected (DPAPI); this layer
+// never holds one in the clear.
+struct StoredHost {
+    std::uint64_t peer{};
+    std::wstring name;
+    std::uint32_t order{};
+    bool issued{};
+    bool has_endpoint{};
+    std::array<std::uint8_t, 4> address{};
+    std::uint16_t port{};
+    std::vector<std::uint8_t> protected_key;
+};
 
 [[nodiscard]] LoadResult Load();
 [[nodiscard]] bool Save(const ProtectionConfig& config, std::wstring& error);
@@ -119,6 +174,8 @@ struct TriggerTestRun {
 [[nodiscard]] bool SaveOsdPosition(int x, int y, std::wstring& error);
 [[nodiscard]] bool SaveCompactPosition(int x, int y, std::wstring& error);
 [[nodiscard]] bool SaveOsdCollapsed(bool collapsed, std::wstring& error);
+[[nodiscard]] bool SaveCompactTiny(bool tiny, std::wstring& error);
+[[nodiscard]] bool SaveOsdCard(bool card, std::wstring& error);
 [[nodiscard]] bool SaveOsdScale(int scale_percent, std::wstring& error);
 [[nodiscard]] bool LoadFpsEnabled() noexcept;
 [[nodiscard]] bool SaveFpsEnabled(bool enabled, std::wstring& error);
@@ -132,11 +189,17 @@ struct TriggerTestRun {
 // is a dashboard most readers will never see the network on.
 [[nodiscard]] bool LoadNetEnabled() noexcept;
 [[nodiscard]] bool SaveNetEnabled(bool enabled, std::wstring& error);
-// The arrangement is returned as the raw stored word, not as a layout: this
-// layer must not depend on the tray's presentation headers. The caller
-// validates it, and an absent value reads as 0, which sanitizes to the default.
+[[nodiscard]] bool LoadTopAppEnabled() noexcept;
+[[nodiscard]] bool SaveTopAppEnabled(bool enabled, std::wstring& error);
+// The arrangement is returned as raw stored values, not as a layout: this
+// layer must not depend on the tray's presentation headers, and the caller
+// validates them. CompactArrangement (REG_QWORD) is the store since the ninth
+// record; nothing when absent. CompactLayout (REG_DWORD) held the first eight
+// and is only read, to translate it once; it is never written again, so an
+// older build run afterwards still finds its own. Absent, it reads as 0.
+[[nodiscard]] std::optional<std::uint64_t> LoadCompactArrangement() noexcept;
+[[nodiscard]] bool SaveCompactArrangement(std::uint64_t packed, std::wstring& error);
 [[nodiscard]] std::uint32_t LoadCompactLayout() noexcept;
-[[nodiscard]] bool SaveCompactLayout(std::uint32_t packed, std::wstring& error);
 [[nodiscard]] bool LoadCompactLocked() noexcept;
 [[nodiscard]] bool SaveCompactLocked(bool locked, std::wstring& error);
 [[nodiscard]] WindowPosition LoadMainWindowPosition() noexcept;
@@ -155,6 +218,19 @@ struct TriggerTestRun {
 [[nodiscard]] bool SaveOverlayHidesOsd(bool enabled, std::wstring& error);
 [[nodiscard]] OverlayHotkey LoadOverlayHotkey() noexcept;
 [[nodiscard]] bool SaveOverlayHotkey(const OverlayHotkey& hotkey, std::wstring& error);
+[[nodiscard]] HostsPreference LoadHostsPreference() noexcept;
+[[nodiscard]] bool SaveHostsEnabled(bool enabled, std::wstring& error);
+[[nodiscard]] bool SaveHostsName(std::wstring_view name, std::wstring& error);
+[[nodiscard]] bool SaveHostsPort(int port, std::wstring& error);
+[[nodiscard]] bool SaveHostsPeerId(std::uint64_t id, std::wstring& error);
+[[nodiscard]] bool SaveHostsLog(bool on, std::wstring& error);
+// The pairs in the reader's order, at most kMaxStoredHosts. An entry without a
+// key is not a pair and is skipped.
+[[nodiscard]] std::vector<StoredHost> LoadHosts();
+// A new pair goes last in the reader's order; a known one keeps its place.
+[[nodiscard]] bool SaveHost(const StoredHost& host, std::wstring& error);
+[[nodiscard]] bool RemoveHost(std::uint64_t peer, std::wstring& error);
+[[nodiscard]] bool SaveHostsOrder(const std::vector<std::uint64_t>& order, std::wstring& error);
 [[nodiscard]] bool LoadFeatureNoticeSerial(std::uint32_t& serial) noexcept;
 [[nodiscard]] bool SaveFeatureNoticeSerial(std::uint32_t serial, std::wstring& error);
 

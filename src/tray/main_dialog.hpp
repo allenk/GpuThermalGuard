@@ -33,6 +33,15 @@
 #include "net/throughput_win32.hpp"
 #include "sysmem/host_memory.hpp"
 #include "sysmem/reclaim_nt.hpp"
+#include "topapp/alert_rule.hpp"
+#include "topapp/board.hpp"
+#include "topapp/sampler.hpp"
+#include "tray/hosts_controller.hpp"
+#ifdef GTG_FEATURE_UPDATE
+#include "update/hosts_updates.hpp"
+#include "update/tray_updates.hpp"
+#include "update/update_resource.h"
+#endif
 
 namespace gtg::tray {
 
@@ -55,6 +64,8 @@ public:
         MESSAGE_HANDLER(WM_SETTINGCHANGE, OnUiSettingChange)
         MESSAGE_HANDLER(WM_SETTINGCHANGE, OnDisplayConfigurationChanged)
         MESSAGE_HANDLER(WM_EXITSIZEMOVE, OnExitSizeMove)
+        MESSAGE_HANDLER(WM_POWERBROADCAST, OnPowerBroadcast)
+        MESSAGE_HANDLER(WM_ENDSESSION, OnEndSession)
         MESSAGE_HANDLER(WM_CTLCOLORSTATIC, OnCtlColorStatic)
         MESSAGE_HANDLER(WM_DRAWITEM, OnDrawItem)
         MESSAGE_HANDLER(kTrayMessage, OnTrayMessage)
@@ -72,14 +83,19 @@ public:
         COMMAND_HANDLER(IDC_SHOW_FPS, BN_CLICKED, OnFpsToggle)
         COMMAND_HANDLER(IDC_SHOW_RAM, BN_CLICKED, OnRamToggle)
         COMMAND_HANDLER(IDC_SHOW_NET, BN_CLICKED, OnNetToggle)
+        COMMAND_HANDLER(IDC_SHOW_TOP_APP, BN_CLICKED, OnTopAppToggle)
         COMMAND_HANDLER(IDC_LANGUAGE, CBN_SELCHANGE, OnLanguageChanged)
         COMMAND_HANDLER(IDC_THEME, CBN_SELCHANGE, OnUiThemeSelected)
         COMMAND_HANDLER(IDC_OVERLAY_ENABLED, BN_CLICKED, OnOverlayToggle)
         COMMAND_HANDLER(IDC_OVERLAY_AUTO_SDR, BN_CLICKED, OnOverlayAutoSdr)
         COMMAND_HANDLER(IDC_OVERLAY_HIDES_OSD, BN_CLICKED, OnOverlayHidesOsd)
         COMMAND_ID_HANDLER(IDC_OVERLAY_HOTKEY, OnOverlayHotkey)
+        COMMAND_ID_HANDLER(IDC_HOSTS, OnHosts)
+        COMMAND_ID_HANDLER(IDM_TRAY_HOSTS, OnHosts)
+        COMMAND_ID_HANDLER(IDM_TRAY_HOSTS_LOG, OnTrayHostsLog)
         COMMAND_HANDLER(IDC_OSD_SCALE, CBN_SELCHANGE, OnOsdScaleChanged)
         COMMAND_HANDLER(IDC_OSD_SCALE, CBN_DROPDOWN, OnOsdScaleDropDown)
+        COMMAND_HANDLER(IDC_OSD_CARD, BN_CLICKED, OnOsdCardToggle)
         COMMAND_HANDLER(IDC_NORMAL_POWER, EN_CHANGE, OnProtectionSettingChanged)
         COMMAND_HANDLER(IDC_SAFE_POWER, EN_CHANGE, OnProtectionSettingChanged)
         COMMAND_HANDLER(IDC_TRIGGER_TEMP, EN_CHANGE, OnProtectionSettingChanged)
@@ -94,6 +110,9 @@ public:
         COMMAND_ID_HANDLER(IDM_TRAY_RESET_OSD_LAYOUT, OnResetOsdLayout)
         COMMAND_ID_HANDLER(IDM_TRAY_DEEP_MEMORY_CLEAN, OnDeepMemoryClean)
         COMMAND_ID_HANDLER(IDM_TRAY_EXIT, OnTrayExit)
+#ifdef GTG_FEATURE_UPDATE
+        COMMAND_RANGE_HANDLER(IDM_TRAY_UPDATE_CHECK, IDM_TRAY_UPDATE_SETTINGS, OnUpdateCommand)
+#endif
     END_MSG_MAP()
 
 private:
@@ -174,6 +193,10 @@ private:
     LRESULT OnFpsToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnRamToggle(WORD, WORD, HWND, BOOL&);
     LRESULT OnNetToggle(WORD, WORD, HWND, BOOL&);
+    LRESULT OnTopAppToggle(WORD, WORD, HWND, BOOL&);
+    // On the 200 ms tick: which records are in alert, which names to float.
+    void UpdateTopApps(std::uint64_t now_ms);
+    void ClearTopApps();
     LRESULT OnResetOsdLayout(WORD, WORD, HWND, BOOL&);
     LRESULT OnDeepMemoryClean(WORD, WORD, HWND, BOOL&);
     LRESULT OnDeepCleanDone(UINT, WPARAM, LPARAM, BOOL&);
@@ -187,6 +210,14 @@ private:
     LRESULT OnOverlayAutoSdr(WORD, WORD, HWND, BOOL&);
     LRESULT OnOverlayHidesOsd(WORD, WORD, HWND, BOOL&);
     LRESULT OnOverlayHotkey(WORD, WORD, HWND, BOOL&);
+    LRESULT OnHosts(WORD, WORD, HWND, BOOL&);
+    LRESULT OnTrayHostsLog(WORD, WORD, HWND, BOOL&);
+    // Sleep and sign-out: paired hosts are told this machine is going, so
+    // they show it offline rather than lost.
+    LRESULT OnPowerBroadcast(UINT, WPARAM, LPARAM, BOOL&);
+    LRESULT OnEndSession(UINT, WPARAM, LPARAM, BOOL&);
+    // What this machine sends its paired hosts, from what the dashboard holds.
+    [[nodiscard]] hosts::LocalState LocalHostState(std::uint64_t now_ms) const;
     void ApplyUiTheme();
     void RefreshThemeChoices();
     // Runs before darkmodelib's own subclass, so the coloured readings keep
@@ -195,6 +226,7 @@ private:
                                                  LPARAM lparam, UINT_PTR id, DWORD_PTR data);
     LRESULT OnOsdScaleChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnOsdScaleDropDown(WORD, WORD, HWND, BOOL&);
+    LRESULT OnOsdCardToggle(WORD, WORD, HWND, BOOL&);
     void RefreshOsdScaleChoices();
     LRESULT OnProtectionSettingChanged(WORD, WORD, HWND, BOOL&);
     LRESULT OnManualSnapshot(WORD, WORD, HWND, BOOL&);
@@ -204,6 +236,16 @@ private:
     LRESULT OnTrayOpenLog(WORD, WORD, HWND, BOOL&);
     LRESULT OnTrayToggleOsd(WORD, WORD, HWND, BOOL&);
     LRESULT OnTrayExit(WORD, WORD, HWND, BOOL&);
+#ifdef GTG_FEATURE_UPDATE
+    LRESULT OnUpdateCommand(WORD, WORD id, HWND, BOOL&);
+    void StartUpdates();
+    // What the updater needs to know to pick a moment that costs no protection.
+    [[nodiscard]] update::SafeInputs UpdateSafeInputs(std::uint64_t now_ms) const;
+    // Updates over Hosts, on the dashboard's tick: requests from paired hosts
+    // to the updater, this machine's status and the reader's triggers to the
+    // link.
+    void TickHostsUpdates(std::uint64_t now_ms);
+#endif
 
     [[nodiscard]] bool AddTrayIcon();
     void RemoveTrayIcon() noexcept;
@@ -256,7 +298,7 @@ private:
     // How long the request took. Not how long the reclaim takes: the call
     // only asks the memory manager to start.
     std::uint64_t deep_clean_elapsed_ms_{};
-    std::uint32_t saved_compact_layout_{};
+    std::uint64_t saved_compact_layout_{};
     bool saved_compact_locked_{true};
     HistoryChart history_chart_;
     settings::UiTheme ui_theme_{settings::UiTheme::Auto};
@@ -278,6 +320,34 @@ private:
     // Off unless asked for; see settings::LoadNetEnabled.
     bool show_net_{false};
     std::uint64_t last_net_sample_ms_{};
+    // The app behind a sustained high load. The rules run here on the tick;
+    // the sweep runs on the sampler's own thread and never on this one.
+    bool show_top_app_{true};
+    topapp::Sampler top_app_sampler_;
+    std::array<topapp::AlertRule, topapp::kRecordCount> top_app_rules_{
+        topapp::AlertRule(topapp::kGpuThresholds), topapp::AlertRule(topapp::kVramThresholds),
+        topapp::AlertRule(topapp::kCpuThresholds), topapp::AlertRule(topapp::kRamThresholds)};
+    topapp::Board top_app_board_{};
+    // The records the top-app rules have in alert on this tick, as Bit()
+    // flags: Tiny raises its bars by them, and paired hosts are sent them.
+    std::uint32_t top_app_alerts_{};
+    // Paired GTGs. The link thread exists only while Hosts is on.
+    HostsController hosts_;
+#ifdef GTG_FEATURE_UPDATE
+    // Updates from the source this machine's administrator configured.
+    update::TrayUpdates updates_;
+    // Armed or monitoring only, and not latched, as of the last snapshot.
+    bool protection_idle_{};
+    // Asking paired hosts to update.
+    update::HostsUpdates host_updates_;
+    std::uint64_t last_update_status_ms_{};
+    // The tooltip SetTrayVisual was last given and the update line it added,
+    // so the tick can redo the tray icon when only the badge changes.
+    std::wstring tray_base_tooltip_;
+    std::wstring tray_badge_line_;
+#endif
+    // Hands the dashboard what it draws for Hosts, on the presentation tick.
+    void UpdateHostsRecord(std::uint64_t now_ms);
     std::uint64_t last_fps_refresh_ms_{};
     std::uint64_t last_tray_add_attempt_ms_{0};
     UINT current_tray_icon_id_{0};

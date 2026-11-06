@@ -406,6 +406,49 @@ int main(int argc, char** argv) {
                 Check(ram_left - graph_left <= tolerance,
                       "RAM reaches the left edge of its plot area");
             }
+
+            // --- cards: the expanded view as large cells -------------------
+            // Drawn in the lanes' own window, so switching moves nothing.
+            {
+                RECT lanes{};
+                GetWindowRect(osd, &lanes);
+                osd.SetCardView(true);
+                RECT cards{};
+                GetWindowRect(osd, &cards);
+                Check(EqualRect(&lanes, &cards) != FALSE, "cards draw in the lanes' window");
+                screenshot("cards-expanded.png");
+                osd.SetHostMemoryLow(true);
+                screenshot("cards-ram-low-memory.png");
+                osd.SetHostMemoryLow(false);
+                osd.SetCardView(false);
+                GetWindowRect(osd, &cards);
+                Check(EqualRect(&lanes, &cards) != FALSE, "and the lanes come back in it");
+            }
+
+            // --- a size change keeps the top-right corner ------------------
+            // Docked on the right edge, as the owner had it: going down a size
+            // used to keep the top-left and leave the edge.
+            {
+                RECT start{};
+                GetWindowRect(osd, &start);
+                MONITORINFO info{sizeof(info)};
+                Check(GetMonitorInfoW(MonitorFromWindow(osd, MONITOR_DEFAULTTONEAREST), &info) !=
+                          FALSE,
+                      "monitor for the docking check");
+                const int docked_x = info.rcMonitor.right - (start.right - start.left);
+                const int docked_y = info.rcMonitor.top + 40;
+                SetWindowPos(osd, nullptr, docked_x, docked_y, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                for (const int percent : {100, 150, 0}) {
+                    osd.SetScalePercent(percent);
+                    RECT after{};
+                    GetWindowRect(osd, &after);
+                    Check(after.right == info.rcMonitor.right && after.top == docked_y,
+                          "a size change keeps the top-right corner on the right edge");
+                }
+                SetWindowPos(osd, nullptr, start.left, start.top, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
             ClickToggle(osd);
 
             // --- arranging the compact dashboard ---------------------------

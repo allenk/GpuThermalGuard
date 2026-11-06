@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-11-06
+
+GpuThermalGuard 1.2: it updates itself from GitHub, shows the other GTGs on your network, and names the program behind a high load.
+
+### Added
+
+- **Updates from GitHub.** GTG checks this repository's releases two minutes after it starts and then once a day, and offers a newer release in the tray menu; it never installs one on its own. With your consent it downloads the release's `GpuThermalGuard.exe` and `gtg_overlay.dll`, checks each against the SHA-256 in the release's `gtg-update.json`, and waits for a moment that costs no protection -- protection armed, the GPU at least 15 °C below the trigger, no game carrying the overlay. It then hands over to a PowerShell script compiled into the EXE, which replaces the files, starts the new version and puts the previous one back if the new one does not come up. A check is one HTTPS request with a `GpuThermalGuard/<version>` user agent; nothing about the machine is sent. **Update Settings...** in the tray menu turns automatic checks off, points GTG at a UNC share instead (`tools/update/publish-update.ps1` publishes to one), and pins a signing certificate. An install without `gtg_overlay.dll` stays without it. Updates are refused while the GTG Service is installed, while Smart App Control is on, and when GTG runs from a network folder.
+- **A violet dot on the tray icon** while a newer release is available or on its way, with a tooltip line naming the version.
+- **Hosts: paired GTGs on the local network.** Off by default, in **Hosts...** in the main window and the tray menu. Two machines pair with a one-time code, also shown as a QR code, valid for ten minutes; the pair key comes from ECDH P-256 and is kept under DPAPI. Each paired host appears in a ninth record, **Hosts**: a compact cell with up to four hosts (temperature, VRAM, GPU and CPU bars), an expanded lane, and an `H` bar in Tiny. Once a second each machine sends its paired hosts what its dashboard shows, in UDP datagrams sealed with AES-256-GCM; nothing received can change a setting, a power limit or protection, and nothing passes through a server. Only the machine that created a code listens, on port 29480 by default. Up to 16 hosts; IPv4.
+- **Updating paired hosts** from the Hosts dialog: **Update**, **Force update** and **Update all**, which asks one host at a time and stops at the first that does not come back updated. A host installs from its own source, after its own checks, and takes requests only while **Let other hosts ask this machine to update** is checked there (the default). An ordinary request is acted on at most once in 30 minutes; a forced one whenever it is asked.
+- **Hosts log.** **Write Hosts Log** in the tray menu (off by default) writes `GpuThermalGuard-hosts.log` beside the diagnostic log, one JSON line every five seconds, for another program on the same machine to read. It holds no address, port, key or pairing code, and is kept to 1 MiB plus one older file.
+- **Top-app names.** When GPU, VRAM, CPU or RAM stays high for eight seconds (70, 70, 80 and 85 %), the program responsible is named over that record's curve, in the compact cell and the expanded lane, until ten seconds after the load falls back. The name is the program's own description or file name, shortened to at most 20 letters; processes of one program are added together, `svchost` is named after its services, WSL and virtual machines are named as such, and a process GTG cannot identify is never named. **Top app** in the main window, on by default. It reads the process list once a second on a low-priority thread that stays off the protection path.
+- **Tiny.** The compact OSD folds into one small cell of bars, one per record, with initials and no numbers; a bar brightens when its record needs a look. The fold control is the mark at the middle of the OSD's bottom edge, shown on hover. The overlay shows the same form.
+- **Cards.** **Cards**, beside the OSD size, draws the expanded OSD as two columns of cards, each with its full reading, the highest value in the window, the frame source on FPS and its own curve with thresholds. Lanes and cards share one window, so switching never moves the OSD.
+
+### Changed
+
+- **The expanded OSD no longer changes into fixed cards on its own** when the screen is short. Its rows get shorter instead, so RAM, NET and the curves stay.
+- **Changing the OSD size keeps its top-right corner in place**, so an OSD docked on the right edge stays docked.
+- **The Overlay checkbox stays on when another program holds the hotkey.** It used to untick itself; the overlay now works from the O and GTG keeps asking for the hotkey, and the **Overlay Hotkey** button shows a red frame with a tooltip saying what to do.
+- The compact arrangement is stored in a new value, to make room for Hosts. The old one is read once and converted, and is not written again, so going back to 1.1 shows the arrangement you had before updating.
+- The QR Code generator library (Project Nayuki, MIT) is included to draw the pairing code.
+
+### Fixed
+
+- The play time on the expanded FPS lane was drawn smaller than on the compact card; it now scales with the display.
+- The overlay hotkey dialog ignored keys sent by remote-control and key-remapping tools, so no combination could be recorded through them.
+- After the OSD changed shape, the overlay kept showing the old shape for up to half a second.
+- Lane labels were cut short when rows got shorter; the font now steps down to fit.
+
+### Notes
+
+- **1.2.5 is not Authenticode-signed.** Verify downloads with `SHA256SUMS.txt` and the build-provenance attestation. Without a signer pin, the updater trusts a release as far as GitHub's HTTPS and the hashes in its `gtg-update.json` -- the same trust as downloading the ZIP by hand.
+- 1.1.0 has no updater: move from it to 1.2.5 by hand, once. Versions 1.2.0 to 1.2.4 were not released here.
+- Unchanged from 1.1: the overlay hides nothing from anti-cheat, so do not use it in protected or competitive online games; Vulkan, OpenGL, Direct3D 9, 32-bit games and HDR are not supported.
+
 ## [1.1.0] - 2026-10-14
 
 GpuThermalGuard 1.1: the overlay reaches games that bring their own Direct3D 12 runtime, and attaches in one step.
@@ -196,7 +232,8 @@ GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows 
 - A power-limit write is never reported as successful until the value is read back.
 - Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
-[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v1.2.5...HEAD
+[1.2.5]: https://github.com/allenk/GpuThermalGuard/compare/v1.1.0...v1.2.5
 [1.1.0]: https://github.com/allenk/GpuThermalGuard/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.13.0...v1.0.0
 [0.13.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.12.0...v0.13.0

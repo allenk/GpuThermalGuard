@@ -118,6 +118,15 @@ foreach ($package in $packages) {
 (($sums -join "`n") + "`n") |
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Encoding utf8NoBOM -NoNewline
 
+# What GTG's updater reads from a release: the same two binaries as the
+# packages, side by side with the gtg-update.json that lists their SHA-256.
+# Written by the tool the updater's own tests read back, so the manifest is
+# always one the updater accepts. A pre-release is not the latest release, so
+# the updater never sees its manifest; it is written anyway, for a check by hand.
+$update = & (Join-Path $PSScriptRoot 'update/publish-update.ps1') -ReleaseAssets (Join-Path $OutputDirectory 'update') `
+    -Build $BuildDirectory -Version $baseVersion -Unsigned
+Write-Host "Updater files for $($update.Version): release $($update.Release), $($update.Variants)."
+
 $notes = [System.Collections.Generic.List[string]]::new()
 $notes.Add("# GpuThermalGuard $Tag")
 $notes.Add('')
@@ -126,6 +135,8 @@ $notes.AddRange([string[]]@(
     '| --- | --- |',
     "| ``GpuThermalGuard-$version-windows-x64.zip`` **(recommended)** | ``GpuThermalGuard.exe``, ``gtg_overlay.dll`` (in-game overlay) |",
     "| ``GpuThermalGuard-$version-no-overlay-windows-x64.zip`` | ``GpuThermalGuard.exe`` -- the same EXE, without the overlay |",
+    '',
+    '`gtg-update.json`, `GpuThermalGuard.exe` and `gtg_overlay.dll` are the files GTG''s updater reads. To install by hand, download a ZIP.',
     ''
 ))
 if ($Unsigned) {

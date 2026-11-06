@@ -136,6 +136,44 @@ add_executable(GpuThermalGuard WIN32
     src/sysmem/reclaim.hpp
     src/sysmem/reclaim_win32.hpp
     src/sysmem/reclaim_nt.hpp
+    # pdh, version and dxgi are resolved at run time, so nothing is added to
+    # the link line; K32EnumProcesses, the process list and the process queries
+    # are kernel32.
+    src/topapp/alert_rule.hpp
+    src/topapp/app_name.hpp
+    src/topapp/board.hpp
+    src/topapp/cpu_ledger.hpp
+    src/topapp/leader.hpp
+    src/topapp/marquee.hpp
+    src/topapp/pdh_instance.hpp
+    src/topapp/sampler.cpp
+    src/topapp/sampler.hpp
+    src/topapp/system_process.hpp
+    # Hosts: ws2_32, bcrypt and crypt32 are resolved at run time, and only
+    # while Hosts is on, so nothing is added to the link line.
+    src/peer/admission.hpp
+    src/peer/crypto.cpp
+    src/peer/crypto.hpp
+    src/peer/hosts_view.hpp
+    src/peer/keys.hpp
+    src/peer/link.cpp
+    src/peer/link.hpp
+    src/peer/pairing.cpp
+    src/peer/pairing.hpp
+    src/peer/pairing_code.hpp
+    src/peer/protocol.hpp
+    src/peer/replay.hpp
+    src/peer/store.cpp
+    src/peer/store.hpp
+    src/tray/hosts_bridge.hpp
+    src/tray/hosts_controller.cpp
+    src/tray/hosts_controller.hpp
+    src/tray/hosts_dialog.cpp
+    src/tray/hosts_dialog.hpp
+    # The Hosts log: its own file and thread, kernel32 only.
+    src/hostlog/frame.hpp
+    src/hostlog/writer.cpp
+    src/hostlog/writer.hpp
     src/resources/GpuThermalGuard.rc
     "${GTG_GENERATED_DIR}/GpuThermalGuard.manifest"
 )
@@ -182,11 +220,32 @@ if(BUILD_TESTING)
         src/supervision/supervisor.cpp
         tests/wtl_compile_probe.cpp
         src/logging/logger.cpp
+        src/hostlog/writer.cpp
+        src/peer/crypto.cpp
+        src/peer/link.cpp
+        src/peer/pairing.cpp
     )
+    # ws2_32 for the loopback test's own socket; the link itself resolves
+    # Winsock at run time.
     target_link_libraries(gtg_tests PRIVATE gtg_core gtg_telemetry gtg_snapshot
-        gtg_build_options nvml_headers wtl user32 gdi32 advapi32)
+        gtg_build_options nvml_headers wtl user32 gdi32 advapi32 ws2_32)
     add_test(NAME gtg_tests COMMAND gtg_tests)
     set_tests_properties(gtg_tests PROPERTIES TIMEOUT 45)
+
+    # Paired hosts on one machine, on GTG's own peer module, for testing Hosts
+    # without other PCs. A test tool: never part of a release.
+    add_executable(gtg_fake_hosts
+        tests/fake_hosts.cpp
+        src/logging/logger.cpp
+        src/peer/crypto.cpp
+        src/peer/link.cpp
+        src/peer/pairing.cpp
+    )
+    target_include_directories(gtg_fake_hosts PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(gtg_fake_hosts PRIVATE gtg_build_options ws2_32 user32 advapi32
+        shell32 ole32)
+    add_test(NAME gtg_fake_hosts_selftest COMMAND gtg_fake_hosts selftest)
+    set_tests_properties(gtg_fake_hosts_selftest PROPERTIES TIMEOUT 60)
 
     if(GTG_BUILD_INTERACTIVE_SMOKE)
         add_executable(gtg_osd_fps_smoke
@@ -240,6 +299,9 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+# The updater's build; OPTIONAL, so a tree without src/update still configures.
+include("${CMAKE_CURRENT_LIST_DIR}/src/update/update.cmake" OPTIONAL)
+
 if(MSVC)
     target_link_options(GpuThermalGuardProbe PRIVATE
         $<$<CONFIG:Release>:/INCREMENTAL:NO /OPT:REF /OPT:ICF>
@@ -277,6 +339,15 @@ target_compile_definitions(gtg_darkmodelib PRIVATE
 target_compile_options(gtg_darkmodelib PRIVATE /W3 /utf-8 /permissive-)
 target_link_libraries(gtg_darkmodelib PUBLIC comctl32 uxtheme dwmapi gdi32 user32 shlwapi)
 target_link_libraries(GpuThermalGuard PRIVATE gtg_darkmodelib)
+
+# ─── QR Code generator (Project Nayuki, MIT): the Hosts pairing code ────────
+# Static, /MT, into GpuThermalGuard.exe. Vendored unmodified; standard library
+# only. Its own warning level, as darkmodelib's: it is not GTG's code.
+add_library(gtg_qrcodegen STATIC third_party/qrcodegen/qrcodegen.cpp)
+target_include_directories(gtg_qrcodegen SYSTEM PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/qrcodegen")
+target_compile_options(gtg_qrcodegen PRIVATE /W3 /utf-8 /permissive- /EHsc)
+target_link_libraries(GpuThermalGuard PRIVATE gtg_qrcodegen)
 
 # ─── Research: the UI theme lab ────────────────────────────────────────────
 # Off by default. The lab shows the production IDD_MAIN dialog and

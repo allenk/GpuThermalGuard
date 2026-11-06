@@ -20,8 +20,14 @@
 #include "snapshot/ui_snapshot.hpp"
 #include "tray/ui_theme.hpp"
 #include "tray/hotkey_capture.hpp"
+#include "tray/hosts_bridge.hpp"
+#include "tray/hosts_dialog.hpp"
 #ifdef GTG_FEATURE_OVERLAY
 #include "../../overlay/integration/runtime.hpp"
+#endif
+#ifdef GTG_FEATURE_UPDATE
+#include "update/hosts_trigger.hpp"
+#include "update/tray_badge.hpp"
 #endif
 
 #include <commctrl.h>
@@ -141,9 +147,10 @@ bool SaveOsdWindowPosition(const OsdOverlay& overlay,
     const auto text = [](const std::optional<POINT>& point) {
         return point ? std::format(L"({}, {})", point->x, point->y) : std::wstring(L"none");
     };
-    logging::Info(std::format(
-        L"OSD placement saved; expanded={} compact={} collapsed={} reason={}",
-        text(positions.expanded), text(positions.collapsed), overlay.Collapsed(), reason));
+    logging::Info(
+        std::format(L"OSD placement saved; expanded={} compact={} collapsed={} tiny={} reason={}",
+                    text(positions.expanded), text(positions.collapsed), overlay.Collapsed(),
+                    overlay.Tiny(), reason));
     return true;
 }
 
@@ -156,6 +163,8 @@ bool RestoreOsdWindowPosition(HWND notification_window,
     // the shape afterwards would show the reader an expanded window that
     // immediately collapses.
     overlay.RestoreCollapsed(preference.collapsed);
+    overlay.RestoreTiny(preference.tiny);
+    overlay.RestoreCardView(preference.card);
     overlay.SetScalePercent(preference.scale_percent);
     const auto positions = placement::FromStored(
         preference.has_position ? std::optional<POINT>{POINT{preference.x, preference.y}}
@@ -297,7 +306,8 @@ std::wstring HotkeyText(const settings::OverlayHotkey& hotkey) {
 bool HotkeyTaken(const settings::OverlayHotkey& hotkey) noexcept {
 #ifdef GTG_FEATURE_OVERLAY
     const auto current = overlay::integration::GetStatus();
-    if (current.enabled && current.modifiers == hotkey.modifiers && current.key == hotkey.key)
+    if (current.enabled && current.hotkey_held && current.modifiers == hotkey.modifiers &&
+        current.key == hotkey.key)
         return false;
 #endif
     constexpr int kProbeId = 0x0FFF;
@@ -306,6 +316,39 @@ bool HotkeyTaken(const settings::OverlayHotkey& hotkey) noexcept {
         return false;
     }
     return GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED;
+}
+
+// On, but without its hotkey: another program holds the combination. The O
+// button on the OSD presses it instead, so this warns rather than refuses.
+bool HotkeyHeldElsewhere() noexcept {
+#ifdef GTG_FEATURE_OVERLAY
+    const auto status = overlay::integration::GetStatus();
+    return status.enabled && !status.hotkey_held;
+#else
+    return false;
+#endif
+}
+
+std::wstring HotkeyHeldElsewhereText(const settings::OverlayHotkey& hotkey) {
+    return localization::Format(
+        L"Overlay 已開啟，但 {} 被其他程式佔用：請用 OSD 上的 O 按鈕，或更換熱鍵。",
+        L"Overlay is on, but another program holds {}: use the O button on the OSD, or "
+        L"choose another hotkey.",
+        HotkeyText(hotkey));
+}
+
+// The conflict, drawn as a frame over whatever the theme drew on the hotkey
+// button, in the red the hotkey dialog uses for a combination it refuses.
+void DrawHotkeyWarning(HWND button, HDC dc, const RECT& bounds) {
+    const int dpi = static_cast<int>(GetDpiForWindow(button));
+    const int radius = MulDiv(8, dpi, 96);
+    HPEN pen = CreatePen(PS_INSIDEFRAME, MulDiv(2, dpi, 96), RGB(196, 43, 28));
+    const HGDIOBJ previous_pen = SelectObject(dc, pen);
+    const HGDIOBJ previous_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom, radius, radius);
+    SelectObject(dc, previous_brush);
+    SelectObject(dc, previous_pen);
+    DeleteObject(pen);
 }
 
 // Choosing the in-game overlay's hotkey, after PowerToys' shortcut dialog.
@@ -386,8 +429,11 @@ private:
         if (code == HC_ACTION && dialog != nullptr && dialog->m_hWnd != nullptr &&
             GetForegroundWindow() == dialog->m_hWnd) {
             const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
-            const bool injected = (key->flags & LLKHF_INJECTED) != 0;
-            if (!injected && !hotkey::PassesThrough(key->vkCode, dialog->capture_.Held())) {
+            // Injected keys are recorded too. Remote control (Parsec,
+            // RustDesk, VNC and the like) and key-remapping software deliver
+            // every key that way, and refusing them left a reader at such a
+            // keyboard unable to choose any combination at all.
+            if (!hotkey::PassesThrough(key->vkCode, dialog->capture_.Held())) {
                 const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
                 if (down) dialog->capture_.KeyDown(key->vkCode);
                 else dialog->capture_.KeyUp(key->vkCode);
@@ -617,7 +663,7 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     if (tooltip_ != nullptr) {
         SendMessageW(tooltip_, TTM_SETMAXTIPWIDTH, 0, 360);
         for (const int id : {IDC_OVERLAY_ENABLED, IDC_OVERLAY_HOTKEY, IDC_OVERLAY_AUTO_SDR,
-                             IDC_OVERLAY_HIDES_OSD}) {
+                             IDC_OVERLAY_HIDES_OSD, IDC_SHOW_TOP_APP, IDC_OSD_CARD}) {
             TTTOOLINFOW tool{sizeof(tool)};
             tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
             tool.hwnd = m_hWnd;
@@ -633,8 +679,10 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     // row eight cells wide, and narrowing to the column afterwards kept the
     // clamped X: the compact window reopened with Y right and X wrong.
     // Before Initialize these setters only record state.
+    // The REG_QWORD, or else the old REG_DWORD translated with Hosts last, or
+    // else the default. Only the REG_QWORD is ever written back.
     saved_compact_layout_ = compact::PackLayout(
-        compact::SanitizeLayout(settings::LoadCompactLayout()));
+        compact::RestoreLayout(settings::LoadCompactArrangement(), settings::LoadCompactLayout()));
     osd_overlay_.SetFpsEnabled(settings::LoadFpsEnabled());
     osd_overlay_.SetNetEnabled(settings::LoadNetEnabled());
     osd_overlay_.SetRamEnabled(settings::LoadRamEnabled());
@@ -643,6 +691,7 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     osd_ready_ = RestoreOsdWindowPosition(
         m_hWnd, &telemetry_history_, osd_overlay_, osd_preference);
     RefreshOsdScaleChoices();
+    CheckDlgButton(IDC_OSD_CARD, osd_overlay_.CardView() ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(IDC_OSD_ENABLED,
                    osd_ready_ && osd_preference.enabled ? BST_CHECKED : BST_UNCHECKED);
     show_fps_ = settings::LoadFpsEnabled();
@@ -667,6 +716,14 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     history_chart_.SetRamHistory(show_ram_ ? &ram_history_ : nullptr);
     if (osd_ready_) osd_overlay_.SetRamHistory(show_ram_ ? &ram_history_ : nullptr);
     if (osd_ready_) osd_overlay_.SetRamEnabled(show_ram_);
+    show_top_app_ = settings::LoadTopAppEnabled();
+    CheckDlgButton(IDC_SHOW_TOP_APP, show_top_app_ ? BST_CHECKED : BST_UNCHECKED);
+    // Started asleep: it does nothing until a record has been high for 8 s.
+    if (show_top_app_ && !top_app_sampler_.Start()) {
+        logging::Warning(L"top app sampling unavailable: its thread could not be started");
+    }
+    // Off unless the reader turned it on; nothing is loaded or bound until then.
+    hosts_.Initialize();
     // The stored arrangement is validated before use: a value that is not a
     // permutation of every record is discarded whole for the default, so no
     // registry content can hide a record. Loaded above, before the OSD was
@@ -723,6 +780,12 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
         SetStatus(localization::Select(L"Overlay 熱鍵無法註冊；請更換組合鍵。",
                                        L"Overlay hotkey unavailable; choose another shortcut."),
                   StatusVisual::Warning);
+    } else if (HotkeyHeldElsewhere()) {
+        // Not on the status line: that line is the protection's, and the
+        // next snapshot rewrites it. The hotkey button carries it instead.
+        logging::Warning(
+            std::format(L"overlay on without its hotkey; {} is held by another program",
+                        HotkeyText(overlay_hotkey_)));
     }
 #else
     HideOverlayControls(m_hWnd);
@@ -730,6 +793,9 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     if (!loaded_settings.warning.empty()) {
         SetStatus(loaded_settings.warning, StatusVisual::Warning);
     }
+#ifdef GTG_FEATURE_UPDATE
+    StartUpdates();
+#endif
     SetTimer(kRefreshTimer, kRefreshIntervalMs);
     PostMessageW(kInitializeTrayMessage);
 #ifdef GTG_FEATURE_OVERLAY
@@ -819,7 +885,21 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
                 osd_overlay_.SetHostMemoryLow(low_memory_signal_.Low());
             }
         }
+        // After every record's reading for this tick is in.
+        UpdateTopApps(now);
+        hosts_.Tick(now, [&] { return LocalHostState(now); });
+        UpdateHostsRecord(now);
         PersistCompactArrangement();
+#ifdef GTG_FEATURE_UPDATE
+        TickHostsUpdates(now);
+        updates_.Tick(now, UpdateSafeInputs(now));
+        // The protection state may not change for hours; the badge follows
+        // the updater.
+        if (tray_added_ && current_tray_icon_id_ != 0 && updates_.BadgeLine() != tray_badge_line_) {
+            const std::wstring tooltip = tray_base_tooltip_;
+            SetTrayVisual(current_tray_icon_id_, tooltip.c_str());
+        }
+#endif
     }
     return 0;
 }
@@ -842,6 +922,16 @@ LRESULT MainDialog::OnClose(UINT, WPARAM, LPARAM, BOOL&) {
 
 LRESULT MainDialog::OnDestroy(UINT, WPARAM, LPARAM, BOOL&) {
     KillTimer(kRefreshTimer);
+#ifdef GTG_FEATURE_UPDATE
+    // At most 2 s, even with a read of a stalled share in flight.
+    updates_.Shutdown();
+#endif
+    // A goodbye to every paired host, so they show this machine offline.
+    hosts_.Shutdown();
+    // At most 2 s, even on a stalled drive.
+    hosts_.StopLog();
+    // Bounded by one sweep.
+    top_app_sampler_.Stop();
     // A joinable std::thread member would call std::terminate at destruction.
     // The call it runs is finite, so this join is too.
     if (deep_clean_worker_.joinable()) deep_clean_worker_.join();
@@ -856,6 +946,12 @@ LRESULT MainDialog::OnDestroy(UINT, WPARAM, LPARAM, BOOL&) {
         std::wstring collapsed_error;
         if (!settings::SaveOsdCollapsed(osd_overlay_.Collapsed(), collapsed_error)) {
             logging::Warning(collapsed_error);
+        }
+        // Tiny is a form of the compact shape and is kept beside it, so the
+        // window opens folded if it was folded.
+        std::wstring tiny_error;
+        if (!settings::SaveCompactTiny(osd_overlay_.Tiny(), tiny_error)) {
+            logging::Warning(tiny_error);
         }
     }
     local_protection_.Stop();
@@ -991,6 +1087,19 @@ LRESULT CALLBACK MainDialog::ReadingColorSubclass(HWND window, const UINT messag
         const LRESULT brush = dialog->OnCtlColorStatic(message, wparam, lparam, handled);
         if (handled) return brush;
     } else if (message == WM_NOTIFY &&
+               reinterpret_cast<const NMHDR*>(lparam)->code == NM_CUSTOMDRAW &&
+               reinterpret_cast<const NMHDR*>(lparam)->idFrom == IDC_OVERLAY_HOTKEY &&
+               HotkeyHeldElsewhere()) {
+        // The theme draws the button first; the frame goes over it, after
+        // the paint if the button paints itself, at once if it was skipped.
+        auto* draw = reinterpret_cast<NMCUSTOMDRAW*>(lparam);
+        const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+        if (draw->dwDrawStage == CDDS_PREPAINT && (result & CDRF_SKIPDEFAULT) == 0)
+            return result | CDRF_NOTIFYPOSTPAINT;
+        if (draw->dwDrawStage == CDDS_PREPAINT || draw->dwDrawStage == CDDS_POSTPAINT)
+            DrawHotkeyWarning(draw->hdr.hwndFrom, draw->hdc, draw->rc);
+        return result;
+    } else if (message == WM_NOTIFY &&
                reinterpret_cast<const NMHDR*>(lparam)->code == TTN_GETDISPINFOW) {
         // The overlay controls' tooltip, built when shown so it names the
         // current hotkey in the current language.
@@ -999,6 +1108,22 @@ LRESULT CALLBACK MainDialog::ReadingColorSubclass(HWND window, const UINT messag
             dialog->tooltip_text_ = localization::Select(
                 L"遊戲內 overlay 顯示時，以它取代桌面 OSD；離開遊戲（ALT+TAB、關閉 overlay 或結束遊戲）後 OSD 會回來。",
                 L"The in-game overlay replaces the desktop OSD while its game is in front. The OSD returns when you leave the game (ALT+TAB, overlay off, or the game exits).");
+            info->lpszText = dialog->tooltip_text_.data();
+            return 0;
+        }
+        if (info->hdr.idFrom ==
+            reinterpret_cast<UINT_PTR>(dialog->GetDlgItem(IDC_SHOW_TOP_APP).m_hWnd)) {
+            dialog->tooltip_text_ = localization::Select(
+                L"GPU、VRAM、CPU 或 RAM 持續高負載時，在該項目的曲線上顯示是哪個程式。沒有高負載時完全不執行。",
+                L"When GPU, VRAM, CPU or RAM load stays high, name the app behind it over that record's curve. Nothing runs while the load is ordinary.");
+            info->lpszText = dialog->tooltip_text_.data();
+            return 0;
+        }
+        if (info->hdr.idFrom ==
+            reinterpret_cast<UINT_PTR>(dialog->GetDlgItem(IDC_OSD_CARD).m_hWnd)) {
+            dialog->tooltip_text_ = localization::Select(
+                L"展開的 OSD 以卡片顯示：每個項目一張卡，兩欄排列，數值、最高值、門檻與曲線都和一般展開畫面相同。",
+                L"Show the expanded OSD as cards, two across: each record's reading, maximum, thresholds and curve, as in the usual expanded view.");
             info->lpszText = dialog->tooltip_text_.data();
             return 0;
         }
@@ -1018,6 +1143,9 @@ LRESULT CALLBACK MainDialog::ReadingColorSubclass(HWND window, const UINT messag
             L"The in-game overlay is not in this build yet; the setting is saved. Hotkey: {}",
 #endif
             HotkeyText(dialog->overlay_hotkey_));
+        if (HotkeyHeldElsewhere()) {
+            dialog->tooltip_text_ += L"\n" + HotkeyHeldElsewhereText(dialog->overlay_hotkey_);
+        }
         info->lpszText = dialog->tooltip_text_.data();
         return 0;
     } else if (message == WM_NCDESTROY) {
@@ -1365,7 +1493,7 @@ void MainDialog::PersistCompactArrangement() {
     if (packed != saved_compact_layout_) {
         saved_compact_layout_ = packed;
         std::wstring error;
-        if (!settings::SaveCompactLayout(packed, error)) logging::Warning(error);
+        if (!settings::SaveCompactArrangement(packed, error)) logging::Warning(error);
     }
     const bool locked = osd_overlay_.compact_locked();
     if (locked != saved_compact_locked_) {
@@ -1550,6 +1678,114 @@ LRESULT MainDialog::OnNetToggle(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 
+LRESULT MainDialog::OnTopAppToggle(WORD, WORD, HWND, BOOL&) {
+    const bool enabled = IsDlgButtonChecked(IDC_SHOW_TOP_APP) == BST_CHECKED;
+    std::wstring error;
+    if (!settings::SaveTopAppEnabled(enabled, error)) {
+        CheckDlgButton(IDC_SHOW_TOP_APP, show_top_app_ ? BST_CHECKED : BST_UNCHECKED);
+        logging::Warning(error);
+        return 0;
+    }
+    show_top_app_ = enabled;
+    if (enabled) {
+        if (!top_app_sampler_.Start()) {
+            logging::Warning(L"top app sampling unavailable: its thread could not be started");
+        }
+    } else {
+        // Off means no thread at all, not a thread told to sleep. The names
+        // go; the rules carry on, since Tiny draws them.
+        top_app_sampler_.Stop();
+        top_app_board_ = {};
+        if (osd_ready_) osd_overlay_.SetTopApps(top_app_board_);
+    }
+    return 0;
+}
+
+void MainDialog::ClearTopApps() {
+    for (topapp::AlertRule& rule : top_app_rules_)
+        rule.Reset();
+    top_app_sampler_.SetMask(0);
+    top_app_board_ = {};
+    top_app_alerts_ = 0;
+    if (osd_ready_) {
+        osd_overlay_.SetTopApps(top_app_board_);
+        osd_overlay_.SetTopAppAlerts(0);
+    }
+}
+
+void MainDialog::UpdateTopApps(const std::uint64_t now_ms) {
+    timing::SlowUiScope phase(L"main.topapp.refresh");
+    // Somewhere to show a name: the desktop OSD, or an in-game overlay that is
+    // drawing, which shows the same dashboard while the desktop copy steps
+    // aside for it.
+    bool shown = osd_ready_ && osd_overlay_.Visible();
+#ifdef GTG_FEATURE_OVERLAY
+    shown = shown || overlay::integration::GetStatus().visible > 0;
+#endif
+    // The rules run whenever a dashboard is shown, whether or not names are
+    // wanted: Tiny raises its bars by them. The preference decides only
+    // whether names are looked for, so off still means no thread. They run
+    // for paired hosts too, which draw this machine's bars as it would: a
+    // machine nobody is looking at is the one a host watches.
+    if (!shown && !hosts_.Running()) {
+        if (top_app_board_ != topapp::Board{} || top_app_rules_[0].Active() ||
+            top_app_rules_[1].Active() || top_app_rules_[2].Active() ||
+            top_app_rules_[3].Active()) {
+            ClearTopApps();
+        } else {
+            top_app_sampler_.SetMask(0);
+        }
+        return;
+    }
+
+    // The readings the cells show on this tick. One older than a second is
+    // not this tick's, and counts as missing.
+    const telemetry::Sample* latest = telemetry_history_.Latest();
+    const auto reading = [&](std::optional<double> telemetry::Sample::* member) {
+        return latest != nullptr && latest->monotonic_ms + 1'000 >= now_ms ? latest->*member
+                                                                           : std::nullopt;
+    };
+    std::optional<double> ram;
+    if (show_ram_ && !ram_history_.Samples().empty() &&
+        ram_history_.Samples().back().monotonic_ms == now_ms &&
+        ram_history_.Samples().back().physical_percent) {
+        ram = *ram_history_.Samples().back().physical_percent;
+    }
+    const std::array<std::optional<double>, topapp::kRecordCount> readings{
+        reading(&telemetry::Sample::gpu_utilization_percent),
+        reading(&telemetry::Sample::vram_utilization_percent),
+        reading(&telemetry::Sample::cpu_utilization_percent), ram};
+
+    std::uint32_t mask = 0;
+    for (std::size_t r = 0; r < topapp::kRecordCount; ++r) {
+        if (top_app_rules_[r].Observe(now_ms, readings[r])) mask |= 1U << r;
+    }
+    top_app_alerts_ = mask;
+    if (osd_ready_) osd_overlay_.SetTopAppAlerts(mask);
+    // Names only where they can be shown; the hosts are sent none.
+    if (!shown || !show_top_app_ || !top_app_sampler_.Running()) {
+        top_app_sampler_.SetMask(0);
+        if (top_app_board_ != topapp::Board{}) {
+            top_app_board_ = {};
+            if (osd_ready_) osd_overlay_.SetTopApps(top_app_board_);
+        }
+        return;
+    }
+    top_app_sampler_.SetMask(mask);
+
+    // Try-only: when the sampler is publishing at this instant the board keeps
+    // what it had, minus any record that has just left its alert.
+    const auto result = top_app_sampler_.TryRead();
+    for (std::size_t r = 0; r < topapp::kRecordCount; ++r) {
+        if ((mask & (1U << r)) == 0) {
+            top_app_board_[r].reset();
+        } else if (result) {
+            topapp::Carry(top_app_board_[r], result->names[r], now_ms);
+        }
+    }
+    if (osd_ready_) osd_overlay_.SetTopApps(top_app_board_);
+}
+
 LRESULT MainDialog::OnFpsToggle(WORD, WORD, HWND, BOOL&) {
     const bool enabled = IsDlgButtonChecked(IDC_SHOW_FPS) == BST_CHECKED;
     std::wstring error;
@@ -1615,6 +1851,16 @@ LRESULT MainDialog::OnOsdScaleChanged(WORD, WORD, HWND, BOOL&) {
     if (!settings::SaveOsdScale(chosen, error)) {
         logging::Warning(error);
     }
+    return 0;
+}
+
+LRESULT MainDialog::OnOsdCardToggle(WORD, WORD, HWND, BOOL&) {
+    const bool cards = IsDlgButtonChecked(IDC_OSD_CARD) == BST_CHECKED;
+    // Applied at once, like the size beside it: the reader judges it by
+    // looking at the dashboard.
+    osd_overlay_.SetCardView(cards);
+    std::wstring error;
+    if (!settings::SaveOsdCard(cards, error)) logging::Warning(error);
     return 0;
 }
 
@@ -1724,6 +1970,83 @@ LRESULT MainDialog::OnTrayExit(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 
+#ifdef GTG_FEATURE_UPDATE
+void MainDialog::StartUpdates() {
+    update::TrayHost host;
+    host.window = m_hWnd;
+    host.supervisor_pid = supervision::SupervisorPid();
+    constexpr int kVersion[] = {GTG_VERSION_COMMA};
+    host.version = {kVersion[0], kVersion[1], kVersion[2]};
+    // What is installed, not what was compiled: the no-overlay package is the
+    // same executable without gtg_overlay.dll, and its updates leave it out.
+    host.variant = OverlayDllPresent() ? "overlay" : "no-overlay";
+    host.balloon = [this](const std::wstring& title, const std::wstring& text, const DWORD icon) {
+        ShowProtectionAlert(title.c_str(), text.c_str(), icon);
+    };
+    // Posted, so the exit runs from the message loop rather than from inside
+    // the tick that learned the script has the update.
+    host.exit = [this] { PostMessageW(WM_COMMAND, IDM_TRAY_EXIT); };
+    updates_.Start(std::move(host));
+}
+
+LRESULT MainDialog::OnUpdateCommand(WORD, const WORD id, HWND, BOOL&) {
+    (void)updates_.OnCommand(id);
+    return 0;
+}
+
+void MainDialog::TickHostsUpdates(const std::uint64_t now_ms) {
+    std::vector<update::HostView> views;
+    const auto& table = hosts_.Table();
+    if (hosts_.Running() && table) {
+        views.reserve(table->hosts.size());
+        for (const peer::HostRow& row : table->hosts) {
+            update::HostView view;
+            view.id = row.peer;
+            view.name = row.name;
+            const peer::Presence presence = peer::PresenceAt(row.heard, now_ms);
+            view.online = presence == peer::Presence::Online || presence == peer::Presence::Dim;
+            if (row.state) view.version = row.state->version;
+            if (row.update_status) view.status = update::hosts::ReadStatus(*row.update_status);
+            views.push_back(std::move(view));
+            // A request stays in the table after it stops arriving; only a
+            // fresh one is acted on, and each only once.
+            if (row.update_trigger && now_ms - row.update_trigger_ms <= update::kTriggerFreshMs) {
+                if (const auto trigger = update::hosts::ReadTrigger(*row.update_trigger)) {
+                    updates_.OnHostsRequest({row.peer, row.name, *trigger});
+                }
+            }
+        }
+    }
+    host_updates_.Tick(now_ms, std::move(views), updates_.SourceRelease());
+    for (const std::wstring& line : host_updates_.TakeJournal())
+        logging::Info(line);
+    peer::Link* link = hosts_.Link();
+    const auto outbox = host_updates_.TakeOutbox();
+    if (link == nullptr) return;
+    for (const auto& [host, body] : outbox)
+        link->Trigger(host, body);
+    if (now_ms - last_update_status_ms_ >= HostsController::kPublishIntervalMs) {
+        link->PublishUpdate(update::hosts::WriteStatus(updates_.HostsStatus()));
+        last_update_status_ms_ = now_ms;
+    }
+}
+
+update::SafeInputs MainDialog::UpdateSafeInputs(const std::uint64_t now_ms) const {
+    update::SafeInputs in;
+    in.protection_idle = protection_idle_;
+    const telemetry::Sample* latest = telemetry_history_.Latest();
+    if (latest != nullptr && latest->monotonic_ms + 3'000 >= now_ms) {
+        in.temperature_c = latest->temperature_c;
+    }
+    in.trigger_c = config_.trigger_temperature_c;
+#ifdef GTG_FEATURE_OVERLAY
+    const auto overlay = overlay::integration::GetStatus();
+    in.overlay_sessions = overlay.installing + overlay.visible + overlay.hidden;
+#endif
+    return in;
+}
+#endif
+
 bool MainDialog::AddTrayIcon() {
     if (tray_added_) return true;
     last_tray_add_attempt_ms_ = static_cast<std::uint64_t>(GetTickCount64());
@@ -1755,6 +2078,11 @@ bool MainDialog::AddTrayIcon() {
              localization::Select(L"GPU Thermal Guard — 保護待命",
                                   L"GPU Thermal Guard — Armed").data());
     current_tray_tooltip_ = tray_data_.szTip;
+#ifdef GTG_FEATURE_UPDATE
+    // Added without the badge; the next tick puts it on.
+    tray_base_tooltip_ = tray_data_.szTip;
+    tray_badge_line_.clear();
+#endif
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &tray_data_) != FALSE;
     if (tray_added_) {
         tray_data_.uVersion = NOTIFYICON_VERSION_4;
@@ -1806,8 +2134,16 @@ void MainDialog::ShowTrayMenu() {
                 IDM_TRAY_DEEP_MEMORY_CLEAN,
                 localization::Select(L"深度釋放記憶體...",
                                      L"Deep Memory Clean...").data());
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_HOSTS,
+                localization::Select(L"主機...", L"Hosts...").data());
+    // For another program on this machine to read; off unless turned on here.
+    AppendMenuW(menu, MF_STRING | (hosts_.LogOn() ? MF_CHECKED : MF_UNCHECKED), IDM_TRAY_HOSTS_LOG,
+                localization::Select(L"輸出主機記錄檔", L"Write Hosts Log").data());
     AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG,
                 localization::Select(L"開啟診斷記錄檔", L"Open Diagnostic Log").data());
+#ifdef GTG_FEATURE_UPDATE
+    updates_.AddMenuItems(menu);
+#endif
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT,
                 localization::Select(L"結束", L"Exit").data());
@@ -2105,6 +2441,11 @@ void MainDialog::RenderSnapshot(const nvml::DeviceSnapshot& s) {
 void MainDialog::HandleLocalProtection() {
     timing::SlowUiScope phase(L"main.protection.presentation");
     const auto snapshot = local_protection_.Snapshot();
+#ifdef GTG_FEATURE_UPDATE
+    protection_idle_ = snapshot.running && snapshot.nvml_ready && !snapshot.safe_latched &&
+                       (snapshot.state == ProtectionState::Armed ||
+                        snapshot.state == ProtectionState::MonitorOnly);
+#endif
     if (trigger_count_ != snapshot.trigger_count) {
         trigger_count_ = snapshot.trigger_count;
         ApplyLocalization();
@@ -2422,17 +2763,43 @@ void MainDialog::ShowProtectionAlert(const wchar_t* title, const wchar_t* messag
 void MainDialog::SetTrayVisual(UINT icon_id, const wchar_t* tooltip) {
     timing::SlowUiScope phase(L"main.tray.visual");
     if (!tray_added_) return;
+#ifdef GTG_FEATURE_UPDATE
+    // While a newer release is offered or on its way, the state icon carries
+    // a badge and the tooltip names the version.
+    tray_base_tooltip_ = tooltip;
+    const std::wstring badge = updates_.BadgeLine();
+    std::wstring badged;
+    if (!badge.empty()) {
+        badged = std::format(L"{}\n{}", tooltip, badge);
+        tooltip = badged.c_str();
+    }
+    // The icon is composed again when the badge comes or goes.
+    if (badge.empty() != tray_badge_line_.empty()) current_tray_icon_id_ = 0;
+#endif
     if (icon_id == current_tray_icon_id_ && current_tray_tooltip_ == tooltip) return;
     tray_data_.uFlags = NIF_TIP | NIF_SHOWTIP | NIF_GUID;
     HICON old = nullptr;
     if (icon_id != current_tray_icon_id_) {
         HICON replacement = LoadSmallIcon(m_hWnd, icon_id);
         if (replacement == nullptr) return;
+#ifdef GTG_FEATURE_UPDATE
+        // Without the badge if the icon cannot be read; the tooltip still
+        // says it.
+        if (!badge.empty()) {
+            if (HICON composed = update::WithBadge(replacement); composed != nullptr) {
+                DestroyIcon(replacement);
+                replacement = composed;
+            }
+        }
+#endif
         old = tray_data_.hIcon;
         tray_data_.hIcon = replacement;
         current_tray_icon_id_ = icon_id;
         tray_data_.uFlags |= NIF_ICON;
     }
+#ifdef GTG_FEATURE_UPDATE
+    tray_badge_line_ = badge;
+#endif
     wcsncpy_s(tray_data_.szTip, tooltip, _TRUNCATE);
     current_tray_tooltip_ = tray_data_.szTip;
     {
@@ -2523,6 +2890,11 @@ void MainDialog::ApplyLocalization() {
     SetControlText(IDC_SHOW_FPS, L"FPS");
     SetControlText(IDC_SHOW_RAM, L"RAM");
     SetControlText(IDC_SHOW_NET, text(L"網路", L"NET"));
+    SetControlText(IDC_SHOW_TOP_APP, text(L"高負載程式", L"Top app"));
+    SetControlText(IDC_HOSTS, text(L"主機...", L"Hosts..."));
+    // App names are read in the interface's language first.
+    top_app_sampler_.SetLanguage(
+        localization::Current() == localization::UiLanguage::TraditionalChinese ? 0x0404 : 0x0409);
     SetControlText(IDC_OVERLAY_ENABLED, L"Overlay");
     SetControlText(IDC_OVERLAY_HIDES_OSD,
                    text(L"遊戲中隱藏桌面 OSD", L"Hide desktop OSD in game"));
@@ -2558,6 +2930,7 @@ void MainDialog::ApplyLocalization() {
     ::InvalidateRect(combo, nullptr, TRUE);
 
     SetControlText(IDC_OSD_SCALE_LABEL, text(L"OSD 大小", L"OSD Size"));
+    SetControlText(IDC_OSD_CARD, text(L"卡片", L"Cards"));
     RefreshOsdScaleChoices();
 }
 
@@ -2849,6 +3222,13 @@ LRESULT MainDialog::OnOverlayToggle(WORD, WORD, HWND, BOOL&) {
     }
     logging::Info(std::format(
         L"overlay preference saved; enabled={}", enabled));
+    // The hotkey button shows whether the overlay got its hotkey.
+    ::InvalidateRect(GetDlgItem(IDC_OVERLAY_HOTKEY), nullptr, TRUE);
+    if (HotkeyHeldElsewhere()) {
+        logging::Warning(
+            std::format(L"overlay on without its hotkey; {} is held by another program",
+                        HotkeyText(overlay_hotkey_)));
+    }
     return 0;
 }
 
@@ -2879,6 +3259,106 @@ LRESULT MainDialog::OnOverlayHidesOsd(WORD, WORD, HWND, BOOL&) {
     return 0;
 }
 
+LRESULT MainDialog::OnHosts(WORD, WORD, HWND, BOOL&) {
+#ifdef GTG_FEATURE_UPDATE
+    HostsDialog dialog(hosts_, updates_, host_updates_);
+#else
+    HostsDialog dialog(hosts_);
+#endif
+    (void)dialog.DoModal(m_hWnd);
+    return 0;
+}
+
+LRESULT MainDialog::OnTrayHostsLog(WORD, WORD, HWND, BOOL&) {
+    std::wstring error;
+    if (!hosts_.SetLogOn(!hosts_.LogOn(), error)) logging::Warning(error);
+    return 0;
+}
+
+void MainDialog::UpdateHostsRecord(const std::uint64_t now_ms) {
+    if (!osd_ready_) return;
+    // Placed while Hosts runs and a host is paired; the view says which four
+    // and how each reads, and is only handed over when it has changed.
+    const auto& table = hosts_.Table();
+    const bool placed = hosts_.Running() && table && !table->hosts.empty();
+    osd_overlay_.SetHostsEnabled(placed);
+    osd_overlay_.SetHosts(placed ? osd_hosts::MakeView(*table, now_ms) : osd_hosts::View{});
+}
+
+LRESULT MainDialog::OnPowerBroadcast(UINT, const WPARAM event, LPARAM, BOOL& handled) {
+    if (event == PBT_APMSUSPEND) {
+        hosts_.Suspend();
+    } else if (event == PBT_APMRESUMEAUTOMATIC || event == PBT_APMRESUMESUSPEND) {
+        hosts_.Resume();
+    }
+    handled = FALSE;
+    return TRUE;
+}
+
+LRESULT MainDialog::OnEndSession(UINT, const WPARAM ending, LPARAM, BOOL& handled) {
+    // Sign-out or shutdown: the process may end as soon as this returns.
+    if (ending) hosts_.Shutdown();
+    handled = FALSE;
+    return 0;
+}
+
+hosts::LocalState MainDialog::LocalHostState(const std::uint64_t now_ms) const {
+    hosts::LocalState local;
+    tiny::BarInputs& in = local.bars;
+    // A reading older than a few seconds is not now: it is sent as missing,
+    // with the state marked stale, never as the last number seen.
+    const telemetry::Sample* latest = telemetry_history_.Latest();
+    const bool fresh = latest != nullptr && latest->monotonic_ms + 3'000 >= now_ms;
+    local.stale = latest != nullptr && !fresh;
+    if (fresh) {
+        in.temperature_c = latest->temperature_c;
+        in.power_w = latest->power_w;
+        in.vram_percent = latest->vram_utilization_percent;
+        in.gpu_percent = latest->gpu_utilization_percent;
+        in.cpu_percent = latest->cpu_utilization_percent;
+    }
+    // One kernel32 call, whether or not RAM is shown here.
+    in.ram_percent = sysmem::Query().physical_percent;
+    in.host_memory_low = low_memory_signal_.Low();
+    if (show_net_) {
+        const net::HistorySample* net = net_history_.Latest();
+        if (net != nullptr && net->monotonic_ms + 3'000 >= now_ms &&
+            net->received_bytes_per_second && net->sent_bytes_per_second) {
+            local.network_received = *net->received_bytes_per_second;
+            local.network_sent = *net->sent_bytes_per_second;
+            in.network_bytes_per_second = std::max(*local.network_received, *local.network_sent);
+            in.network_peak =
+                net_history_.PeakWithin(now_ms > 60'000 ? now_ms - 60'000 : 0, now_ms);
+        }
+    }
+    if (show_fps_) in.fps = tiny::MeasureFpsStability(fps_history_.Samples(), now_ms);
+    in.trigger_temperature_c = config_.trigger_temperature_c;
+    in.safe_power_w = config_.safe_power_w;
+    if (maximum_power_limit_mw_) in.maximum_power_w = *maximum_power_limit_mw_ / 1000.0;
+    in.top_app_alerts = top_app_alerts_;
+    switch (status_visual_) {
+        case StatusVisual::Neutral:
+            local.visual = hosts::Visual::Neutral;
+            break;
+        case StatusVisual::Armed:
+            local.visual = hosts::Visual::Armed;
+            break;
+        case StatusVisual::Warning:
+            local.visual = hosts::Visual::Warning;
+            break;
+        case StatusVisual::Protected:
+            local.visual = hosts::Visual::Protected;
+            break;
+        case StatusVisual::Fault:
+            local.visual = hosts::Visual::Fault;
+            break;
+    }
+    constexpr int kVersion[] = {GTG_VERSION_COMMA};
+    local.version = {static_cast<std::uint8_t>(kVersion[0]), static_cast<std::uint8_t>(kVersion[1]),
+                     static_cast<std::uint8_t>(kVersion[2])};
+    return local;
+}
+
 LRESULT MainDialog::OnOverlayHotkey(WORD, WORD, HWND, BOOL&) {
     OverlayHotkeyDialog dialog(overlay_hotkey_);
     if (dialog.DoModal(m_hWnd) != IDOK) return 0;
@@ -2906,6 +3386,7 @@ LRESULT MainDialog::OnOverlayHotkey(WORD, WORD, HWND, BOOL&) {
         return 0;
     }
     overlay_hotkey_ = dialog.hotkey();
+    ::InvalidateRect(GetDlgItem(IDC_OVERLAY_HOTKEY), nullptr, TRUE);
     logging::Info(std::format(
         L"overlay hotkey saved; hotkey={}",
         HotkeyText(overlay_hotkey_)));

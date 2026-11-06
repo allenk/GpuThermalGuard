@@ -11,7 +11,16 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 ![The GTG dashboard drawn inside a Direct3D 12 game at 4K: temperature, power, VRAM, GPU, CPU, RAM, network and FPS, with the wall clock in the header and 19 minutes of play time on the FPS card](docs/images/overlay-dx12-4k.jpg)
 
-## What's new in 1.1
+## What's new in 1.2
+
+- **Updates from GitHub.** GTG checks this repository's releases once a day and tells you when a newer one is out. Nothing installs until you agree; then it updates itself at a moment that costs no protection, restarts, and goes back to the previous version if the new one does not come up. A share on your own network can take GitHub's place ([Updates](#updates)).
+- **Hosts.** Pair GTGs on the same network with a one-time code, and each shows the others as a ninth record on its dashboard. The Hosts dialog can also update them, one after another ([Hosts](#hosts)).
+- **The program behind a high load.** When GPU, VRAM, CPU or RAM stays high, the OSD names the program responsible over that record's curve ([Top-app names](#top-app-names)).
+- **Tiny.** The compact OSD folds into one small cell of bars ([Tiny](#tiny)).
+- **Cards.** The expanded OSD can draw each record as a card with its full reading and its own curve ([Cards](#cards)).
+- **A violet dot on the tray icon** while a newer version is waiting.
+
+## What 1.1 added
 
 - **The overlay reaches games that bring their own Direct3D 12 runtime.** Some games ship the Agility SDK's `D3D12Core.dll` in their own folder. GTG used to work out the overlay's Direct3D 12 entry point from the runtime in Windows, which is not the one those games run, and refused them with a red O. It now works it out from the runtime the game actually loaded ([how](#how-it-works)).
 - **One attach, one pause.** On Direct3D 12 the overlay places seven hooks. They used to go in one at a time, each suspending the game's threads on its own; [Splice](https://github.com/allenk/splice) 1.2 installs them as one transaction, so the game's threads are suspended once and the seven go in together or not at all.
@@ -40,6 +49,8 @@ Each release has two packages. The executable in both is the same file; the over
 | `GpuThermalGuard-<version>-no-overlay-windows-x64.zip` | `GpuThermalGuard.exe` | machines that never need the in-game overlay |
 
 Without `gtg_overlay.dll` beside the EXE, the overlay controls are not shown and no hotkey is registered. Add the DLL and restart GTG to enable it.
+
+From 1.2.5 each release also carries `gtg-update.json`, `GpuThermalGuard.exe` and `gtg_overlay.dll` as separate files. Those are what GTG's updater reads; to install by hand, take a ZIP. 1.1.0 has no updater, so moving from it to 1.2.5 is by hand, once.
 
 ## Screenshots
 
@@ -137,6 +148,14 @@ A one-minute walkthrough of an earlier release, recorded over a game at 4K, is o
 
 Each record gets a full-width curve of the last 30 seconds, with its value on the right.
 
+When the screen is short, the rows get shorter rather than the OSD changing form on its own; earlier versions switched to a fixed set of cards there, without RAM, NET or curves.
+
+### Cards
+
+**Cards**, beside the OSD size in the main window, draws the expanded OSD as cards instead of lanes: two across, in your order, each with the full reading, the highest value in the window, the frame source on FPS, and its own curve with its thresholds. Lanes and cards use the same window, so switching between them neither moves nor resizes the OSD. It is off by default.
+
+Changing the OSD size keeps the OSD's top-right corner where it is, so an OSD docked on the right edge stays docked.
+
 ### Compact OSD
 
 ![Compact OSD, one row of eight live metrics with 30-second miniature trends, the network card showing both directions and the FPS card its graphics API and resolution](docs/images/osd-compact.png)
@@ -152,6 +171,12 @@ Or into a single column, which suits a screen edge:
 <img src="docs/images/osd-compact-column.png" alt="The same eight records as one vertical column of cards" width="164">
 
 Protection alerts and telemetry warnings remain visible in the header. Switching views does not pause monitoring or change protection settings. Each view reopens where you left it.
+
+### Tiny
+
+The compact OSD can fold into one small cell under its header: a bar for each record, in your order, with its initial underneath -- `T P G V C R F N`, and `H` for Hosts -- and no numbers. A bar brightens and pulses when its record needs a look: by the same rules as the [top-app names](#top-app-names), by the protection state for temperature and power, and when the frame rate is more than 10 % away from its recent median.
+
+The fold control is the small mark in the middle of the OSD's bottom edge, shown while the pointer is over the OSD. Folding and unfolding keep the top-right corner in place, and the choice is remembered. The in-game overlay shows the same form; the chevron still opens the expanded OSD.
 
 ### Arranging the compact OSD
 
@@ -180,6 +205,21 @@ Two seconds after the pointer leaves the OSD, the lock and the chevron give thei
 ### Play time
 
 The FPS card carries how long you have been playing, in yellow in the corner of its curve: `42 min`, then `7.2 hr`, up to `99.9 hr`. It counts only while a game has a steady frame rate, so `Alt`+`Tab`, menus and loading screens pause it rather than reset it. A restarted game carries on. When the game being counted has had no frame rate for three minutes -- you moved to another game, or stopped -- the count goes to whatever is playing now, with the time it earned in those three minutes added back. It is kept in memory and starts again with GTG.
+
+### Top-app names
+
+When GPU, VRAM, CPU or RAM stays high, the name of the program responsible appears over that record's curve, in the compact cell and in the expanded lane. A record counts as high after eight seconds above its threshold and stops ten seconds after it falls below the lower one:
+
+| Record | Above | Below |
+| --- | --- | --- |
+| GPU | 70 % | 55 % |
+| VRAM | 70 % | 60 % |
+| CPU | 80 % | 60 % |
+| RAM | 85 % | 75 % |
+
+At ordinary load nothing is shown. The name is the program's own description in the Windows display language, or its file name, shortened -- version numbers and build suffixes such as `-Win64-Shipping` dropped -- to at most 20 letters. The processes of one program are added together, each `svchost` is named after its services, WSL and other virtual machines are named as such, and a process GTG cannot identify is never named. With two NVIDIA adapters, GPU and VRAM stay silent rather than guess. A name too long for its place scrolls on the desktop OSD and turns pages every two seconds in the overlay.
+
+**Top app** in the main window turns it on and off (on by default). The process list is read once a second on a low-priority thread that never touches NVML or the protection loop, and that thread pauses itself for a minute if it uses more CPU than it is allowed. The names shown are written to the diagnostic log.
 
 ### Optional host RAM
 
@@ -245,6 +285,36 @@ The card names what produced the number when that can be established: `D9`, `D11
 
 It shows `-` during warm-up, across focus changes, and whenever the foreground program is presenting nothing -- an idle program has no frame rate. Dark curve sections are visual continuity, **not measured FPS**.
 
+## Hosts
+
+**Hosts** lets the GTGs on one local network show each other. Every machine you pair with appears in a ninth record, **Hosts**, which you can place like the others: in the compact OSD as a cell with up to four hosts, each with bars for temperature, VRAM, GPU and CPU, and `4/6` when more are paired; in the expanded OSD as a lane of its own; in Tiny as the `H` bar. Hosts in alert come first.
+
+Hosts is off by default. Open **Hosts...** in the main window or the tray menu, check **Hosts**, and pair two machines:
+
+1. On one, choose **Create code**. It shows a code beginning `GTG-` and the same code as a QR code. A code works once, for ten minutes.
+2. On the other, paste it under **Paste a code from another GTG** and choose **Join**.
+
+<img src="docs/images/hosts.png" alt="The Hosts dialog after Update all: two paired hosts online at 1.2.5 and marked Updated, this machine's update source and the update buttons, and below them a pairing code with its QR code" width="495">
+
+*Host names, addresses and the pairing code in this screenshot are examples.*
+
+The code carries the first machine's address, port and a one-time secret; from it the two agree on a key for that pair (ECDH P-256), kept under DPAPI. Small typing slips -- case, spaces, dashes, `O` for `0` -- are forgiven, and a checksum catches a wrong character. Up to 16 hosts can be paired. Pairs are one to one: if A pairs with B and with C, B and C see each other only once they pair too.
+
+**What crosses the network.** Once a second, each machine sends each paired host a UDP datagram with what its own dashboard shows -- each record's reading and bar, the protection state, its name and version -- sealed with AES-256-GCM and checked before anything in it is read. Nothing a host receives can change a setting, a power limit or the protection state, and nothing passes through a server. Only the machine that created a code listens on a fixed port, **29480** by default (1024--65535 in the dialog), so it is the one that may see a Windows Firewall prompt. A host that exits, signs out or goes to sleep says so and is shown as offline; ten seconds of silence shows it as lost, which is an alert.
+
+### Updating paired hosts
+
+The Hosts dialog shows each host's version and what its updater is doing, and can ask a host to update to the release this machine's source names:
+
+- **Update** asks one host; **Force update** also reinstalls the same version or goes back to an older one (never below 1.2.0).
+- **Update all** asks one host at a time, waits until it is back with the new version, and stops at the first that is not.
+
+The host installs from its own source, after its own checks, exactly as if its own user had agreed. It takes requests only while **Let other hosts ask this machine to update** is checked there -- checked by default; uncheck it on a machine that should only ever be updated by hand. An ordinary request is acted on at most once in 30 minutes; a forced one is not held off. A request names a release and nothing else: the code always comes from the host's own source.
+
+### Hosts log
+
+**Write Hosts Log** in the tray menu (off by default) writes `GpuThermalGuard-hosts.log` beside the diagnostic log: one JSON line every five seconds with this machine's Hosts status and every paired host's readings, for another program on the same machine to read. It is kept to 1 MiB plus one older file, and contains no address, port, key or pairing code.
+
 ## Themes
 
 The **Theme** list offers **Auto** (follows the Windows app mode, and switches with it while GTG runs), **Dark** and **Light**. Light is the classic Windows look. High-contrast mode always gets the system's own colours, and a Windows build that cannot draw the dark controls falls back to light rather than half-dark. The dark theme is drawn with [darkmodelib](https://github.com/ozone10/darkmodelib), compiled into the EXE.
@@ -283,6 +353,7 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 - **Incident evidence** — rolling telemetry, logs, trip count and a trip marker on the temperature history, wall time, and automatic/manual PNG snapshots.
 - **Opt-in injection** — the desktop OSD and FPS use no injection or hook. Only the overlay writes into a game, only into the game in front, and only when you press the hotkey.
 - **Standalone deployment** — static MSVC runtime; no installer, no runtime to install. `GpuThermalGuard.exe` needs only Windows system DLLs and the NVIDIA driver's `nvml.dll`; `gtg_overlay.dll` needs only Windows system DLLs.
+- **Little on the network** — a daily HTTPS check of this repository's releases, which you can turn off, and, only with Hosts on, UDP to the machines you paired. No telemetry, no account, no server of ours.
 
 ## What it monitors
 
@@ -297,6 +368,8 @@ Do not cross-flash a ROM downloaded for a different board or channel SKU. GpuThe
 - play time on the FPS card
 - one hour of retained telemetry with a draggable five-minute dashboard view
 - a compact, non-activating 30-second always-on-top OSD, and the same dashboard inside Direct3D 11/12 games
+- the program behind a high GPU, VRAM, CPU or RAM load
+- paired GTGs on the local network (Hosts)
 
 ## Protection behavior
 
@@ -328,6 +401,29 @@ Restore failures retain the latch and attempt a verified safe-power fallback. Au
 
 The OSD displays an **ALERT** while safe power is latched, including while waiting for restore. Delayed presentation samples are visually marked rather than silently presented as fresh measurements. Missing protection telemetry is handled separately by the protection core.
 
+## Updates
+
+GTG looks for new releases of this repository on GitHub two minutes after it starts and then once a day, or within the hour after a check that failed. A check is one HTTPS request for the latest release's `gtg-update.json`, sent with `GpuThermalGuard/<version>` as its user agent; nothing about the machine is sent. When a newer release is out, the tray shows a notice once and keeps a small violet dot on its icon until you update.
+
+Nothing is installed until you choose **Update to <version>...** in the tray menu. Then GTG:
+
+1. downloads the release's files and checks each against the SHA-256 listed in that release's `gtg-update.json`, keeping them in `_gtg_update` beside the EXE, a folder only administrators can write to;
+2. waits for a moment that costs no protection -- protection armed, the GPU at least 15 °C below the trigger temperature, and no game carrying the overlay;
+3. hands over to a short PowerShell script compiled into the EXE and exits; the script replaces the files and starts the new version, so protection pauses for a few seconds;
+4. puts the previous version back if the new one does not come up.
+
+An install from the no-overlay package stays without `gtg_overlay.dll`. **Check for Updates**, **Reinstall <version> from Source...** and **Cancel Update** are in the tray menu too.
+
+**What an update trusts.** Releases are not Authenticode-signed yet. Without a signer pin, an update is trusted as far as the release on GitHub is: HTTPS to GitHub, with the certificate and its revocation checked by Windows, redirects followed only to GitHub's own hosts, and each file's SHA-256 in the release's own manifest -- the same trust as downloading the ZIP yourself. The build-provenance attestation covers these files as it covers the ZIPs.
+
+**Update Settings...** in the tray menu changes, for the whole machine:
+
+- **Update source.** Empty means GitHub. A UNC path such as `\\server\share\GTG` makes a share on your network the source instead; `tools/update/publish-update.ps1` publishes a build to one. GTG runs elevated and does not see mapped drive letters, so it must be a UNC path.
+- **Check automatically.** Unchecked, GTG checks only when you choose **Check for Updates**.
+- **Signer pin.** The SHA-256 of a code-signing certificate. With a pin, only files signed by that certificate are installed. Releases on GitHub are not signed yet, so a pin stops updates from GitHub; it is meant for a share whose builds you sign yourself.
+
+GTG does not update while the GTG Service is installed (an update does not replace the service yet), while Smart App Control is on (it would block the new version and the way back), or when it runs from a network folder. Paired hosts can be updated from the Hosts dialog ([Updating paired hosts](#updating-paired-hosts)).
+
 ## Language and settings
 
 English is the first-run default. Traditional Chinese can be selected from the **Language** list. The choice is embedded in the EXE and persisted for the current user at:
@@ -341,6 +437,8 @@ The theme, OSD placement, overlay and hotkey choices are stored beside it under 
 ```text
 HKLM\SOFTWARE\GpuThermalGuard
 ```
+
+Update settings are machine-wide, under `HKLM\SOFTWARE\GpuThermalGuard\Update`, so only an administrator can change where GTG updates from.
 
 The application requests administrator privileges because changing an NVIDIA power limit and writing machine-wide protection settings require elevation. The version is shown in the main window's title bar.
 
@@ -394,7 +492,7 @@ out\build\windows-x64-release\gtg_overlay.dll
 out\build\windows-x64-release\GpuThermalGuardProbe.exe
 ```
 
-`-DGTG_FEATURE_OVERLAY=OFF` builds without the overlay and needs neither vcpkg nor Splice. `GpuThermalGuardProbe.exe` is a development tool, built from source only and not in the downloads; it is read-only and never calls an NVML setter.
+`-DGTG_FEATURE_OVERLAY=OFF` builds without the overlay and needs neither vcpkg nor Splice. `-DGTG_FEATURE_UPDATE=OFF` builds without the updater. `GpuThermalGuardProbe.exe` is a development tool, built from source only and not in the downloads; it is read-only and never calls an NVML setter.
 
 ## Logs and snapshots
 
@@ -434,11 +532,13 @@ Metric cards open a detail view with selectable time ranges and chart scaling. T
 - No installer or service-management UI yet.
 - No guarantee against every TDR, driver reset, sudden sensor failure, or hardware fault.
 - The in-game overlay supports native 64-bit Direct3D 11 and 12 games only; not Vulkan, OpenGL, Direct3D 9, 32-bit games or HDR. Games with anti-cheat may refuse it.
+- Hosts works on one local network, over IPv4.
+- Updates are refused while the GTG Service is installed or Smart App Control is on; releases are not code-signed yet.
 - Hardware-specific safe power and temperature values must be chosen responsibly.
 
 ## Release integrity
 
-Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation for both packages. When an Authenticode certificate is configured, the executables and the overlay DLL are signed and verified before packaging. **1.1.0 is not Authenticode-signed**; the release notes say so, and the archives are verified by checksum and attestation instead. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
+Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation for both packages and for the updater's files. When an Authenticode certificate is configured, the executables and the overlay DLL are signed and verified before packaging. **1.2.5 is not Authenticode-signed**; the release notes say so, and the archives are verified by checksum and attestation instead. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
 
 After downloading a release archive, verify that its exact bytes were produced by this repository's GitHub Actions workflow:
 
@@ -458,4 +558,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines. Please report
 
 ## License
 
-GpuThermalGuard is released under the [MIT License](LICENSE). Third-party components keep their own terms: WTL (Microsoft Public License), the NVIDIA NVML header (NVIDIA's notice), darkmodelib (Mozilla Public License 2.0, with some code under MIT), Dear ImGui (MIT) and Splice (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+GpuThermalGuard is released under the [MIT License](LICENSE). Third-party components keep their own terms: WTL (Microsoft Public License), the NVIDIA NVML header (NVIDIA's notice), darkmodelib (Mozilla Public License 2.0, with some code under MIT), Dear ImGui (MIT), Splice (MIT) and the QR Code generator library (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

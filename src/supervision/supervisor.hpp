@@ -13,6 +13,11 @@ int RunSupervisor(const std::wstring& executable, int show_command,
                   const SupervisorOptions& options = {});
 bool AttachChild(const wchar_t* mapping_handle) noexcept;
 bool IsChild() noexcept;
+#ifdef GTG_FEATURE_UPDATE
+// The supervisor's process id, as the supervisor wrote it into the mapping; 0
+// outside a supervised Tray.
+DWORD SupervisorPid() noexcept;
+#endif
 bool TakeRecoveryLatch() noexcept;
 void MarkCleanExit() noexcept;
 void ReportHealth(bool ready, bool valid_sample = true) noexcept;
