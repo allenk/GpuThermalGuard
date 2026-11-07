@@ -1,5 +1,7 @@
 #include "update/handoff.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <cwchar>
 #include <format>
 #include <vector>
@@ -85,6 +87,25 @@ bool Loaded(const std::filesystem::path& file, const DWORD pid) {
     if (!parsed.value) return false;
     const json::Value* value = parsed.value->Find("pid");
     return value != nullptr && value->integer == static_cast<std::int64_t>(pid);
+}
+
+// Whether `pid` is in this process's own job: in the tray, the supervisor's,
+// which kills what it holds when it closes. IsProcessInJob answers for any job,
+// and a job around the supervisor as well (a CI runner puts every step in one)
+// holds the script harmlessly, so only this job's own list can tell.
+bool InOwnJob(const DWORD pid) {
+    constexpr DWORD kMaxIds = 1024;
+    std::vector<std::uint8_t> buffer(offsetof(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) +
+                                     kMaxIds * sizeof(ULONG_PTR));
+    auto* list = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(buffer.data());
+    if (!QueryInformationJobObject(nullptr, JobObjectBasicProcessIdList, list,
+                                   static_cast<DWORD>(buffer.size()), nullptr)) {
+        return false;
+    }
+    for (DWORD i = 0; i < list->NumberOfProcessIdsInList; ++i) {
+        if (list->ProcessIdList[i] == pid) return true;
+    }
+    return false;
 }
 
 HandOffResult Fail(const std::filesystem::path& plan, std::wstring problem) {
@@ -174,8 +195,7 @@ HandOffResult HandOff(const std::filesystem::path& work, const Plan& plan,
 
     HandOffResult result;
     result.script_pid = process.dwProcessId;
-    BOOL in_job = FALSE;
-    result.in_job = IsProcessInJob(script_process.Get(), nullptr, &in_job) && in_job;
+    result.in_job = InOwnJob(process.dwProcessId);
     const ULONGLONG deadline = GetTickCount64() + loaded_ms;
     for (;;) {
         if (Loaded(loaded_file, process.dwProcessId)) {

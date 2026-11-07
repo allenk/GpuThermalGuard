@@ -28,8 +28,11 @@ private:
     HANDLE handle_{};
 };
 
-// The token a program the user starts normally runs with: the linked, filtered
-// token when this process is elevated, otherwise this process's own.
+// The token a program the user starts normally runs with, without administrator
+// rights: the linked, filtered token when this process is elevated, otherwise
+// this process's own with Administrators made deny-only. Under UAC that group
+// is deny-only already; where UAC is off, every program would otherwise count
+// as one without administrator rights that can write System32.
 bool UserToken(Token& user) noexcept {
     Token process;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, process.Out())) {
@@ -47,7 +50,18 @@ bool UserToken(Token& user) noexcept {
         *user.Out() = linked.LinkedToken;
         return true;
     }
-    return DuplicateToken(process.Get(), SecurityIdentification, user.Out()) != FALSE;
+    std::uint8_t administrators[SECURITY_MAX_SID_SIZE]{};
+    DWORD size = sizeof(administrators);
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators, &size)) {
+        return false;
+    }
+    SID_AND_ATTRIBUTES disable{administrators, 0};
+    Token restricted;
+    if (!CreateRestrictedToken(process.Get(), 0, 1, &disable, 0, nullptr, 0, nullptr,
+                               restricted.Out())) {
+        return false;
+    }
+    return DuplicateToken(restricted.Get(), SecurityIdentification, user.Out()) != FALSE;
 }
 
 bool Grants(const HANDLE token, PSECURITY_DESCRIPTOR descriptor, const DWORD access) noexcept {

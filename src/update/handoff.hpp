@@ -24,7 +24,8 @@ namespace gtg::update {
 struct HandOffResult {
     bool ok{};
     DWORD script_pid{};
-    // Whether the script ended up inside a job (it must not).
+    // Whether the script ended up inside this process's own job, the one that
+    // ends with it (it must not).
     bool in_job{};
     std::wstring problem;
 };

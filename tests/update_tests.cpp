@@ -954,6 +954,13 @@ void TestWorkFolder() {
     wchar_t system[MAX_PATH]{};
     GetSystemDirectoryW(system, MAX_PATH);
     Require(!InspectInstallFolder(system).user_writable, "System32 is not the user's to write");
+    // Elevated or not, with UAC on or off: a program without administrator
+    // rights cannot write where only administrators may.
+    const auto admins = temp.Path() / "admins";
+    Require(SecureFolder(admins, L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", error),
+            "administrators-only folder");
+    Require(!InspectInstallFolder(admins).user_writable,
+            "a folder only administrators may write is not the user's to write");
     Require(InspectInstallFolder(L"\\\\host\\share\\GTG").remote, "a share is remote");
 }
 
@@ -1053,12 +1060,20 @@ void TestHandOff() {
         WaitForSingleObject(process, 10'000);
         CloseHandle(process);
     };
+    // The script starts in its parent's job. Here the parent is this process, in
+    // a job of its own, so the script must be found in it; apply_test.ps1 checks
+    // the opposite under the real supervisor.
+    const HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    Require(job != nullptr && AssignProcessToJobObject(job, GetCurrentProcess()),
+            "this test in a job of its own");
+    CloseHandle(job);
     SetEnvironmentVariableW(L"PSModulePath", L"X:\\left-by-a-shell");
     const HandOffResult ok = HandOff(work, plan, answers, self, 20'000);
     SetEnvironmentVariableW(L"PSModulePath", nullptr);
     finished(ok.script_pid);
     Require(ok.ok && ok.script_pid != 0,
             "a script that answers is handed the update: " + Narrow(ok.problem));
+    Require(ok.in_job, "a script started under this process is in this process's job");
     Require(std::filesystem::exists(work / kPlanFileName), "the plan stays for the script");
     Require(Get(work / kScriptFileName) == answers, "the script written is the one given");
     Require(Get(work / "env.txt").find("left-by-a-shell") == std::string::npos,
