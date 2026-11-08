@@ -133,11 +133,13 @@ HandOffResult HandOff(const std::filesystem::path& work, const Plan& plan,
     const std::filesystem::path plan_file = work / kPlanFileName;
     const std::filesystem::path script_file = work / kScriptFileName;
     const std::filesystem::path loaded_file = work / kLoadedFileName;
-    for (const wchar_t* stale : {kLoadedFileName, kReadyFileName, kOutcomeFileName}) {
+    for (const wchar_t* stale :
+         {kLoadedFileName, kReadyFileName, kOutcomeFileName, kUnprotectedFileName}) {
         (void)DeleteFileW((work / stale).c_str());
     }
     DWORD error = 0;
-    if (!WriteWhole(script_file, script, error) ||
+    if ((plan.unprotected && !WriteWhole(work / kUnprotectedFileName, {}, error)) ||
+        !WriteWhole(script_file, script, error) ||
         !WriteWhole(plan_file, FormatPlan(plan), error)) {
         return Fail(plan_file,
                     localization::Format(L"無法寫入更新腳本（Win32 {}）",

@@ -4,7 +4,10 @@
 //                          its own so it never meets a running GTG
 //   --supervised <mapping> a Tray: reports healthy every 200 ms, and on a
 //                          request hands the update off with the real HandOff
-//                          and the compiled-in script, then exits cleanly
+//                          and the compiled-in script, then exits cleanly. A
+//                          build named nogpu* reports a machine with no NVIDIA
+//                          GPU instead; pinned-nogpu pins a GPU first, as a
+//                          Tray after a driver reset finds none
 //   --game <dll> <ms>      keeps a DLL loaded, as a game keeps the overlay
 // A copy's build identity is the marker the harness appends to its file.
 #include <windows.h>
@@ -103,8 +106,8 @@ unsigned EnvironmentMs(const wchar_t* name, const unsigned fallback) {
 
 // What GTG's Tray does once the reader has agreed and the moment is safe:
 // describe the staged files in a plan and hand it to the script.
-int HandOffUpdate(const fs::path& dir, const std::string& build, const bool tamper,
-                  const bool hang) {
+int HandOffUpdate(const fs::path& dir, const std::string& build, const bool tamper, const bool hang,
+                  const bool no_gpu) {
     using namespace gtg::update;
     const fs::path work = dir / kWorkFolderName;
     const fs::path staged = work / L"staged" / L"TEST";
@@ -116,6 +119,7 @@ int HandOffUpdate(const fs::path& dir, const std::string& build, const bool tamp
     plan.old_build = build;
     plan.new_version = "1.2.1";
     plan.release = "TEST";
+    plan.unprotected = no_gpu;
     for (const auto& entry : fs::directory_iterator(staged)) {
         const std::string data = ReadAll(entry.path());
         PlanFile file;
@@ -179,14 +183,21 @@ int RunTray() {
         Log(dir, "TRAY", "build=crash exits before ready");
         return 3;
     }
+    const bool no_gpu = build.starts_with("nogpu") || build == "pinned-nogpu";
+    if (build == "pinned-nogpu") (void)gtg::supervision::PinTargetUuid("GPU-standin");
     Log(dir, "TRAY",
-        std::format("started build={} elevated={} supervisor={}", build, Elevated() ? 1 : 0,
-                    gtg::supervision::SupervisorPid()));
+        std::format("started build={} elevated={} supervisor={} recovery={}", build,
+                    Elevated() ? 1 : 0, gtg::supervision::SupervisorPid(),
+                    gtg::supervision::TakeRecoveryLatch() ? 1 : 0));
     WriteText(dir / L"lab-ready.json",
               std::format("{{\"build\":\"{}\",\"pid\":{}}}", build, GetCurrentProcessId()));
     const fs::path request = dir / L"lab-request.json";
     for (;;) {
-        gtg::supervision::ReportHealth(true);
+        if (no_gpu) {
+            gtg::supervision::ReportNoGpu();
+        } else {
+            gtg::supervision::ReportHealth(true);
+        }
         Sleep(200);
         const std::string text = ReadAll(request);
         if (text.empty()) continue;
@@ -195,8 +206,18 @@ int RunTray() {
             gtg::supervision::MarkCleanExit();
             return 0;
         }
+        if (text.find("fresh") != std::string::npos) {
+            Log(dir, "TRAY", "a GPU appeared; asks for a fresh start");
+            gtg::supervision::RequestFreshStart();
+            continue;
+        }
+        if (text.find("stall") != std::string::npos) {
+            Log(dir, "TRAY", "stops its heartbeat");
+            for (;;)
+                Sleep(1000);
+        }
         const int code = HandOffUpdate(dir, build, text.find("tamper") != std::string::npos,
-                                       text.find("hang") != std::string::npos);
+                                       text.find("hang") != std::string::npos, no_gpu);
         if (code >= 0) return code;
         // A failed hand-off leaves this build running, as it leaves GTG.
     }
@@ -224,5 +245,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     gtg::supervision::SupervisorOptions options;
     options.singleton_name = L"Local\\GtgUpdateStandin.Supervisor";
     options.journal = false;
+    options.watchdog_ms = EnvironmentMs(L"GTG_STANDIN_WATCHDOG_MS", options.watchdog_ms);
     return gtg::supervision::RunSupervisor(SelfPath().wstring(), SW_HIDE, options);
 }

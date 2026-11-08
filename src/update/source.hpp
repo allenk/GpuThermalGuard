@@ -74,6 +74,26 @@ inline constexpr std::uint64_t kRetryAfterFailureMs = 60 * 60'000;
     return failed && interval > kRetryAfterFailureMs ? kRetryAfterFailureMs : interval;
 }
 
+// The SHA-256 of the certificate the public releases are signed with: the
+// project's own, self-signed (tools/update/public-release-signer.cer). Windows
+// still shows their publisher as unknown; what it buys is that a machine updating
+// from GitHub installs only files that certificate signed, not whatever a
+// release happens to hold.
+inline constexpr Digest kPublicReleaseSigner{
+    0x05, 0x0B, 0xF4, 0xD6, 0x8B, 0x72, 0xAA, 0xA8, 0x7C, 0x74, 0x30, 0xDD, 0xF1, 0xF7, 0x24, 0xCA,
+    0xBF, 0x37, 0x7C, 0x13, 0xBA, 0xCB, 0x25, 0xC0, 0x7D, 0xEA, 0x05, 0x38, 0x40, 0x99, 0x2D, 0x30,
+};
+
+// The certificate staged files must be signed with: the administrator's pin
+// for any source when one is set; otherwise the public releases' own for
+// GitHub; none for a folder without a pin.
+[[nodiscard]] constexpr std::optional<Digest> PinInEffect(const std::optional<Digest>& configured,
+                                                          const UpdateSource::Kind kind) noexcept {
+    if (configured) return configured;
+    if (kind == UpdateSource::Kind::Releases) return kPublicReleaseSigner;
+    return std::nullopt;
+}
+
 // \\host\share, optionally followed by folders: what an elevated GTG can reach
 // (it does not see the user's mapped drive letters). No \\?\ or \\.\ forms, no
 // "." or ".." folder, no characters Windows refuses in a name; at most 260

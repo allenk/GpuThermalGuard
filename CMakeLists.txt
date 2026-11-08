@@ -120,6 +120,8 @@ add_executable(GpuThermalGuard WIN32
     src/logging/logger.hpp
     src/protection/local_protection_worker.cpp
     src/protection/local_protection_worker.hpp
+    src/tray/grey_icon.cpp
+    src/tray/grey_icon.hpp
     src/tray/history_chart.cpp
     src/tray/history_chart.hpp
     src/tray/main_dialog.cpp

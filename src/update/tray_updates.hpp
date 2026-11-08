@@ -145,6 +145,8 @@ private:
     UpdatePreference preference_;
     State state_{State::Off};
     Wait wait_{Wait::None};
+    // From the last safe-moment inputs: told to the next build through the plan.
+    bool no_gpu_{};
     std::filesystem::path executable_;
     std::filesystem::path install_;
     std::filesystem::path work_;

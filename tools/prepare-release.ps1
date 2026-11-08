@@ -87,6 +87,21 @@ foreach ($file in @($mainExe, $overlayDll)) {
     if (-not (Test-Path -LiteralPath $file)) { throw "Missing release binary: $file" }
 }
 
+# What the notes say about signing is checked against the files. Unless
+# -Unsigned, both carry the project's own certificate: the one GTG's updater
+# requires of an update from GitHub.
+$signer = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+    (Join-Path $PSScriptRoot 'update/public-release-signer.cer'))
+if (-not $Unsigned) {
+    foreach ($file in @($mainExe, $overlayDll)) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $file
+        if ($null -eq $signature.SignerCertificate -or
+            $signature.SignerCertificate.Thumbprint -ne $signer.Thumbprint) {
+            throw "$file is not signed with tools/update/public-release-signer.cer."
+        }
+    }
+}
+
 if (Test-Path -LiteralPath $OutputDirectory) {
     Remove-Item -LiteralPath $OutputDirectory -Recurse -Force
 }
@@ -142,6 +157,10 @@ $notes.AddRange([string[]]@(
 if ($Unsigned) {
     $notes.Add('> [!WARNING]')
     $notes.Add('> **Not Authenticode-signed.** The executables and the overlay DLL carry no publisher signature. Verify each ZIP with `SHA256SUMS.txt` and the GitHub Actions build-provenance attestation (`gh attestation verify <zip> -R allenk/GpuThermalGuard`) before running it. Some antivirus products flag programs that load a DLL into another process; the overlay does that, by design and only when you press its hotkey.')
+    $notes.Add('')
+} else {
+    $notes.Add('> [!NOTE]')
+    $notes.Add("> **Signed with the project's own certificate**, not one a certificate authority issued: Windows shows an unknown publisher, and SmartScreen may still warn about a new download. GTG's updater installs an update from GitHub only if this certificate signed it. Its thumbprint is ``$($signer.Thumbprint)``; ``(Get-AuthenticodeSignature .\GpuThermalGuard.exe).SignerCertificate.Thumbprint`` shows a file's. Verify each ZIP with ``SHA256SUMS.txt`` and the GitHub Actions build-provenance attestation (``gh attestation verify <zip> -R allenk/GpuThermalGuard``). Some antivirus products flag programs that load a DLL into another process; the overlay does that, by design and only when you press its hotkey.")
     $notes.Add('')
 }
 $notes.AddRange([string[]]@(

@@ -32,6 +32,24 @@ struct DeviceSnapshot {
     std::optional<int> thermal_margin_c;
 };
 
+// Why NVML has no GPU to offer, when its answer means this machine has none
+// right now rather than that something failed: no nvml.dll in System32 (no
+// NVIDIA driver installed), a driver that is not loaded, or no device.
+enum class Absence { None, NoLibrary, DriverNotLoaded, NoDevice };
+
+// ERROR_MOD_NOT_FOUND from LoadLibraryExW.
+[[nodiscard]] constexpr Absence AbsenceFromLoad(const unsigned long win32_error) noexcept {
+    return win32_error == 126 ? Absence::NoLibrary : Absence::None;
+}
+
+[[nodiscard]] constexpr Absence AbsenceFromInit(const nvmlReturn_t result) noexcept {
+    return result == NVML_ERROR_DRIVER_NOT_LOADED ? Absence::DriverNotLoaded : Absence::None;
+}
+
+[[nodiscard]] constexpr Absence AbsenceFromCount(const unsigned int count) noexcept {
+    return count == 0 ? Absence::NoDevice : Absence::None;
+}
+
 class Library final {
 public:
     Library() = default;
@@ -56,6 +74,10 @@ public:
         return device_set_power_limit_ != nullptr;
     }
     [[nodiscard]] const std::string& last_error() const noexcept { return last_error_; }
+
+    // Set by Initialize, and by BindDeviceByUuid with no UUID; None when the
+    // failure, if any, was something else.
+    [[nodiscard]] Absence absence() const noexcept { return absence_; }
     // Copy before another setter if retaining evidence across safe fallback.
     [[nodiscard]] const PowerOperationResult& last_power_result() const noexcept {
         return last_power_result_;
@@ -76,6 +98,7 @@ private:
     void* module_{nullptr};
     bool initialized_{false};
     std::string last_error_;
+    Absence absence_{Absence::None};
     std::string bound_uuid_;
     mutable nvmlReturn_t last_temperature_result_{NVML_SUCCESS};
     PowerOperationResult last_power_result_;

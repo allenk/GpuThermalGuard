@@ -96,6 +96,10 @@ void LogTimingSummary(const WorkerSnapshot& snapshot) {
 
 }  // namespace
 
+bool NoGpuHere(const nvml::Library& nvml) {
+    return nvml.absence() != nvml::Absence::None && supervision::TargetUuid().empty();
+}
+
 LocalProtectionWorker::~LocalProtectionWorker() {
     Stop();
 }
@@ -116,6 +120,7 @@ bool LocalProtectionWorker::Start(ProtectionConfig config,
     }
     stop_requested_.store(false);
     manual_restore_requested_.store(false);
+    gpu_absent_.store(false);
     running_.store(true);
     try {
         thread_ = std::thread(&LocalProtectionWorker::Run, this,
@@ -148,7 +153,10 @@ void LocalProtectionWorker::RequestManualRestore() noexcept {
 }
 
 bool LocalProtectionWorker::RequestApply(const ProtectionConfig& config) {
-    if (!running_.load() || apply_stage_.load(std::memory_order_acquire) != 0) return false;
+    if (!running_.load() || gpu_absent_.load() ||
+        apply_stage_.load(std::memory_order_acquire) != 0) {
+        return false;
+    }
     apply_config_ = config;
     apply_stage_.store(1, std::memory_order_release);
     return true; // next ordinary 200 ms tick; never alter the deadline cadence
@@ -209,6 +217,10 @@ void LocalProtectionWorker::Run(ProtectionConfig config,
         !supervision::PinTargetUuid(nvml.bound_uuid())) {
         published.running = false;
         published.error = nvml.last_error();
+        if (NoGpuHere(nvml)) {
+            WaitForGpu(published);
+            return;
+        }
         Publish(published);
         running_.store(false);
         (void)logging::TryError(std::format(L"RECOVERY startup NVML failure: {}", Widen(published.error)));
@@ -565,6 +577,36 @@ void LocalProtectionWorker::Run(ProtectionConfig config,
 
     CancelWaitableTimer(timer);
     CloseHandle(timer);
+    published.running = false;
+    Publish(published);
+    running_.store(false);
+}
+
+// A fresh process would find no GPU either, so instead of asking for one this
+// reports the heartbeat of a Tray that monitors only, and looks again every
+// five seconds. Once NVML binds a device, a fresh Tray takes over to protect it.
+void LocalProtectionWorker::WaitForGpu(WorkerSnapshot& published) noexcept {
+    constexpr DWORD kHeartbeatMs = 250;
+    constexpr ULONGLONG kLookAgainMs = 5'000;
+    gpu_absent_.store(true);
+    published.running = true;
+    published.gpu_absent = true;
+    Publish(published);
+    (void)logging::TryInfo(
+        std::format(L"no NVIDIA GPU; monitoring only: {}", Widen(published.error)));
+    bool appeared = false;
+    ULONGLONG next_look = GetTickCount64() + kLookAgainMs;
+    while (!stop_requested_.load()) {
+        supervision::ReportNoGpu();
+        if (WaitForSingleObject(wake_event_, kHeartbeatMs) == WAIT_FAILED) break;
+        if (appeared || GetTickCount64() < next_look) continue;
+        next_look = GetTickCount64() + kLookAgainMs;
+        nvml::Library probe;
+        if (!probe.Initialize() || !probe.BindDeviceByUuid({})) continue;
+        (void)logging::TryInfo(L"an NVIDIA GPU appeared; asking for a fresh Tray to protect it");
+        supervision::RequestFreshStart();
+        appeared = true;
+    }
     published.running = false;
     Publish(published);
     running_.store(false);

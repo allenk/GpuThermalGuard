@@ -14,9 +14,11 @@
 #include "tray/trip_markers.hpp"
 #include "tray/timeline_track.hpp"
 #include "tray/hotkey_capture.hpp"
+#include "tray/grey_icon.hpp"
 #include "core/working_power_apply.hpp"
 #include "core/restore_prompt_gate.hpp"
 #include "core/restore_policy.hpp"
+#include "nvml/nvml_loader.hpp"
 #include "nvml/power_operation.hpp"
 #include "telemetry/telemetry_history.hpp"
 #include "telemetry/telemetry_freshness.hpp"
@@ -3349,6 +3351,51 @@ void TestRecoveryPolicy() {
     Require(readiness.Observe(800, true), "five continuous samples establish readiness");
     Require(!readiness.Observe(1800, true), "one-second gap invalidates readiness");
     Require(!readiness.Observe(2000, false), "invalid sample cannot be ready");
+
+    using gtg::supervision::ChildHealthy;
+    Require(ChildHealthy(2000, 1000, true, false, true), "ready with a fresh heartbeat is healthy");
+    Require(!ChildHealthy(2500, 1000, true, false, true), "a stale heartbeat is not healthy");
+    Require(!ChildHealthy(2000, 0, true, false, false), "no heartbeat yet is not healthy");
+    Require(!ChildHealthy(2000, 1000, false, false, false),
+            "neither ready nor no GPU is not healthy");
+    Require(ChildHealthy(2000, 1000, false, true, false),
+            "no GPU, none pinned, fresh heartbeat: healthy, not replaced");
+    Require(!ChildHealthy(2500, 1000, false, true, false),
+            "no GPU with a stale heartbeat is replaced");
+    Require(!ChildHealthy(2000, 1000, false, true, true),
+            "no GPU after one was pinned is a driver reset: replaced");
+    using gtg::supervision::RelaunchAsRecovery;
+    Require(!RelaunchAsRecovery(true, false), "a GPU appeared, none pinned: an ordinary start");
+    Require(RelaunchAsRecovery(true, true), "a fresh start after a pin is still a recovery");
+    Require(RelaunchAsRecovery(false, false), "any other replacement is a recovery");
+}
+
+void TestNvmlAbsence() {
+    using gtg::nvml::Absence;
+    Require(gtg::nvml::AbsenceFromLoad(126) == Absence::NoLibrary, "no nvml.dll: no NVIDIA driver");
+    for (const unsigned long error : {0UL, 5UL, 193UL, 1114UL})
+        Require(gtg::nvml::AbsenceFromLoad(error) == Absence::None,
+                "any other load error is a failure");
+    Require(gtg::nvml::AbsenceFromInit(NVML_ERROR_DRIVER_NOT_LOADED) == Absence::DriverNotLoaded,
+            "driver not loaded: no GPU right now");
+    for (const nvmlReturn_t result : {NVML_SUCCESS, NVML_ERROR_UNKNOWN, NVML_ERROR_NO_PERMISSION,
+                                      NVML_ERROR_GPU_IS_LOST, NVML_ERROR_LIB_RM_VERSION_MISMATCH})
+        Require(gtg::nvml::AbsenceFromInit(result) == Absence::None,
+                "any other init answer is a failure");
+    Require(gtg::nvml::AbsenceFromCount(0) == Absence::NoDevice, "no device: no GPU");
+    Require(gtg::nvml::AbsenceFromCount(1) == Absence::None, "a device is there");
+}
+
+void TestGreyIconPixels() {
+    std::uint32_t pixels[] = {0xFF00FF00, 0x80FFFFFF, 0x00000000, 0xFF123456};
+    gtg::tray::GreyPixels(pixels);
+    Require(pixels[0] == 0xFF969696, "green becomes its luminance");
+    Require(pixels[1] == 0x80FFFFFF, "white stays white, its alpha kept");
+    Require(pixels[2] == 0x00000000, "a transparent pixel stays transparent");
+    for (const std::uint32_t pixel : pixels) {
+        const auto r = (pixel >> 16) & 0xFF;
+        Require(r == ((pixel >> 8) & 0xFF) && r == (pixel & 0xFF), "every channel the same grey");
+    }
 }
 
 void TestHiddenWindowPosition() {
@@ -6732,6 +6779,8 @@ int main(int argc, char** argv) {
         {"WorkingPowerApply", TestWorkingPowerApply},
         {"WorkingPowerFailureAndContinuity", TestWorkingPowerFailureAndContinuity},
         {"RecoveryPolicy", TestRecoveryPolicy},
+        {"NvmlAbsence", TestNvmlAbsence},
+        {"GreyIconPixels", TestGreyIconPixels},
         {"HiddenWindowPosition", TestHiddenWindowPosition},
         {"SupervisorChildLifecycle", TestSupervisorChildLifecycle},
         {"CoolingRequiresContinuousObservations", TestCoolingRequiresContinuousObservations},

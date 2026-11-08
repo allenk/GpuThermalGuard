@@ -19,6 +19,8 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 - **Tiny.** The compact OSD folds into one small cell of bars ([Tiny](#tiny)).
 - **Cards.** The expanded OSD can draw each record as a card with its full reading and its own curve ([Cards](#cards)).
 - **A violet dot on the tray icon** while a newer version is waiting.
+- **Without an NVIDIA GPU, GTG monitors instead of restarting.** CPU, RAM, NET, FPS, the OSD, Hosts and updates work, and the status line says there is no protection. Before 1.2.6, such a machine saw GTG appear and vanish every few seconds.
+- **Signed releases.** From 1.2.6 the executables carry the project's own certificate, and the updater installs from GitHub only what it signed. The certificate is self-signed, so Windows still shows an unknown publisher ([Updates](#updates)).
 
 ## What 1.1 added
 
@@ -408,19 +410,19 @@ GTG looks for new releases of this repository on GitHub two minutes after it sta
 Nothing is installed until you choose **Update to <version>...** in the tray menu. Then GTG:
 
 1. downloads the release's files and checks each against the SHA-256 listed in that release's `gtg-update.json`, keeping them in `_gtg_update` beside the EXE, a folder only administrators can write to;
-2. waits for a moment that costs no protection -- protection armed, the GPU at least 15 °C below the trigger temperature, and no game carrying the overlay;
+2. waits for a moment that costs no protection -- protection armed, the GPU at least 15 °C below the trigger temperature, and no game carrying the overlay; without an NVIDIA GPU, only the overlay condition applies;
 3. hands over to a short PowerShell script compiled into the EXE and exits; the script replaces the files and starts the new version, so protection pauses for a few seconds;
 4. puts the previous version back if the new one does not come up.
 
 An install from the no-overlay package stays without `gtg_overlay.dll`. **Check for Updates**, **Reinstall <version> from Source...** and **Cancel Update** are in the tray menu too.
 
-**What an update trusts.** Releases are not Authenticode-signed yet. Without a signer pin, an update is trusted as far as the release on GitHub is: HTTPS to GitHub, with the certificate and its revocation checked by Windows, redirects followed only to GitHub's own hosts, and each file's SHA-256 in the release's own manifest -- the same trust as downloading the ZIP yourself. The build-provenance attestation covers these files as it covers the ZIPs.
+**What an update trusts.** From 1.2.6, releases are signed with the project's own certificate, [`tools/update/public-release-signer.cer`](tools/update/public-release-signer.cer). Its SHA-256 is built into GTG: without a signer pin of your own, an update from GitHub is installed only if each file carries a valid signature by that certificate. Each file must also match the SHA-256 in the release's own manifest, downloaded over HTTPS from GitHub, with the certificate and its revocation checked by Windows and redirects followed only to GitHub's own hosts. The certificate is self-signed, not issued by a certificate authority, so Windows shows an unknown publisher: the signature is for GTG's updater to check, not an identity Windows vouches for. The build-provenance attestation covers these files as it covers the ZIPs.
 
 **Update Settings...** in the tray menu changes, for the whole machine:
 
 - **Update source.** Empty means GitHub. A UNC path such as `\\server\share\GTG` makes a share on your network the source instead; `tools/update/publish-update.ps1` publishes a build to one. GTG runs elevated and does not see mapped drive letters, so it must be a UNC path.
 - **Check automatically.** Unchecked, GTG checks only when you choose **Check for Updates**.
-- **Signer pin.** The SHA-256 of a code-signing certificate. With a pin, only files signed by that certificate are installed. Releases on GitHub are not signed yet, so a pin stops updates from GitHub; it is meant for a share whose builds you sign yourself.
+- **Signer pin.** The SHA-256 of a code-signing certificate. With a pin, only files signed by that certificate are installed, from any source; for GitHub it takes the place of the project's own certificate. It is meant for a share whose builds you sign yourself.
 
 GTG does not update while the GTG Service is installed (an update does not replace the service yet), while Smart App Control is on (it would block the new version and the way back), or when it runs from a network folder. Paired hosts can be updated from the Hosts dialog ([Updating paired hosts](#updating-paired-hosts)).
 
@@ -527,18 +529,19 @@ Metric cards open a detail view with selectable time ranges and chart scaling. T
 
 ## Current limitations
 
-- Windows and NVIDIA NVML only.
+- Windows only. Protection needs an NVIDIA GPU and the NVML its driver provides; without them, GTG monitors only.
 - The current release protects one selected/default GPU; multi-GPU policy is not complete.
 - No installer or service-management UI yet.
 - No guarantee against every TDR, driver reset, sudden sensor failure, or hardware fault.
 - The in-game overlay supports native 64-bit Direct3D 11 and 12 games only; not Vulkan, OpenGL, Direct3D 9, 32-bit games or HDR. Games with anti-cheat may refuse it.
 - Hosts works on one local network, over IPv4.
-- Updates are refused while the GTG Service is installed or Smart App Control is on; releases are not code-signed yet.
+- Updates are refused while the GTG Service is installed or Smart App Control is on.
+- Releases are signed with the project's own certificate, not one a certificate authority issued, so Windows shows an unknown publisher.
 - Hardware-specific safe power and temperature values must be chosen responsibly.
 
 ## Release integrity
 
-Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation for both packages and for the updater's files. When an Authenticode certificate is configured, the executables and the overlay DLL are signed and verified before packaging. **1.2.5 is not Authenticode-signed**; the release notes say so, and the archives are verified by checksum and attestation instead. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
+Published releases are tag-driven. The release workflow validates version consistency, builds and tests on GitHub Actions, produces `SHA256SUMS.txt`, and publishes a build-provenance attestation for both packages and for the updater's files. The executables and the overlay DLL are signed with the project's own certificate and checked before packaging, and no release is published without it; 1.2.5 and earlier are not signed. Release notes are taken from [CHANGELOG.md](CHANGELOG.md).
 
 After downloading a release archive, verify that its exact bytes were produced by this repository's GitHub Actions workflow:
 
@@ -546,7 +549,7 @@ After downloading a release archive, verify that its exact bytes were produced b
 gh attestation verify .\GpuThermalGuard-<version>-windows-x64.zip -R allenk/GpuThermalGuard
 ```
 
-This provenance check does not replace Authenticode publisher identity or malware scanning. Windows SmartScreen may warn about unsigned executables, and some antivirus products flag any program that loads a DLL into another process; the overlay does exactly that, by design and only on your hotkey.
+This provenance check does not replace malware scanning, and the project's certificate is not a publisher identity Windows vouches for. Windows SmartScreen may still warn about a new download, and some antivirus products flag any program that loads a DLL into another process; the overlay does exactly that, by design and only on your hotkey.
 
 ## Contributing and security
 

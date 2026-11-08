@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.6] - 2026-11-08
+
+GpuThermalGuard 1.2.6 runs on machines without an NVIDIA GPU, and its releases are signed.
+
+### Fixed
+
+- **Without an NVIDIA GPU, GTG kept vanishing.** Its supervisor took the missing GPU for a failure and replaced GTG every 2 to 30 seconds, so the window appeared and disappeared and nothing else worked. When there is no `nvml.dll`, the NVIDIA driver is not loaded, or it reports no GPU, GTG now stays up and monitors: CPU, RAM, NET, FPS, the OSD, Hosts and updates work, the status line says **No NVIDIA GPU: monitoring only, no protection**, and the tray icon is the armed icon in grey. Paired hosts show the machine without a fault. GTG looks for a GPU again every five seconds and protects one that appears. A GPU that GTG protected and then lost, as in a driver reset, is still a fault and is recovered as before.
+
+### Changed
+
+- **Releases are signed with the project's own certificate**, `tools/update/public-release-signer.cer`. It is self-signed, not issued by a certificate authority, so Windows still shows an unknown publisher and SmartScreen may still warn about a new download. What changes is the updater: without a signer pin of its own, a machine that updates from GitHub installs only files this certificate signed; its SHA-256 is built into GTG. A signer pin set in **Update Settings...** still takes precedence, for any source.
+
+### Notes
+
+- On a machine without an NVIDIA GPU, 1.2.5 never stayed up long enough to check for updates. Install 1.2.6 there by hand, once.
+- 1.2.5 updates to 1.2.6 as to any release. From 1.2.6 on, an update from GitHub must carry the signature.
+
 ## [1.2.5] - 2026-11-06
 
 GpuThermalGuard 1.2: it updates itself from GitHub, shows the other GTGs on your network, and names the program behind a high load.
@@ -232,7 +249,8 @@ GpuThermalGuard 1.0: the dashboard inside the game, and a frame rate that knows 
 - A power-limit write is never reported as successful until the value is read back.
 - Release automation signs and verifies executables when an Authenticode certificate is configured; otherwise it publishes only a clearly labeled unsigned prerelease with checksums and build provenance.
 
-[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v1.2.5...HEAD
+[Unreleased]: https://github.com/allenk/GpuThermalGuard/compare/v1.2.6...HEAD
+[1.2.6]: https://github.com/allenk/GpuThermalGuard/compare/v1.2.5...v1.2.6
 [1.2.5]: https://github.com/allenk/GpuThermalGuard/compare/v1.1.0...v1.2.5
 [1.1.0]: https://github.com/allenk/GpuThermalGuard/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/allenk/GpuThermalGuard/compare/v0.13.0...v1.0.0

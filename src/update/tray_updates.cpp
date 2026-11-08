@@ -194,7 +194,11 @@ void TrayUpdates::Start(TrayHost host) {
             L"update: the source in the registry is not a valid UNC path; nothing is checked "
             L"until it is corrected");
     } else {
-        logging::Info(std::format(L"update: source {}", Describe(Source())));
+        const UpdateSource source = Source();
+        const wchar_t* signer = preference_.pin                          ? L"registry"
+                                : PinInEffect(std::nullopt, source.kind) ? L"public-release"
+                                                                         : L"none";
+        logging::Info(std::format(L"update: source {} signer_pin={}", Describe(source), signer));
     }
     if (preference_.pin_invalid) {
         logging::Warning(
@@ -358,6 +362,7 @@ void TrayUpdates::Tick(const std::uint64_t now_ms, const SafeInputs& safe) {
                 break;
             }
             wait_ = SafeMoment(safe);
+            no_gpu_ = safe.no_gpu;
             if (wait_ == Wait::None) StartHandOff();
             break;
         default:
@@ -551,8 +556,8 @@ void TrayUpdates::StartStage(const Consent consent) {
     consent_ = consent;
     staged_.reset();
     Launch(
-        [consent, source = Source(), variant = host_.variant, pin = preference_.pin,
-         work = work_](Shared& shared) {
+        [consent, source = Source(), variant = host_.variant,
+         pin = PinInEffect(preference_.pin, Source().kind), work = work_](Shared& shared) {
             StageDone done;
             const Sha256 sha;
             DWORD error = 0;
@@ -640,6 +645,7 @@ void TrayUpdates::StartHandOff() {
     plan.new_build = ToHex(variant->build);
     plan.release = ToHex(manifest_->release);
     plan.reinstall = consent_.reinstall;
+    plan.unprotected = no_gpu_;
     for (const StagedFile& file : staged_->files) {
         plan.files.push_back({file.name, file.path, file.size, file.sha256});
     }
@@ -712,11 +718,12 @@ bool TrayUpdates::Confirm(const bool reinstall) {
     }
     if (!preference_.pin && source.kind == UpdateSource::Kind::Releases) {
         text += localization::Select(
-            L"\n\n公開版沒有程式碼簽章：這台信任 GitHub 上這個專案的發佈，透過 HTTPS 下載，並逐一"
-            L"比對發佈清單裡的 SHA-256，跟自己下載 zip 一樣。",
-            L"\n\nPublic releases are not code-signed: this machine trusts the project's releases "
-            L"on GitHub, downloaded over HTTPS and checked against the SHA-256 of each file in the "
-            L"release's manifest, as when you download the zip yourself.");
+            L"\n\n公開版以這個專案自己的憑證簽章（不是憑證機構發的，所以 Windows 仍顯示未知的發行者）："
+            L"這台只安裝那張憑證簽署的檔案，透過 HTTPS 下載，並逐一比對發佈清單裡的 SHA-256。",
+            L"\n\nPublic releases are signed with the project's own certificate (not one a "
+            L"certificate authority issued, so Windows still shows an unknown publisher): this "
+            L"machine installs only files that certificate signed, downloaded over HTTPS and "
+            L"checked against the SHA-256 of each file in the release's manifest.");
     } else if (!preference_.pin) {
         text += localization::Select(
             L"\n\n沒有設定簽章釘選：任何能寫入更新來源的人，都能發佈這台會安裝的版本。",
@@ -1038,7 +1045,9 @@ hosts::Status TrayUpdates::HostsStatus() const {
     hosts::Status status;
     status.has_source = HasSource();
     status.accepts_triggers = preference_.hosts_trigger;
-    status.pin_set = preference_.pin.has_value();
+    // Any pin in effect, the public releases' own included: what the bit tells
+    // a paired host is whether this machine installs only signed files.
+    status.pin_set = HasSource() && PinInEffect(preference_.pin, Source().kind).has_value();
     status.folder_writable = folder_writable_;
     switch (state_) {
         case State::Off:

@@ -7,6 +7,25 @@ namespace gtg::supervision {
 constexpr bool IsFreshSample(std::uint64_t now, std::uint64_t completed) noexcept {
     return now >= completed && now - completed < 1000;
 }
+
+// A child is healthy while its heartbeat is fresh and it reports protection
+// ready, or reports that this machine has no NVIDIA GPU. That counts only while
+// this supervisor has pinned no GPU: after one was protected, "no GPU" is a
+// driver being reset or reinstalled, and a fresh process is what brings
+// protection back.
+constexpr bool ChildHealthy(std::uint64_t now, std::uint64_t heartbeat, bool ready, bool no_gpu,
+                            bool pinned) noexcept {
+    const bool fresh = heartbeat != 0 && now >= heartbeat && now - heartbeat < 1500;
+    return fresh && (ready || (no_gpu && !pinned));
+}
+
+// A child that monitored a machine without a GPU asks for a fresh start when
+// one appears. With none pinned there is nothing to recover, so its
+// replacement starts as on any start; anything else is a recovery.
+constexpr bool RelaunchAsRecovery(bool fresh_start, bool pinned) noexcept {
+    return !fresh_start || pinned;
+}
+
 class RecoveryPolicy {
 public:
     unsigned NextDelayMs() noexcept {

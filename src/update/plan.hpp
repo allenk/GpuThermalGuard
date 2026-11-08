@@ -42,6 +42,9 @@ struct Plan {
     std::string release;
     // A reinstall from the source rather than an update; for the outcome only.
     bool reinstall{};
+    // This build has no GPU to protect. Not in plan.json: HandOff writes it as
+    // the unprotected file, which the new supervisor reads by name only.
+    bool unprotected{};
     std::vector<PlanFile> files;
     std::vector<PlanProcess> wait;
     std::wstring mutex{kUpdateMutexName};

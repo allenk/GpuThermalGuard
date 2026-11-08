@@ -19,6 +19,8 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 - **Tiny。** 精簡 OSD 可以收成一格小小的直條圖（[Tiny](#tiny)）。
 - **卡片。** 展開 OSD 可以改用卡片呈現，每張卡有完整讀值和自己的曲線（[卡片](#卡片)）。
 - **Tray 圖示上的紫點**：有新版本等著安裝時出現。
+- **沒有 NVIDIA GPU 時只監看，不再一直重啟。** CPU、RAM、NET、FPS、OSD、主機與更新照常運作，狀態列會說明沒有保護。1.2.6 之前，這種機器上的 GTG 每隔幾秒就出現又消失。
+- **Release 有簽章。** 從 1.2.6 起，EXE 用專案自己的憑證簽章，從 GitHub 更新時只安裝它簽的檔案。這張憑證是自簽的，所以 Windows 仍顯示未知的發行者（[更新](#更新)）。
 
 ## 1.1 加入的功能
 
@@ -412,19 +414,19 @@ GTG 啟動兩分鐘後檢查一次本 Repository 在 GitHub 上的 Release，之
 你在 tray 選單選 **更新到 <版本>...** 之前，什麼都不會安裝。選了之後，GTG 會：
 
 1. 下載這個 Release 的檔案，逐一比對該 Release `gtg-update.json` 裡列的 SHA-256，存到 EXE 旁邊的 `_gtg_update`，這個資料夾只有系統管理員能寫入；
-2. 等一個不影響保護的時機 —— 保護在待命狀態、GPU 比觸發溫度低至少 15 °C、沒有遊戲正在用 overlay；
+2. 等一個不影響保護的時機 —— 保護在待命狀態、GPU 比觸發溫度低至少 15 °C、沒有遊戲正在用 overlay；沒有 NVIDIA GPU 的機器只看 overlay 這一項；
 3. 交給編譯在 EXE 裡的一小段 PowerShell 腳本，然後結束自己；腳本替換檔案、啟動新版，保護因此暫停幾秒；
 4. 新版沒有正常啟動，就換回原本的版本。
 
 用 no-overlay 套件安裝的，更新後仍然沒有 `gtg_overlay.dll`。Tray 選單另有 **檢查更新**、**從來源重新安裝 <版本>...** 與 **取消更新**。
 
-**更新信任的是什麼。** 目前的 Release 還沒有 Authenticode 簽章。沒有設定簽章釘選時，更新信任的就是 GitHub 上的這個 Release：透過 HTTPS 連到 GitHub，憑證與撤銷狀態由 Windows 檢查，重新導向只接受 GitHub 自己的主機，每個檔案都要符合該 Release 自己清單裡的 SHA-256 —— 跟你自己下載 ZIP 的信任程度一樣。這些檔案跟 ZIP 一樣有 build-provenance attestation。
+**更新信任的是什麼。** 從 1.2.6 起，Release 用專案自己的憑證簽章，就是 [`tools/update/public-release-signer.cer`](tools/update/public-release-signer.cer)。它的 SHA-256 編在 GTG 裡：沒有設定自己的簽章釘選時，從 GitHub 更新的每個檔案，都要帶著這張憑證的有效簽章才會安裝。每個檔案也都要符合該 Release 自己清單裡的 SHA-256；下載走 HTTPS，憑證與撤銷狀態由 Windows 檢查，重新導向只接受 GitHub 自己的主機。這張憑證是自簽的，不是憑證機構發的，所以 Windows 會顯示未知的發行者。這個簽章是給 GTG 的 updater 檢查用的，不是 Windows 替我們擔保的身分。這些檔案跟 ZIP 一樣有 build-provenance attestation。
 
 Tray 選單的 **更新設定...** 可以調整整台電腦的設定：
 
 - **更新來源。** 留空就是 GitHub。填入 `\\server\share\GTG` 這樣的 UNC 路徑，就改用區域網路上的共用資料夾；`tools/update/publish-update.ps1` 可以把建置好的版本發佈上去。GTG 以系統管理員身分執行，看不到對應的磁碟機代號，所以必須是 UNC 路徑。
 - **自動檢查更新。** 取消勾選後，只有你按 **檢查更新** 時才會檢查。
-- **簽章釘選。** 程式碼簽章憑證的 SHA-256。設定後，只安裝由那張憑證簽署的檔案。GitHub 上的 Release 目前沒有簽章，設了釘選就不會從 GitHub 更新；這是給自己簽署版本的共用資料夾用的。
+- **簽章釘選。** 程式碼簽章憑證的 SHA-256。設定後，不論來源，只安裝由那張憑證簽署的檔案；從 GitHub 更新時，它取代專案自己的憑證。這是給自己簽署版本的共用資料夾用的。
 
 安裝了 GTG Service（更新還不會替換 service）、Smart App Control 開著（它會擋下新版，連退回舊版也會被擋），或 GTG 是從網路資料夾執行時，GTG 都不會更新。配對的主機可以從主機視窗更新（[更新配對的主機](#更新配對的主機)）。
 
@@ -524,18 +526,19 @@ GTG 維持本機、standalone 設計。獨立 collector 把 GTG log 當作其中
 
 ## 目前限制
 
-- 目前只支援 Windows 與 NVIDIA NVML。
+- 只支援 Windows。保護需要 NVIDIA GPU，以及它的 driver 提供的 NVML；沒有的話，GTG 只監看。
 - 現行版本保護單一選定／預設 GPU；多 GPU policy 尚未完成。
 - 尚未提供 installer 或 service 管理 UI。
 - 無法保證攔截所有 TDR、driver reset、感測器突然失效或硬體故障。
 - 遊戲內 overlay 只支援原生 64 位元的 Direct3D 11 與 12 遊戲；不支援 Vulkan、OpenGL、Direct3D 9、32 位元遊戲與 HDR。有 anti-cheat 的遊戲可能拒絕它。
 - 主機功能只在同一個區域網路、透過 IPv4 運作。
-- 安裝了 GTG Service 或 Smart App Control 開著時不會更新；Release 目前還沒有程式碼簽章。
+- 安裝了 GTG Service 或 Smart App Control 開著時不會更新。
+- Release 用專案自己的憑證簽章，不是憑證機構發的，所以 Windows 會顯示未知的發行者。
 - 安全功率與觸發溫度必須依實際硬體審慎設定。
 
 ## 發佈完整性
 
-Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt`，並為兩個套件與更新用的檔案都發佈 build-provenance attestation。有設定 Authenticode 憑證時，EXE 與 overlay DLL 會先簽章並驗證再封裝。**1.2.5 沒有 Authenticode 簽章**；Release Notes 會說明，壓縮檔改以 checksum 與 attestation 驗證。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
+Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 建置與測試、產生 `SHA256SUMS.txt`，並為兩個套件與更新用的檔案都發佈 build-provenance attestation。EXE 與 overlay DLL 會先用專案自己的憑證簽章、驗證，再封裝；沒有簽章就不發佈。1.2.5 以前的版本沒有簽章。Release Notes 取自 [CHANGELOG.md](CHANGELOG.md)。
 
 下載 Release 壓縮檔後，可驗證該檔案是否確實由本 Repository 的 GitHub Actions workflow 產生：
 
@@ -543,7 +546,7 @@ Release 由 tag 驅動。Workflow 會驗證版本一致性、在 GitHub Actions 
 gh attestation verify .\GpuThermalGuard-<version>-windows-x64.zip -R allenk/GpuThermalGuard
 ```
 
-Provenance 驗證不能取代 Authenticode 發行者身分或惡意程式掃描。Windows SmartScreen 可能警告未簽章的 EXE；部分防毒軟體會標記任何把 DLL 載入其他行程的程式 —— overlay 正是這樣做的，這是設計，而且只在你按下熱鍵時發生。
+Provenance 驗證不能取代惡意程式掃描；專案自己的憑證也不是 Windows 替我們擔保的發行者身分。Windows SmartScreen 對新下載的檔案仍可能警告；部分防毒軟體會標記任何把 DLL 載入其他行程的程式 —— overlay 正是這樣做的，這是設計，而且只在你按下熱鍵時發生。
 
 ## 貢獻與安全性
 

@@ -62,13 +62,11 @@ LRESULT UpdateSettingsDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
         note += L"\n";
     }
     note += localization::Select(
-        L"設定釘選後，只安裝由那張憑證簽署的檔案；GitHub 上的公開版目前沒有簽章，設了釘選就不會從 "
-        L"GitHub 更新。沒有釘選時，GitHub 來源信任這個專案在 GitHub 的發佈；UNC 來源則是任何能寫入"
-        L"它的人，都能發佈這台會安裝的版本。",
-        L"With a pin, only files signed with that certificate are installed; the public releases "
-        L"on GitHub are not signed yet, so a pin stops updates from GitHub. Without a pin, GitHub "
-        L"means trusting the project's releases there, and a UNC source means trusting anyone who "
-        L"can write to it.");
+        L"設定釘選後，只安裝由那張憑證簽署的檔案，不論來源。沒有釘選時，GitHub 來源只安裝這個專案"
+        L"自己的憑證簽署的檔案；UNC 來源則是任何能寫入它的人，都能發佈這台會安裝的版本。",
+        L"With a pin, only files signed with that certificate are installed, from any source. "
+        L"Without one, GitHub installs only files signed with the project's own certificate, "
+        L"and a UNC source means trusting anyone who can write to it.");
     Note(note);
     return TRUE;
 }

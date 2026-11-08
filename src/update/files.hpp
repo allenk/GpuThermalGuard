@@ -13,6 +13,9 @@ inline constexpr wchar_t kScriptFileName[] = L"apply-update.ps1";
 inline constexpr wchar_t kLoadedFileName[] = L"loaded.json";
 // The supervisor, the first time it sees protection ready while a plan exists.
 inline constexpr wchar_t kReadyFileName[] = L"ready.json";
+// The Tray, beside the plan, when the build handing off had no GPU to protect;
+// only then may the new supervisor count a Tray without one as ready.
+inline constexpr wchar_t kUnprotectedFileName[] = L"unprotected";
 // The script, when it is done, however it ended.
 inline constexpr wchar_t kOutcomeFileName[] = L"outcome.json";
 inline constexpr wchar_t kLogFileName[] = L"update.log";

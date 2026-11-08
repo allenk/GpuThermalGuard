@@ -90,6 +90,20 @@ add_test(NAME gtg_update_trust
             -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/update/trust_test.ps1"
             -Tests $<TARGET_FILE:gtg_update_tests>)
 set_tests_properties(gtg_update_trust PROPERTIES TIMEOUT 120)
+# The release workflow's signing script, in Windows PowerShell and in
+# PowerShell 7 (the one the workflow runs), with certificates made in memory.
+find_program(GTG_PWSH pwsh HINTS "$ENV{ProgramFiles}/PowerShell/7")
+set(GTG_SIGN_TEST_PWSH)
+if(GTG_PWSH)
+    set(GTG_SIGN_TEST_PWSH -Pwsh "${GTG_PWSH}")
+endif()
+add_test(NAME gtg_update_sign
+    COMMAND ${GTG_WINDOWS_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/update/sign_test.ps1"
+            -Script "${CMAKE_CURRENT_SOURCE_DIR}/tools/update/sign-release-files.ps1"
+            -Tests $<TARGET_FILE:gtg_update_tests>
+            ${GTG_SIGN_TEST_PWSH})
+set_tests_properties(gtg_update_sign PROPERTIES TIMEOUT 120)
 
 # The script end to end against stand-ins that run the real supervisor and
 # hand-off code with the script compiled in. Test tools: never part of a
@@ -111,7 +125,14 @@ add_test(NAME gtg_update_apply
             -Overlay $<TARGET_FILE:gtg_update_standin_dll>)
 # The stand-ins share a supervisor singleton and an update mutex: one run at a
 # time.
-set_tests_properties(gtg_update_apply PROPERTIES TIMEOUT 300 RESOURCE_LOCK gtg_update_standin)
+set_tests_properties(gtg_update_apply PROPERTIES TIMEOUT 420 RESOURCE_LOCK gtg_update_standin)
+# The supervisor with a Tray on a machine with no NVIDIA GPU, on the same
+# stand-in.
+add_test(NAME gtg_supervisor_no_gpu
+    COMMAND ${GTG_WINDOWS_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/update/no_gpu_test.ps1"
+            -Standin $<TARGET_FILE:gtg_update_standin>)
+set_tests_properties(gtg_supervisor_no_gpu PROPERTIES TIMEOUT 120 RESOURCE_LOCK gtg_update_standin)
 # The publish tool's output read by the updater's own code.
 add_test(NAME gtg_update_publish
     COMMAND ${GTG_WINDOWS_POWERSHELL} -NoProfile -ExecutionPolicy Bypass

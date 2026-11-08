@@ -13,11 +13,22 @@
 #include "core/working_power_apply.hpp"
 #include "timing/protection_timing.hpp"
 
+namespace gtg::nvml {
+class Library;
+}
+
 namespace gtg::protection {
+
+// NVML answered that this machine has no NVIDIA GPU, and this supervisor has
+// pinned none: the Tray monitors only. After a GPU was pinned the same answer
+// is a driver being reset or reinstalled, and recovery handles it.
+[[nodiscard]] bool NoGpuHere(const nvml::Library& nvml);
 
 struct WorkerSnapshot {
     bool running{false};
     bool nvml_ready{false};
+    // No NVIDIA GPU here (NoGpuHere): monitoring only, no protection.
+    bool gpu_absent{false};
     ProtectionState state{ProtectionState::GpuUnavailable};
     bool safe_latched{false};
     std::optional<int> temperature_c;
@@ -67,10 +78,12 @@ public:
 
 private:
     void Run(ProtectionConfig config, bool persisted_safe_latch) noexcept;
+    void WaitForGpu(WorkerSnapshot& published) noexcept;
     void Publish(const WorkerSnapshot& snapshot);
     [[nodiscard]] bool TryPublish(const WorkerSnapshot& snapshot);
 
     std::atomic<bool> running_{false};
+    std::atomic<bool> gpu_absent_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> manual_restore_requested_{false};
     HANDLE wake_event_{nullptr};

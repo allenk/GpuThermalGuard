@@ -94,6 +94,7 @@ void Library::Reset() noexcept {
 bool Library::Initialize() {
     Reset();
     last_error_.clear();
+    absence_ = Absence::None;
 
     module_ = ::LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (module_ == nullptr) {
@@ -101,6 +102,7 @@ bool Library::Initialize() {
         std::ostringstream stream;
         stream << "LoadLibraryExW(System32\\nvml.dll) failed with Win32 error " << error;
         last_error_ = stream.str();
+        absence_ = AbsenceFromLoad(error);
         return false;
     }
 
@@ -144,6 +146,7 @@ bool Library::Initialize() {
     if (result != NVML_SUCCESS) {
         last_error_ = "nvmlInit_v2 failed: " + ErrorText(result);
         Reset();
+        absence_ = AbsenceFromInit(result);
         return false;
     }
 
@@ -364,7 +367,16 @@ bool Library::BindDevice(const unsigned int device_index) {
 }
 
 bool Library::BindDeviceByUuid(const std::string& uuid) {
-    if (uuid.empty()) return BindDevice(0);
+    if (uuid.empty()) {
+        unsigned count{};
+        if (initialized_ && device_get_count_v2_(&count) == NVML_SUCCESS &&
+            AbsenceFromCount(count) != Absence::None) {
+            absence_ = AbsenceFromCount(count);
+            last_error_ = "NVML reports no NVIDIA GPU";
+            return false;
+        }
+        return BindDevice(0);
+    }
     bound_device_ = nullptr;
     if (!initialized_) return false;
     unsigned count{};

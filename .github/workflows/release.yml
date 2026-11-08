@@ -13,6 +13,9 @@ jobs:
     # windows-2025 moved to the VS 2026 image in June 2026. Keep release
     # binaries reproducible with the project's VS 2022/v143 baseline.
     runs-on: windows-2022
+    # The signing key is a secret of this environment, which only v*.*.* tags
+    # may use and which waits for the maintainer's approval before the job runs.
+    environment: release
     permissions:
       contents: write
       id-token: write
@@ -64,51 +67,25 @@ jobs:
         shell: pwsh
         run: ctest --test-dir out/build/release-ci -C Release --output-on-failure
 
-      - name: Authenticode sign and verify when configured
-        id: signing
+      # GTG's updater installs an update from GitHub only if the project's own
+      # certificate (tools/update/public-release-signer.cer) signed it, so no
+      # release is published unsigned. The script takes the key from these two
+      # variables once, loads it in process, refuses a key that is not that
+      # certificate's, and checks each file with the updater's own signer check.
+      - name: Sign with the project's certificate
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          $hasCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)
-          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)
-          if ($hasCertificate -ne $hasPassword) {
-            throw 'Release signing is only partially configured. Set both signing secrets or remove both.'
-          }
-          if (-not $hasCertificate) {
-            'signed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            Write-Warning 'No Authenticode certificate is configured. The release notes will say the binaries are unsigned.'
-            exit 0
-          }
-          $pfx = Join-Path $env:RUNNER_TEMP 'release-signing.pfx'
-          try {
-            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
-            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-              Sort-Object FullName -Descending | Select-Object -First 1
-            if ($null -eq $signTool) { throw 'signtool.exe was not found on the runner.' }
-            foreach ($file in @(
-              'out/build/release-ci/Release/GpuThermalGuard.exe',
-              'out/build/release-ci/Release/gtg_overlay.dll'
-            )) {
-              & $signTool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD $file
-              if ($LASTEXITCODE -ne 0) { throw "Signing failed for $file." }
-              & $signTool.FullName verify /pa /v $file
-              if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $file." }
-            }
-            'signed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          } finally {
-            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
-          }
+        run: >-
+          ./tools/update/sign-release-files.ps1
+          -Files out/build/release-ci/Release/GpuThermalGuard.exe, out/build/release-ci/Release/gtg_overlay.dll
+          -Certificate tools/update/public-release-signer.cer
+          -VerifyWith out/build/release-ci/Release/gtg_update_tests.exe
 
       - name: Prepare packages, checksums, and release notes
         shell: pwsh
-        run: |
-          $parameters = @{ Tag = '${{ github.ref_name }}' }
-          if ('${{ steps.signing.outputs.signed }}' -ne 'true') {
-            $parameters.Unsigned = $true
-          }
-          ./tools/prepare-release.ps1 @parameters
+        run: ./tools/prepare-release.ps1 -Tag '${{ github.ref_name }}'
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

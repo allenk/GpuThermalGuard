@@ -15,9 +15,10 @@
 
 namespace gtg::supervision {
 namespace {
-constexpr DWORD kSignature = 0x47544732;
+constexpr DWORD kSignature = 0x47544733;
 constexpr DWORD kRecoveryExit = 0xE0470001;
 constexpr DWORD kHangExit = 0xE0470002;
+constexpr DWORD kFreshStartExit = 0xE0470003;
 struct Shared {
     DWORD signature;
     DWORD child_pid;
@@ -26,6 +27,8 @@ struct Shared {
     volatile LONG restart_requested;
     volatile LONG ready;
     volatile LONG identity_ready;
+    volatile LONG no_gpu;
+    volatile LONG fresh_start;
     alignas(8) volatile LONG64 heartbeat;
     alignas(8) volatile LONG64 first_sample;
     char uuid[96];
@@ -62,12 +65,22 @@ void ActivateExisting() noexcept {
 // While an update script waits on this build, the first ready is its health
 // signal: protection is ready as this supervisor judges it. Written beside the
 // plan and renamed into place, naming this process, which the script started.
-void ReportReadyForUpdate(const std::wstring& executable) noexcept {
+// A child with no GPU to protect counts only when the build that handed off
+// had none either: one that cannot find the GPU its predecessor protected is
+// not a good build, and the script puts the old one back.
+void ReportReadyForUpdate(const std::wstring& executable, const bool no_gpu) noexcept {
     const std::wstring::size_type slash = executable.find_last_of(L'\\');
     if (slash == std::wstring::npos) return;
     const std::wstring work = executable.substr(0, slash + 1) + update::kWorkFolderName + L"\\";
     const std::wstring plan = work + update::kPlanFileName;
     if (GetFileAttributesW(plan.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    if (no_gpu && GetFileAttributesW((work + update::kUnprotectedFileName).c_str()) ==
+                      INVALID_FILE_ATTRIBUTES) {
+        logging::Warning(
+            L"SUPERVISOR not reporting ready: no GPU here, and the build that "
+            L"handed off protected one");
+        return;
+    }
     const std::wstring ready = work + update::kReadyFileName;
     const std::wstring temporary = ready + L".tmp";
     const std::string text = std::format("{{\"pid\":{}}}", GetCurrentProcessId());
@@ -120,11 +133,24 @@ void ReportHealth(bool ready, bool valid_sample) noexcept {
     InterlockedExchange64(&shared_->heartbeat, static_cast<LONG64>(AwakeMs()));
     if (valid_sample) InterlockedCompareExchange64(&shared_->first_sample, static_cast<LONG64>(AwakeMs()), 0);
 }
+
+void ReportNoGpu() noexcept {
+    if (!shared_) return;
+    InterlockedExchange(&shared_->ready, 0);
+    InterlockedExchange(&shared_->no_gpu, 1);
+    InterlockedExchange64(&shared_->heartbeat, static_cast<LONG64>(AwakeMs()));
+}
+
 void RequestRecovery() noexcept {
     if (!shared_) return;
     InterlockedExchange(&shared_->ready, 0);
     InterlockedExchange(&shared_->restart_requested, 1);
 }
+
+void RequestFreshStart() noexcept {
+    if (shared_) InterlockedExchange(&shared_->fresh_start, 1);
+}
+
 std::string TargetUuid() {
     return shared_ && InterlockedCompareExchange(&shared_->identity_ready, 0, 0)
         ? std::string(shared_->uuid, strnlen_s(shared_->uuid, sizeof(shared_->uuid)))
@@ -248,30 +274,41 @@ int RunSupervisor(const std::wstring& executable, int show_command, const Superv
             }
             const auto heartbeat = static_cast<std::uint64_t>(
                 InterlockedCompareExchange64(&view.value->heartbeat, 0, 0));
-            const bool healthy = heartbeat && now >= heartbeat && now - heartbeat < 1500 &&
-                InterlockedCompareExchange(&view.value->ready, 0, 0) != 0;
+            const bool pinned = InterlockedCompareExchange(&view.value->identity_ready, 0, 0) != 0;
+            const bool no_gpu = InterlockedCompareExchange(&view.value->no_gpu, 0, 0) != 0;
+            const bool healthy = ChildHealthy(
+                now, heartbeat, InterlockedCompareExchange(&view.value->ready, 0, 0) != 0, no_gpu,
+                pinned);
             policy.Observe(now, healthy);
             if (healthy) {
                 last_healthy = now;
                 if (!first_ready) {
-                    logging::Info(std::format(L"SUPERVISOR child pid={} ready outage_ms={}",
-                        process.dwProcessId, now - outage_begin));
+                    logging::Info(
+                        std::format(L"SUPERVISOR child pid={} ready outage_ms={} no_gpu={}",
+                                    process.dwProcessId, now - outage_begin, no_gpu && !pinned));
                     first_ready = true;
 #ifdef GTG_FEATURE_UPDATE
-                    ReportReadyForUpdate(executable);
+                    ReportReadyForUpdate(executable, no_gpu && !pinned);
 #endif
                 }
             }
             const bool clean = InterlockedCompareExchange(&view.value->clean_exit, 0, 0) != 0;
             const bool requested = InterlockedCompareExchange(&view.value->restart_requested, 0, 0) != 0;
+            const bool fresh = InterlockedCompareExchange(&view.value->fresh_start, 0, 0) != 0;
             // Awake time excludes suspend. Low UI frame rate alone does not trip this watchdog.
             const bool stalled = now - last_healthy >= options.watchdog_ms;
-            if (!termination_requested && (requested || stalled)) {
+            if (!termination_requested && (requested || fresh || stalled)) {
                 logging::Error(std::format(
                     L"SUPERVISOR terminating child pid={} reason={} clean_exit={} ready_seen={} heartbeat_age_ms={}; protection unverified",
-                    process.dwProcessId, requested ? L"recovery-request" : L"90s-no-valid-protection",
-                    clean, first_ready, heartbeat && now >= heartbeat ? now - heartbeat : now - launched));
-                termination_requested = TerminateProcess(child.value, requested ? kRecoveryExit : kHangExit) != FALSE;
+                    process.dwProcessId,
+                    requested ? L"recovery-request"
+                    : fresh   ? L"fresh-start"
+                              : L"90s-no-valid-protection",
+                    clean, first_ready,
+                    heartbeat && now >= heartbeat ? now - heartbeat : now - launched));
+                termination_requested = TerminateProcess(child.value, requested ? kRecoveryExit
+                                                                      : fresh   ? kFreshStartExit
+                                                                              : kHangExit) != FALSE;
                 // Never create a replacement until the process handle is signaled, even if termination stalls.
                 if (!termination_requested) return static_cast<int>(GetLastError());
             }
@@ -282,14 +319,19 @@ int RunSupervisor(const std::wstring& executable, int show_command, const Superv
         logging::Warning(std::format(L"SUPERVISOR child pid={} exited code=0x{:08X} user_exit={}",
             process.dwProcessId, exit_code, clean));
         if (clean) return static_cast<int>(exit_code);
-        if (InterlockedCompareExchange(&view.value->identity_ready, 0, 0))
-            memcpy(uuid.data(), view.value->uuid, uuid.size());
+        const bool pinned = InterlockedCompareExchange(&view.value->identity_ready, 0, 0) != 0;
+        if (pinned) memcpy(uuid.data(), view.value->uuid, uuid.size());
         uuid.back() = 0;
         if (first_ready) outage_begin = AwakeMs();
+        recovery = RelaunchAsRecovery(
+            InterlockedCompareExchange(&view.value->fresh_start, 0, 0) != 0, pinned);
+        if (!recovery) {
+            logging::Info(L"SUPERVISOR a GPU appeared; starting a fresh Tray to protect it");
+            continue;
+        }
         const unsigned delay = policy.NextDelayMs();
         logging::Warning(std::format(L"SUPERVISOR waiting {} ms before fresh NVML process; protection unavailable", delay));
         Sleep(delay);
-        recovery = true;
     }
 }
 }  // namespace gtg::supervision

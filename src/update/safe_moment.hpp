@@ -20,6 +20,9 @@ struct SafeInputs {
     int trigger_c{};
     // Overlay sessions installing, visible or hidden.
     unsigned overlay_sessions{};
+    // This machine has no NVIDIA GPU: no protection to interrupt and no
+    // temperature to wait for.
+    bool no_gpu{};
 };
 
 enum class Wait {
@@ -30,9 +33,11 @@ enum class Wait {
 };
 
 [[nodiscard]] constexpr Wait SafeMoment(const SafeInputs& in) noexcept {
-    if (!in.protection_idle) return Wait::Protection;
-    if (!in.temperature_c || *in.temperature_c > in.trigger_c - kSafeMarginC) {
-        return Wait::Temperature;
+    if (!in.no_gpu) {
+        if (!in.protection_idle) return Wait::Protection;
+        if (!in.temperature_c || *in.temperature_c > in.trigger_c - kSafeMarginC) {
+            return Wait::Temperature;
+        }
     }
     if (in.overlay_sessions > 0) return Wait::Overlay;
     return Wait::None;

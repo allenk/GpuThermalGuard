@@ -377,6 +377,13 @@ void TestSafeMoment() {
     Require(SafeMoment(in) == Wait::Overlay, "a game draws the overlay: wait");
     in.protection_idle = false;
     Require(SafeMoment(in) == Wait::Protection, "protection busy comes first");
+
+    // No NVIDIA GPU: no protection to interrupt and no temperature to wait for.
+    SafeInputs none;
+    none.no_gpu = true;
+    Require(SafeMoment(none) == Wait::None, "no GPU, no overlay: now");
+    none.overlay_sessions = 1;
+    Require(SafeMoment(none) == Wait::Overlay, "no GPU, a game draws the overlay: wait");
 }
 
 std::string Narrow(const std::wstring& text) {
@@ -787,6 +794,28 @@ void TestSourceKinds() {
             "not text, or too long: invalid");
 }
 
+// Which certificate staged files must be signed with: the administrator's for
+// any source, else the public releases' own for GitHub, else none.
+void TestPinInEffect() {
+    const std::optional<Digest> configured = ParseDigest(Hex64('A'));
+    Require(PinInEffect(configured, UpdateSource::Kind::Releases) == configured,
+            "a pin set wins over the public releases' own");
+    Require(PinInEffect(configured, UpdateSource::Kind::Folder) == configured,
+            "a pin set applies to a folder");
+    Require(PinInEffect(std::nullopt, UpdateSource::Kind::Releases) == kPublicReleaseSigner,
+            "GitHub without a pin: the public releases' certificate");
+    Require(!PinInEffect(std::nullopt, UpdateSource::Kind::Folder),
+            "a folder without a pin: none, as before");
+
+    // The built-in pin is the certificate the release workflow checks it signed with.
+    const std::string certificate = Get(std::filesystem::path(GTG_SOURCE_DIR) / "tools" / "update" /
+                                        "public-release-signer.cer");
+    Require(!certificate.empty(), "the public release certificate is in the tree");
+    const Sha256 sha;
+    Require(sha.Of(certificate) == kPublicReleaseSigner,
+            "the built-in pin is the SHA-256 of tools/update/public-release-signer.cer");
+}
+
 // The release reader end to end, against a server that answers as GitHub does:
 // the latest release redirects to its tag, the tag to a content host.
 void TestReleasesLoopback() {
@@ -1078,11 +1107,19 @@ void TestHandOff() {
     Require(Get(work / kScriptFileName) == answers, "the script written is the one given");
     Require(Get(work / "env.txt").find("left-by-a-shell") == std::string::npos,
             "the script does not inherit PSModulePath");
+    Require(!std::filesystem::exists(work / kUnprotectedFileName),
+            "a build that protects a GPU writes no unprotected file");
 
+    // A build with no GPU says so beside the plan, so the next build's
+    // supervisor may count a Tray without one as ready.
+    plan.unprotected = true;
     const HandOffResult early = HandOff(work, plan, "exit 5\n", self, 20'000);
+    plan.unprotected = false;
     Require(!early.ok && early.problem.find(L"5") != std::wstring::npos,
             "a script that ends early fails at once: " + Narrow(early.problem));
     Require(!std::filesystem::exists(work / kPlanFileName), "and its plan is deleted");
+    Require(std::filesystem::exists(work / kUnprotectedFileName),
+            "a build with no GPU writes the unprotected file");
 
     // Answers for another process, then waits for its plan to go.
     const std::string wrong =
@@ -1097,6 +1134,8 @@ void TestHandOff() {
             "no answer naming the script: it waits, then fails");
     Require(!std::filesystem::exists(work / kPlanFileName),
             "the plan is deleted, so a late script stops");
+    Require(!std::filesystem::exists(work / kUnprotectedFileName),
+            "a hand-off by a build that protects clears an unprotected file left behind");
 
     const HandOffResult no_parent = HandOff(work, plan, answers, 0, 2'000);
     Require(!no_parent.ok, "no supervisor to start it under");
@@ -1938,6 +1977,7 @@ int main(int argc, char** argv) {
         {"SourcePath", TestSourcePath},
         {"HttpRules", TestHttpRules},
         {"SourceKinds", TestSourceKinds},
+        {"PinInEffect", TestPinInEffect},
         {"ReleasesLoopback", TestReleasesLoopback},
         {"ReadBounded", TestReadBounded},
         {"LoadAndStage", TestLoadAndStage},

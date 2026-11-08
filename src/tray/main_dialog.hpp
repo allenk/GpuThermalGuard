@@ -357,6 +357,9 @@ private:
     HICON snapshot_icon_{nullptr};
     UINT current_status_icon_id_{0};
     bool nvml_ready_{false};
+    // No NVIDIA GPU here (protection::NoGpuHere): monitoring only. Never goes
+    // back: a GPU that appears gets a fresh Tray.
+    bool gpu_absent_{false};
     RestorePromptGate restore_prompt_gate_;
     unsigned int trigger_count_{0};
     std::uint32_t test_run_baseline_{0};

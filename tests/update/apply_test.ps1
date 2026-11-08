@@ -50,30 +50,34 @@ function Read-Json([string]$file) {
     try { return [IO.File]::ReadAllText($file) | ConvertFrom-Json } catch { return $null }
 }
 
+# The stand-ins append to lab.log while this reads it, each line through a
+# handle of its own: ReadAllText shares only reading and fails on that handle.
 function Get-Log([string]$dir) {
     $file = Join-Path $dir 'lab.log'
-    if (Test-Path -LiteralPath $file) { return [IO.File]::ReadAllText($file) }
-    return ''
+    if (-not (Test-Path -LiteralPath $file)) { return '' }
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $reader = New-Object IO.StreamReader((New-Object IO.FileStream($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)))
+    try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
 }
 
-function New-Install([string]$name) {
+function New-Install([string]$name, [string]$base) {
     $dir = Join-Path $Sandbox $name
     if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
     New-Item -ItemType Directory -Path (Join-Path $dir '_gtg_update\staged\TEST') | Out-Null
-    Copy-Variant $Standin (Join-Path $dir 'app.exe') 'base'
-    Copy-Variant $Overlay (Join-Path $dir 'gtg_overlay.dll') 'base'
+    Copy-Variant $Standin (Join-Path $dir 'app.exe') $base
+    Copy-Variant $Overlay (Join-Path $dir 'gtg_overlay.dll') $base
     return $dir
 }
 
-function Start-Install([string]$dir) {
+function Start-Install([string]$dir, [string]$base) {
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName = Join-Path $dir 'app.exe'
     $start.WorkingDirectory = $dir
     $start.UseShellExecute = $false
     [void][Diagnostics.Process]::Start($start)
     $ready = Join-Path $dir 'lab-ready.json'
-    if (-not (Wait-Until { $r = Read-Json $ready; $r -and $r.build -eq 'base' } 10000)) {
-        throw "the base build did not start in $dir"
+    if (-not (Wait-Until { $r = Read-Json $ready; $r -and $r.build -eq $base } 10000)) {
+        throw "the $base build did not start in $dir"
     }
     # The supervisor logs ready after five healthy observations; give it that.
     Start-Sleep -Milliseconds 1500
@@ -99,11 +103,11 @@ function Check([string]$scenario, [string]$what, [bool]$ok, [string]$detail) {
 
 function Invoke-Scenario {
     param([string]$Name, [string]$Build, [string]$Flags, [scriptblock]$Prepare,
-          [string]$Outcome, [string]$Running, [scriptblock]$Extra)
+          [string]$Outcome, [string]$Running, [scriptblock]$Extra, [string]$Base = 'base')
     if ($Only -and $Only -notcontains $Name) { return }
     Stop-Sandbox
-    $dir = New-Install $Name
-    $oldPid = Start-Install $dir
+    $dir = New-Install $Name $Base
+    $oldPid = Start-Install $dir $Base
     $staged = Join-Path $dir '_gtg_update\staged\TEST'
     Copy-Variant $Standin (Join-Path $staged 'app.exe') $Build
     Copy-Variant $Overlay (Join-Path $staged 'gtg_overlay.dll') $Build
@@ -158,6 +162,14 @@ try {
     }
 
     Invoke-Scenario -Name 'tamper' -Build 'next' -Flags 'tamper' -Outcome 'aborted' -Running 'base'
+
+    # No NVIDIA GPU before or after: the new build counts as ready without one.
+    Invoke-Scenario -Name 'nogpu' -Base 'nogpu-base' -Build 'nogpu-next' -Flags 'go' `
+        -Outcome 'updated' -Running 'nogpu-next'
+
+    # The old build protected a GPU; a new build that finds none is no good.
+    Invoke-Scenario -Name 'lost-gpu' -Build 'nogpu-next' -Flags 'go' -Outcome 'rolled_back' `
+        -Running 'base'
 
     Invoke-Scenario -Name 'hang' -Build 'next' -Flags 'hang' -Outcome 'aborted' -Running 'base' -Extra {
         param($dir, $oldPid)

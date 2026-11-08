@@ -21,7 +21,12 @@ DWORD SupervisorPid() noexcept;
 bool TakeRecoveryLatch() noexcept;
 void MarkCleanExit() noexcept;
 void ReportHealth(bool ready, bool valid_sample = true) noexcept;
+// The heartbeat of a Tray on a machine with no NVIDIA GPU: monitoring only.
+void ReportNoGpu() noexcept;
 void RequestRecovery() noexcept;
+// A GPU appeared while the Tray monitored only: replace it with a fresh Tray
+// that protects it.
+void RequestFreshStart() noexcept;
 std::string TargetUuid();
 bool PinTargetUuid(const std::string& uuid) noexcept;
 // Shared by Service and local protection; acquired on the writer thread.

@@ -20,6 +20,7 @@
 #include "snapshot/ui_snapshot.hpp"
 #include "tray/ui_theme.hpp"
 #include "tray/hotkey_capture.hpp"
+#include "tray/grey_icon.hpp"
 #include "tray/hosts_bridge.hpp"
 #include "tray/hosts_dialog.hpp"
 #ifdef GTG_FEATURE_OVERLAY
@@ -92,6 +93,9 @@ std::wstring Utf8ToWide(const std::string& text) {
                         static_cast<int>(text.size()), result.data(), size);
     return result;
 }
+
+// Not a resource: the armed icon drawn grey, for a machine with no NVIDIA GPU.
+constexpr UINT kTrayNoGpuIcon = 0x7FFF;
 
 HICON LoadSmallIcon(HWND window, UINT resource_id) {
     const int size = MulDiv(16, static_cast<int>(GetDpiForWindow(window)), 96);
@@ -742,10 +746,14 @@ LRESULT MainDialog::OnInitDialog(UINT, WPARAM, LPARAM, BOOL&) {
     taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
     activate_message_ = RegisterWindowMessageW(L"GpuThermalGuard.Activate.v1");
     nvml_ready_ = nvml_.Initialize();
-    if (!nvml_ready_) supervision::RequestRecovery();
-    logging::Info(nvml_ready_
-        ? std::format(L"NVML initialized; driver={}", Utf8ToWide(nvml_.driver_version()))
-        : std::format(L"NVML initialization failed: {}", Utf8ToWide(nvml_.last_error())));
+    gpu_absent_ = !nvml_ready_ && protection::NoGpuHere(nvml_);
+    if (!nvml_ready_ && !gpu_absent_) supervision::RequestRecovery();
+    logging::Info(
+        nvml_ready_
+            ? std::format(L"NVML initialized; driver={}", Utf8ToWide(nvml_.driver_version()))
+            : std::format(L"NVML initialization failed{}: {}",
+                          gpu_absent_ ? L" (no NVIDIA GPU; monitoring only)" : L"",
+                          Utf8ToWide(nvml_.last_error())));
     ipc::Response startup_service{};
     service_connected_ = ipc::Send(ipc::Command::Query, startup_service);
     if (service_connected_) {
@@ -1394,6 +1402,14 @@ LRESULT MainDialog::OnValidateSettings(WORD, WORD, HWND, BOOL&) {
                     MB_OK | MB_ICONWARNING);
         return 0;
     }
+    if (gpu_absent_) {
+        MessageBoxW(localization::Select(L"這台沒有 NVIDIA GPU，保護設定無處套用。",
+                                         L"There is no NVIDIA GPU here to apply protection "
+                                         L"settings to.")
+                        .data(),
+                    L"GPU Thermal Guard", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
     if (!local_protection_.RequestApply(candidate)) {
         MessageBoxW(localization::Select(L"監控核心尚未就緒或有待處理的套用要求。",
             L"Protection worker is unavailable or an Apply request is pending.").data(),
@@ -2039,6 +2055,7 @@ update::SafeInputs MainDialog::UpdateSafeInputs(const std::uint64_t now_ms) cons
         in.temperature_c = latest->temperature_c;
     }
     in.trigger_c = config_.trigger_temperature_c;
+    in.no_gpu = gpu_absent_;
 #ifdef GTG_FEATURE_OVERLAY
     const auto overlay = overlay::integration::GetStatus();
     in.overlay_sessions = overlay.installing + overlay.visible + overlay.hidden;
@@ -2198,7 +2215,7 @@ void MainDialog::RefreshSnapshot() {
     timing::SlowUiScope phase(L"main.snapshot.refresh");
     if (!nvml_ready_) {
         if (!service_connected_) HandleLocalProtection();
-        if (!gpu_unavailable_logged_) {
+        if (!gpu_unavailable_logged_ && !gpu_absent_) {
             logging::Error(std::format(L"GPU unavailable: {}", Utf8ToWide(nvml_.last_error())));
             gpu_unavailable_logged_ = true;
         }
@@ -2211,7 +2228,7 @@ void MainDialog::RefreshSnapshot() {
     }();
     if (devices.empty()) {
         if (!service_connected_) HandleLocalProtection();
-        if (!gpu_unavailable_logged_) {
+        if (!gpu_unavailable_logged_ && !gpu_absent_) {
             logging::Error(std::format(L"GPU probe failed: {}", Utf8ToWide(nvml_.last_error())));
             gpu_unavailable_logged_ = true;
         }
@@ -2283,13 +2300,26 @@ void MainDialog::RenderUnavailable(const std::wstring& status) {
                                   latest_cpu_utilization_percent_});
     history_chart_.NotifyDataChanged();
     osd_overlay_.RequestRefresh();
-    SetControlText(IDC_GPU_NAME, localization::Select(L"無法取得", L"Unavailable"));
+    SetControlText(IDC_GPU_NAME, gpu_absent_
+                                     ? localization::Select(L"沒有 NVIDIA GPU", L"No NVIDIA GPU")
+                                     : localization::Select(L"無法取得", L"Unavailable"));
     SetControlText(IDC_GPU_VBIOS, L"—");
     SetControlText(IDC_GPU_TEMP, L"—");
     SetControlText(IDC_GPU_POWER, L"—");
     SetControlText(IDC_GPU_VRAM, L"—");
     SetControlText(IDC_GPU_LIMIT, L"—");
     SetControlText(IDC_GPU_THERMAL, L"—");
+    if (gpu_absent_) {
+        // Neutral: the OSD and paired hosts show no protection, not a fault.
+        SetStatus(localization::Select(L"沒有 NVIDIA GPU：只監看，沒有保護",
+                                       L"No NVIDIA GPU: monitoring only, no protection"),
+                  StatusVisual::Neutral);
+        SetTrayVisual(kTrayNoGpuIcon,
+                      localization::Select(L"GPU Thermal Guard — 沒有 NVIDIA GPU，只監看",
+                                           L"GPU Thermal Guard — No NVIDIA GPU, monitoring only")
+                          .data());
+        return;
+    }
     SetStatus(status, StatusVisual::Fault);
     SetTrayVisual(IDI_TRAY_FAULT,
                   localization::Select(L"GPU Thermal Guard — GPU 無法存取",
@@ -2470,6 +2500,11 @@ void MainDialog::HandleLocalProtection() {
             NIIF_WARNING);
     }
 
+    // RenderUnavailable says it; there is no protection to present.
+    if (snapshot.gpu_absent) {
+        gpu_absent_ = true;
+        return;
+    }
     if (!snapshot.running || !snapshot.nvml_ready) {
         if (!snapshot.error.empty()) {
             SetStatus(Utf8ToWide(snapshot.error), StatusVisual::Fault);
@@ -2780,8 +2815,17 @@ void MainDialog::SetTrayVisual(UINT icon_id, const wchar_t* tooltip) {
     tray_data_.uFlags = NIF_TIP | NIF_SHOWTIP | NIF_GUID;
     HICON old = nullptr;
     if (icon_id != current_tray_icon_id_) {
-        HICON replacement = LoadSmallIcon(m_hWnd, icon_id);
+        HICON replacement =
+            LoadSmallIcon(m_hWnd, icon_id == kTrayNoGpuIcon ? IDI_TRAY_ARMED : icon_id);
         if (replacement == nullptr) return;
+        // The armed icon as it is if its pixels cannot be read; the tooltip
+        // still says there is no GPU.
+        if (icon_id == kTrayNoGpuIcon) {
+            if (HICON grey = GreyIcon(replacement); grey != nullptr) {
+                DestroyIcon(replacement);
+                replacement = grey;
+            }
+        }
 #ifdef GTG_FEATURE_UPDATE
         // Without the badge if the icon cannot be read; the tooltip still
         // says it.
