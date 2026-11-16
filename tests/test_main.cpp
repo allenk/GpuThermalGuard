@@ -48,6 +48,7 @@
 #include "topapp/details.hpp"
 #include "topapp/leader.hpp"
 #include "topapp/marquee.hpp"
+#include "topapp/memory_counters.hpp"
 #include "topapp/network_meter.hpp"
 #include "topapp/pdh_instance.hpp"
 #include "topapp/sampler.hpp"
@@ -4640,6 +4641,48 @@ void TestTopAppDetails() {
     Require(idle.pid == 0, "a process holding nothing is nobody's representative");
 }
 
+// A process's private bytes from what Windows filled in. A Windows that does
+// not know the larger structure still succeeds and reports the size it filled;
+// its private working set is then not a reading, and the commit charge is.
+void TestTopAppMemoryCounters() {
+    using gtg::topapp::MemoryCountersEx2;
+    using gtg::topapp::MemoryCountersRequest;
+    using gtg::topapp::PrivateBytes;
+
+    const auto filled = [](const DWORD cb, const SIZE_T commit, const SIZE_T working) {
+        MemoryCountersEx2 counters = MemoryCountersRequest();
+        counters.base.cb = cb;
+        counters.base.PrivateUsage = commit;
+        counters.private_working_set = working;
+        return counters;
+    };
+    const DWORD ex2 = sizeof(MemoryCountersEx2);
+    const DWORD ex = sizeof(PROCESS_MEMORY_COUNTERS_EX);
+
+    Require(PrivateBytes(filled(ex2, 9'000, 4'000)) == 4'000u,
+            "a Windows that knows it: the private working set");
+    Require(PrivateBytes(filled(ex2, 9'000, 0)) == 0u,
+            "a private working set of nothing is a reading");
+    const MemoryCountersEx2 request = MemoryCountersRequest();
+    Require(request.base.cb == ex2, "the request asks for the larger structure");
+    Require(PrivateBytes(filled(ex, 9'000, request.private_working_set)) == 9'000u,
+            "an older Windows fills less and says so: the commit charge");
+    Require(PrivateBytes(filled(ex2, 9'000, request.private_working_set)) == 9'000u,
+            "a private working set left as it was is not a reading, whatever cb says");
+    Require(PrivateBytes(filled(ex, 9'000, 4'000)) == 9'000u,
+            "nor is one beyond what cb says was filled, whatever it holds");
+    Require(!PrivateBytes(filled(sizeof(PROCESS_MEMORY_COUNTERS), 9'000, 4'000)).has_value(),
+            "too little filled to hold either: nothing");
+
+    MemoryCountersEx2 self = MemoryCountersRequest();
+    Require(K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&self),
+                                    sizeof(self)) != FALSE,
+            "this process's counters");
+    const auto bytes = PrivateBytes(self);
+    Require(bytes.has_value() && *bytes > 0, "this process holds private memory");
+}
+
 // A process's working directory: made one way, refused when it is not a place,
 // its last folder only where it says something about the app; then read back
 // from this process and from children started where the test chose.
@@ -5133,6 +5176,14 @@ void TestTopAppSamplerDetails() {
     const auto& table = *measured->details;
     Require(!table.rows.empty(), "the table has apps");
     Require(table.totals[static_cast<std::size_t>(Record::Ram)] > 0.0, "RAM's whole is known");
+    // Every app holds some memory. A RAM column of zeros is a reading that
+    // was never taken, and the table would then stand on CPU alone.
+    Require(std::any_of(table.rows.begin(), table.rows.end(),
+                        [](const gtg::topapp::DetailsRow& row) {
+                            const auto& ram = row.values[static_cast<std::size_t>(Record::Ram)];
+                            return ram.has_value() && *ram > 0.0;
+                        }),
+            "RAM is read, not zero for every app");
     for (const auto& row : table.rows) {
         Require(!row.name.empty() && row.processes >= 1, "every app is named and counted");
         Require(row.values[static_cast<std::size_t>(Record::Ram)].has_value() &&
@@ -7413,6 +7464,7 @@ int main(int argc, char** argv) {
         {"TopAppSweepBudget", TestTopAppSweepBudget},
         {"TopAppDetails", TestTopAppDetails},
         {"TopAppNetworkColumn", TestTopAppNetworkColumn},
+        {"TopAppMemoryCounters", TestTopAppMemoryCounters},
         {"TopAppWorkingDirectory", TestTopAppWorkingDirectory},
         {"TopAppSamplerDetails", TestTopAppSamplerDetails},
         {"OsdDetails", TestOsdDetails},

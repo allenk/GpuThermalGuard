@@ -23,6 +23,7 @@
 #include "topapp/app_name.hpp"
 #include "topapp/cpu_ledger.hpp"
 #include "topapp/leader.hpp"
+#include "topapp/memory_counters.hpp"
 #include "topapp/network_meter.hpp"
 #include "topapp/pdh_instance.hpp"
 #include "topapp/sweep_budget.hpp"
@@ -41,15 +42,6 @@ constexpr std::uint64_t kStaleRateMs = 10'000;
 // Paths are kept for processes seen recently, so a process that comes and
 // goes between sweeps is not asked again every time.
 constexpr std::uint64_t kPathRetentionSweeps = 30;
-
-// PROCESS_MEMORY_COUNTERS_EX2 is declared only for NTDDI_WIN10_CU and later;
-// this build targets plain Windows 10. Same layout, documented; a Windows
-// that does not know it rejects the size and the RAM half falls back.
-struct MemoryCountersEx2 {
-    PROCESS_MEMORY_COUNTERS_EX base;
-    SIZE_T private_working_set;
-    ULONG64 shared_commit;
-};
 
 template <typename T>
 T Resolve(const HMODULE module, const char* name) noexcept {
@@ -757,11 +749,10 @@ private:
         cached->second.generation = generation_;
         facts.path = cached->second.path;
         if (want_memory) {
-            MemoryCountersEx2 ex2{};
-            ex2.base.cb = sizeof(ex2);
+            MemoryCountersEx2 ex2 = MemoryCountersRequest();
             if (K32GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&ex2),
                                         sizeof(ex2))) {
-                facts.private_bytes = ex2.private_working_set;
+                facts.private_bytes = PrivateBytes(ex2);
             } else {
                 PROCESS_MEMORY_COUNTERS_EX ex{};
                 ex.cb = sizeof(ex);
