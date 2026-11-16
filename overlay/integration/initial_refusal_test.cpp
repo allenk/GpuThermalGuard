@@ -107,7 +107,7 @@ int main() {
         Check(ClassifyInspection(invalid) == InspectionState::Refused,
               "all previous refusal gates still prohibit fast activation");
     }
-    static_assert(sizeof(gtg::research::HookSection) == 712, "approved product v2 layout");
+    static_assert(sizeof(gtg::research::HookSection) == 832, "approved product v3 layout");
     volatile LONG ready{};
     const LONG exact_reasons[] = {-260, -261, -262, -263, -264, -265, -270, -271, -272};
     for (const LONG reason : exact_reasons) {

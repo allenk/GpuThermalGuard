@@ -11,7 +11,13 @@ GpuThermalGuard 持續監控 GPU telemetry；偵測到危險溫度或快速上�
 
 ![GTG 面板畫在 4K 的 Direct3D 12 遊戲畫面內：溫度、功率、VRAM、GPU、CPU、RAM、網路與 FPS，頂部是時鐘，FPS 卡上顯示已玩 19 分鐘](docs/images/overlay-dx12-4k.jpg)
 
-## 1.2 新功能
+## 1.3 新功能
+
+- **Direct3D 12 overlay 又掛得上了。** 某次 Windows 更新帶來的 Direct3D 12 runtime（`D3D12Core.dll` 10.0.26100.9818），`Signal` 開頭的指令太短，放不下 overlay 的 patch。從那之後，這台機器上的 Direct3D 12 遊戲全部被拒絕。現在 `Signal` 改成換掉 command queue vtable 裡的指標（[以 Splice 打造](#以-splice-打造)）。
+- **Details。** 對某個項目雙擊，就能看到背後前十名的 app：每個 app 的 GPU、VRAM、CPU、RAM 與網路用量，是哪個 process、在哪個資料夾工作（[Details](#details)）。
+- **Overlay 的 log 講得更清楚。** 啟動 log 會記下是哪個遊戲、它跑在哪一版 Direct3D 12 runtime 上，也分得出遊戲是被關掉，還是真的失敗。
+
+## 1.2 加入的功能
 
 - **從 GitHub 更新。** GTG 每天檢查一次本 Repository 的 Release，有新版就通知你。你同意之前什麼都不會裝；同意之後，它會挑一個不影響保護的時機更新、重新啟動，新版沒有正常啟動就自動退回原本的版本。區域網路上的共用資料夾也可以取代 GitHub 當更新來源（[更新](#更新)）。
 - **主機（Hosts）。** 同一個網路裡的 GTG 用一次性配對碼配對後，彼此會以第九個項目出現在對方的面板上。主機視窗也能幫它們更新，一台接一台（[主機](#主機)）。
@@ -124,6 +130,8 @@ OSD 永遠不會搶走鍵盤焦點，所以點 O 作用的對象，就是你剛�
 
 Overlay 透過 [Splice](https://github.com/allenk/splice) hook 遊戲送出畫面的路徑。Splice 是同一位作者開發的跨平台、型別安全的 C++ hook 函式庫。把 hook 安裝進一個 render thread 可能正在執行那段被替換程式碼的行程，是最困難的情況，Splice 就是被這個情況磨出來的：透過鄰近 relay 達成原子性的五位元組安裝、嚴格的精確位置安裝、協調那些卡在被修補程式碼裡的執行緒，以及 1.2 起把一組 hook 當成一次 transaction 安裝 —— 執行緒只列舉一次、只暫停一次，全有或全無。這個 overlay 的啟動 log 量到的安裝時間，以及這幾筆樣本的限制，寫在 [Splice 1.2 的說明](https://github.com/allenk/splice#new-in-120)。Splice 是本 repository 的 submodule，寫進遊戲的程式碼任何人都能檢視。
 
+Splice 1.3 加入另一種 hook method 的做法：不改函式的程式碼，改換物件 vtable 裡的指標。Overlay 只在 Direct3D 12 的 `Signal` 上這樣做，因為有一版 Windows runtime 讓這個函式開頭的指令短到放不下五位元組的 patch。換指標用的是 compare-and-swap：slot 裡還是 helper 從遊戲自己的 runtime 算出來的那個 `Signal`，才會換；已經被別的程式換掉的話，這個遊戲直接拒絕，不會疊上去。`Present` 還是原地 patch，因為 vtable 指標誰都能寫，同一個 slot 被別的 overlay 一寫就搶走了。詳見 [Splice 1.3 的說明](https://github.com/allenk/splice/blob/main/CHANGELOG.md#130---2026-11-15)。
+
 ## 桌面 OSD
 
 ### OSD 一覽
@@ -226,6 +234,17 @@ GPU、VRAM、CPU 或 RAM 持續偏高時，造成負載的程式名稱會出現�
 一般負載下什麼都不顯示。名稱取自程式本身的描述（Windows 顯示語言），沒有就用執行檔名，再縮短：去掉版本號和 `-Win64-Shipping` 這類建置後綴，最多 20 個字。同一個程式的多個行程會合併計算；每個 `svchost` 依它承載的服務命名；WSL 與其他虛擬機直接標成 WSL、虛擬機器；GTG 認不出來的行程一律不標。電腦裝了兩張 NVIDIA 顯示卡時，GPU 與 VRAM 不標名稱，不用猜的。名稱太長時，桌面 OSD 用跑馬燈，遊戲內 overlay 每兩秒換一頁。
 
 主視窗的 **高負載程式** 可以開關（預設開啟）。程式清單每秒讀一次，在低優先權的 thread 上跑，不碰 NVML，也不碰保護迴圈；這個 thread 用掉的 CPU 超過上限時會自己暫停一分鐘。顯示過的名稱會寫進診斷 log。
+
+### Details
+
+曲線上的名字只告訴你誰排第一，**Details** 把其他的也列出來。在展開 OSD 對 GPU、VRAM、CPU 或 RAM 雙擊（lane 或卡片都可以），同一個視窗、同一個頂部底下就換成前十名 app 的表格，排法跟工作管理員差不多：一列一個 app，附上它有幾個 process，GPU、VRAM、CPU、RAM、NET 五欄各自依佔整體的比例上色。一打開是照你雙擊的那個項目排序，點欄位標題可以換。沒在用的 app 不會列出來。
+
+- **精簡 OSD 也能開。** 每個 cell 雙擊都會開 Details，只有 RAM 和 NET 維持原本的雙擊功能。展開 OSD 頂部、chevron 左邊的列表按鈕會開在 GPU；沒有 GPU 欄時（沒有 NVIDIA GPU，或不只一張）開在 CPU。
+- **到底是哪個 process。** 一個 app 可能有好幾個 process，同一個 `python.exe` 底下可能是兩個毫不相干的 server。所以 Details 每一列、每一欄都記下用量最大的那個 process。點 **應用程式** 標題，名稱會換成那個 process 的工作位置（工作目錄的最後一層），再點一次換成 PID。滑鼠停在某一列，底部會顯示 `PID · 路徑`；雙擊那一列，用檔案總管開啟那個資料夾，只限本機磁碟，網路路徑一律不開。GTG 只讀 64 位元 process 的工作目錄，只在 Details 開著時讀，而且從不讀 command line，因為裡面可能帶著金鑰。
+- **每個 app 的網路。** NET 欄單位是 MB/s，來自 Kernel-Network ETW trace。這個 trace 只在 Details 開著時跑，而且需要系統管理員權限，沒有的話欄位會直接說。流量算在 Windows 歸給誰的那一邊：跟別台機器之間的 SMB 算 System，WSL 經 NAT 往外送的流量完全看不到，Windows 與 WSL 之間的流量算在 Windows 這端。
+- **動作。** 依 RAM 排序時，右上角是 **回收**（[釋放主機記憶體](#釋放主機記憶體)）；依 NET 排序時是 **測延遲**（[網路路徑的評價](#網路路徑的評價)）。
+
+按 `‹` 回到 lane 或卡片。收合或隱藏 OSD 都會關掉 Details，遊戲內 overlay 也從來不畫它。表格的資料跟高負載程式來自同一個低優先權的 sampler，多出來的工作只在 Details 開著時做；就算 **高負載程式** 關著，開 Details 時它也會跑。
 
 ### 可選的主機 RAM
 

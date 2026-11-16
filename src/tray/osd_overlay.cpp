@@ -16,6 +16,8 @@
 #include <windowsx.h>
 #include <gdiplus.h>
 #include <dwmapi.h>
+#include <objbase.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <cmath>
@@ -325,6 +327,23 @@ std::optional<topapp::Record> AlertRecord(const compact::Metric metric) noexcept
         default:
             return std::nullopt;
     }
+}
+
+// The record a Details column is drawn as, for its accent.
+compact::Metric MetricOf(const topapp::Column column) noexcept {
+    switch (column) {
+        case topapp::Column::Gpu:
+            return compact::Metric::Gpu;
+        case topapp::Column::Vram:
+            return compact::Metric::Vram;
+        case topapp::Column::Cpu:
+            return compact::Metric::Cpu;
+        case topapp::Column::Ram:
+            return compact::Metric::Ram;
+        case topapp::Column::Network:
+            return compact::Metric::Network;
+    }
+    return compact::Metric::Gpu;
 }
 
 // One line drawn in pieces, so a piece can differ in colour.
@@ -1226,9 +1245,9 @@ void OsdOverlay::SetOverlayMark(const OverlayMark mark) noexcept {
     if (mark == OverlayMark::None) overlay_gesture_.Cancel();
     // The busy indicator is the O while an attach runs: it turns on its own
     // 33 ms timer over the O, so the dashboard keeps its 500 ms cadence.
-    // It is shared with cell actions, so
-    // only one started here (action_slot_ < 0) is ever ended here.
-    const bool spinning = busy_indicator_.Active() && action_slot_ < 0;
+    // It is shared with the actions of cells and Details, so only one started
+    // here -- standing for no action -- is ever ended here.
+    const bool spinning = busy_indicator_.Active() && active_action_ == CellAction::None;
     if (mark == OverlayMark::Installing) {
         if (!spinning && !busy_indicator_.Active() && !move_grab_ && Visible()) {
             const Layout layout = CurrentLayout();
@@ -1263,6 +1282,12 @@ bool OsdOverlay::TitleShown() const noexcept {
     const Layout layout = CurrentLayout();
     const int widest_columns = layout.columns < 0 ? -layout.columns : layout.columns;
     return !collapsed_ || compact::HeaderShowsTitle(widest_columns);
+}
+
+bool OsdOverlay::DetailsButtonHit(const POINT point) const noexcept {
+    if (!ShowsDetailsButton()) return false;
+    const Layout layout = CurrentLayout();
+    return details::ButtonHit(point.x, point.y, layout.width, layout.drag_height);
 }
 
 bool OsdOverlay::OverlayHit(const POINT point) const noexcept {
@@ -1304,6 +1329,7 @@ void OsdOverlay::SetVisible(const bool should_show) {
     } else {
         toggle_gesture_.Cancel();
         fold_gesture_.Cancel();
+        details_button_gesture_.Cancel();
         if (::GetCapture() == m_hWnd ||
             (drag_handle_.m_hWnd != nullptr && ::GetCapture() == drag_handle_.m_hWnd))
             ::ReleaseCapture();
@@ -1315,6 +1341,11 @@ void OsdOverlay::SetVisible(const bool should_show) {
         if (drag_handle_.m_hWnd != nullptr) drag_handle_.ShowWindow(SW_HIDE);
         EndAction();
         ShowWindow(SW_HIDE);
+        // Nobody can read or close Details now, and the sampler should stop
+        // sweeping for it. This is also the in-game overlay taking over. A
+        // window that borrowed the expanded shape from a cell comes back as
+        // the cells -- after the hide, so the change of shape is not seen.
+        LeaveDetails(false);
         // After the hide, not before: the cadence is decided by asking who
         // wants frames, and this window only stops wanting them once it is
         // actually hidden.
@@ -1508,9 +1539,11 @@ LRESULT OsdOverlay::OnNcHitTest(UINT, WPARAM, const LPARAM lparam, BOOL&) {
 #else
     POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     ScreenToClient(&point);
-    // Both header controls must be carved out of the caption band or Windows
-    // turns the press into a window drag and no button message ever arrives.
-    if (ToggleHit(point) || LockHit(point) || OverlayHit(point)) return HTCLIENT;
+    // Every header control must be carved out of the caption band or Windows
+    // turns the press into a window drag and no button message ever arrives --
+    // which is how the Details button first shipped, drawn and dead.
+    if (ToggleHit(point) || LockHit(point) || OverlayHit(point) || DetailsButtonHit(point))
+        return HTCLIENT;
     if (point.y >= 0 && point.y < CurrentLayout().drag_height) return HTCAPTION;
     return HTCLIENT;
 #endif
@@ -1569,6 +1602,12 @@ LRESULT OsdOverlay::OnDragMove(UINT, WPARAM, const LPARAM point, BOOL& handled) 
                                         static_cast<short>(screen.y)));
                 return 0;
             }
+        }
+        // The row under the pointer, whose process the footer names.
+        const int hover = DetailsRowAt({GET_X_LPARAM(point), GET_Y_LPARAM(point)});
+        if (hover != details_hover_) {
+            details_hover_ = hover;
+            RenderLatest();
         }
         handled = FALSE;
         return 0;
@@ -1975,11 +2014,92 @@ void OsdBusyIndicator::Paint() noexcept {
     ::ReleaseDC(nullptr, screen);
 }
 
+namespace {
+
+// Set while a directory is being shown: one at a time.
+std::atomic<bool> showing_directory{false};
+
+// Shows `directory` in the reader's Explorer, if it is a directory on a fixed
+// local drive. GTG is elevated and the path came from another process's
+// memory, so it is opened as a folder whatever it turns out to be -- the
+// Folder class's "open", never the path's own, which for a program is to run
+// it, elevated. Explorer hands a window an elevated program asks for to the
+// reader's own, unelevated shell.
+void ShowDirectoryNow(const std::wstring& directory) noexcept {
+    if (!details::ShowableDirectory(directory)) return;
+    const wchar_t root[]{directory[0], L':', L'\\', L'\0'};
+    if (GetDriveTypeW(root) != DRIVE_FIXED) return;
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        return;
+    // As the shell asks of its callers: an STA, without OLE1 DDE.
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_CLASSNAME | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    info.lpVerb = L"open";
+    info.lpFile = directory.c_str();
+    info.lpClass = L"Folder";
+    info.nShow = SW_SHOWNORMAL;
+    (void)ShellExecuteExW(&info);
+    if (SUCCEEDED(com)) CoUninitialize();
+}
+
+// On a thread of its own, detached: a call into the shell has no bound, and
+// nothing of the OSD may wait on Explorer. The thread holds its own copy of
+// the path and touches nothing else. False when one is already opening.
+bool ShowDirectory(std::wstring directory) noexcept {
+    bool idle = false;
+    if (!showing_directory.compare_exchange_strong(idle, true, std::memory_order_acq_rel))
+        return false;
+    try {
+        std::thread([directory = std::move(directory)]() noexcept {
+            ShowDirectoryNow(directory);
+            showing_directory.store(false, std::memory_order_release);
+        }).detach();
+        return true;
+    } catch (...) {
+        showing_directory.store(false, std::memory_order_release);
+        return false;
+    }
+}
+
+}  // namespace
+
 // A double-click on a cell activates that record. Only while the dashboard is
 // locked: unlocked is arrange mode and keeps the drag gesture it already has,
-// so the two can never be confused with one another.
+// so the two can never be confused with one another. A record's own action
+// comes first; a record without one opens Details, sorted by its own column
+// or by GPU's (details::ColumnFor). The lanes and cards have no actions, so
+// any of them opens Details; a compact cell lends Details the expanded shape
+// until it closes. In Details, a row shows where its process works, where
+// that says anything (details::NameFor).
 LRESULT OsdOverlay::OnCellActivate(UINT, WPARAM, const LPARAM point, BOOL& handled) {
-    if (!collapsed_ || !compact_locked_ || !ShowsLock()) {
+    if (!collapsed_) {
+#if !GTG_OSD_CLICK_THROUGH
+        if (ShowsDetails()) {
+            const topapp::DetailsRow* row =
+                ListedDetailsRow(DetailsRowAt({GET_X_LPARAM(point), GET_Y_LPARAM(point)}));
+            if (row != nullptr) {
+                const auto& who = row->representatives[static_cast<std::size_t>(*details_record_)];
+                if (!who.folder.empty()) (void)ShowDirectory(who.directory);
+            }
+        } else if (!details_record_) {
+            const Layout layout = CurrentLayout();
+            const float s = layout.scale;
+            const auto placed = CurrentPlacement();
+            const int slot = details::ExpandedSlotAt(
+                cards_, placed.count, static_cast<float>(layout.width) / s,
+                static_cast<float>(layout.height) / s, static_cast<float>(GET_X_LPARAM(point)) / s,
+                static_cast<float>(GET_Y_LPARAM(point)) / s);
+            if (slot >= 0) {
+                OpenDetails(details::ColumnFor(placed.cells[static_cast<std::size_t>(slot)]));
+            }
+        }
+#endif
+        return 0;
+    }
+    if (!compact_locked_ || !ShowsLock()) {
         handled = FALSE;
         return 0;
     }
@@ -1998,9 +2118,13 @@ LRESULT OsdOverlay::OnCellActivate(UINT, WPARAM, const LPARAM point, BOOL& handl
     if (FoldHit(cursor)) return 0;
     const int slot = compact::CellSlotAt(grid, placed, cursor.x, cursor.y);
     if (slot < 0) return 0;
-    // Two records have an action. Every other one ignores the gesture rather
-    // than pretending to do something.
-    switch (placed.cells[static_cast<std::size_t>(slot)]) {
+    // Two records have an action of their own; every other one opens Details.
+    const compact::Metric metric = placed.cells[static_cast<std::size_t>(slot)];
+    if (!details::CellHasAction(metric)) {
+        OpenDetailsFromCompact(details::ColumnFor(metric));
+        return 0;
+    }
+    switch (metric) {
         case compact::Metric::Ram: BeginReclaim(slot); break;
         case compact::Metric::Network: BeginNetworkProbe(slot); break;
         default: break;
@@ -2018,11 +2142,6 @@ bool OsdOverlay::BeginAction(const int slot,
         if (action_worker_.joinable()) action_worker_.join();
 
         const auto geometry = CurrentLayout();
-        const auto grid = compact::MakeCellGrid(geometry.columns, geometry.width,
-                                                geometry.scale);
-        const auto placed = CurrentPlacement();
-        const auto origin = compact::CellOriginAt(grid, placed, slot);
-        action_slot_ = slot;
         RECT window_rect{};
         if (GetWindowRect(&window_rect) == FALSE) return false;
         // Round, do not truncate. A cell is 51 dip tall, which is 127.5 px at
@@ -2033,12 +2152,33 @@ bool OsdOverlay::BeginAction(const int slot,
         const auto round_to_px = [](const float value) {
             return static_cast<int>(value + 0.5F);
         };
-        const int left = window_rect.left + round_to_px(origin.x);
-        const int top = window_rect.top + round_to_px(origin.y);
-        const RECT cell{
-            left, top,
-            left + round_to_px(grid.cell_width_dip * geometry.scale),
-            top + round_to_px(compact::kCellHeightDip * geometry.scale)};
+        // A cell's box, or for Details' action a cell-sized box over the
+        // control and the headings under it.
+        float origin_x = 0.0F;
+        float origin_y = 0.0F;
+        float box_width = 0.0F;
+        if (slot >= 0) {
+            const auto grid =
+                compact::MakeCellGrid(geometry.columns, geometry.width, geometry.scale);
+            const auto origin = compact::CellOriginAt(grid, CurrentPlacement(), slot);
+            origin_x = origin.x;
+            origin_y = origin.y;
+            box_width = grid.cell_width_dip * geometry.scale;
+        } else {
+            if (!ShowsDetails()) return false;
+            const float s = geometry.scale;
+            const auto box = details::BusyBox(details::MakeGeometry(
+                static_cast<float>(geometry.width) / s, static_cast<float>(geometry.height) / s,
+                static_cast<int>(topapp::kDetailsRows)));
+            origin_x = box.x * s;
+            origin_y = box.y * s;
+            box_width = box.width * s;
+        }
+        action_slot_ = slot;
+        const int left = window_rect.left + round_to_px(origin_x);
+        const int top = window_rect.top + round_to_px(origin_y);
+        const RECT cell{left, top, left + round_to_px(box_width),
+                        top + round_to_px(compact::kCellHeightDip * geometry.scale)};
 
         const Gdiplus::Color accent = Accent(metric);
         const std::uint32_t argb =
@@ -2412,6 +2552,19 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
         compact::LockHit(cursor.x, cursor.y, geometry.width, geometry.drag_height);
     const bool on_overlay = OverlayHit(cursor);
     const bool on_fold = FoldHit(cursor);
+    const bool on_details_button = DetailsButtonHit(cursor);
+    // Details' back control, its action where the sorted column has one, and
+    // its column headings.
+    details::Hit on_details{};
+    if (ShowsDetails()) {
+        const float s = geometry.scale;
+        const auto box = details::MakeGeometry(static_cast<float>(geometry.width) / s,
+                                               static_cast<float>(geometry.height) / s,
+                                               static_cast<int>(topapp::kDetailsRows));
+        on_details = details::HitTest(box, static_cast<float>(cursor.x) / s,
+                                      static_cast<float>(cursor.y) / s,
+                                      details::ActionOf(*details_record_) != details::Action::None);
+    }
 
     if (message == WM_LBUTTONDOWN) {
         if (on_overlay) {
@@ -2428,6 +2581,17 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
         }
         if (on_lock) {
             lock_gesture_.Press(true, cursor.x, cursor.y);
+            ::SetCapture(input_window);
+            return 0;
+        }
+        if (on_details_button) {
+            details_button_gesture_.Press(true, cursor.x, cursor.y);
+            ::SetCapture(input_window);
+            return 0;
+        }
+        if (on_details.target != details::Target::None) {
+            details_gesture_.Press(true, cursor.x, cursor.y);
+            details_pressed_ = on_details;
             ::SetCapture(input_window);
             return 0;
         }
@@ -2467,11 +2631,52 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
         const bool lock_click = lock_gesture_.Release(on_lock && captured);
         const bool overlay_click = overlay_gesture_.Release(on_overlay && captured);
         const bool fold_click = fold_gesture_.Release(on_fold && captured);
+        const bool details_button_click =
+            details_button_gesture_.Release(on_details_button && captured);
+        // Released on what it was pressed on: a press on one heading and a
+        // release on the next sorts by neither.
+        const bool details_click =
+            details_gesture_.Release(captured && on_details == details_pressed_);
+        const details::Hit details_hit = details_pressed_;
+        details_pressed_ = {};
         const bool toggle = toggle_gesture_.Release(on_chevron && captured);
         if (captured) ::ReleaseCapture();
         EndDragImage();
         if (from_slot >= 0) {
             if (captured) FinishArrangement(from_slot, cursor);
+        } else if (details_click) {
+            if (details_hit.target == details::Target::Sort) {
+                // The reader's column from now on, GPU included.
+                details_record_ = details_hit.column;
+                details_opening_column_ = false;
+                RenderLatest();
+            } else if (details_hit.target == details::Target::Name) {
+                details_view_ = details::NextView(details_view_);
+                RenderLatest();
+            } else if (details_hit.target == details::Target::Action) {
+                // The column's own action, as its compact cell would run it on a
+                // double-click; the indicator stands over the control.
+                switch (details::ActionOf(*details_record_)) {
+                    case details::Action::Reclaim:
+                        BeginReclaim(-1);
+                        break;
+                    case details::Action::Latency:
+                        BeginNetworkProbe(-1);
+                        break;
+                    case details::Action::None:
+                        break;
+                }
+            } else {
+                LeaveDetails(true);
+            }
+        } else if (details_button_click) {
+            // The button opens Details on GPU, the dashboard's own subject,
+            // and closes it again when it is open.
+            if (details_record_) {
+                LeaveDetails(true);
+            } else {
+                OpenDetails(topapp::Column::Gpu);
+            }
         } else if (fold_click) {
             ToggleTiny();
         } else if (overlay_click) {
@@ -2494,6 +2699,9 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
     lock_gesture_.Cancel();
     toggle_gesture_.Cancel();
     fold_gesture_.Cancel();
+    details_gesture_.Cancel();
+    details_button_gesture_.Cancel();
+    details_pressed_ = {};
     EndDragImage();
     EndAction();
     if (message == WM_CANCELMODE && ::GetCapture() == input_window)
@@ -2502,6 +2710,15 @@ LRESULT OsdOverlay::HandleTogglePointer(const UINT message, const HWND input_win
 }
 
 void OsdOverlay::ToggleCollapsed() noexcept {
+    // Details belongs to the expanded view: collapsing leaves it, and the
+    // next expand shows the lanes or cards again. Opened from a cell, that is
+    // also the way back to the cells.
+    ForgetDetails();
+    SwitchShape();
+    RenderLatest();
+}
+
+void OsdOverlay::SwitchShape() noexcept {
     // The expanded view has no cells, so an indicator pinned to one would be
     // left floating over a lane.
     EndAction();
@@ -2516,7 +2733,6 @@ void OsdOverlay::ToggleCollapsed() noexcept {
     (void)FitToWorkArea(next, layout);
     ApplyPosition(next, layout);
     positions_.For(collapsed_) = next;
-    RenderLatest();
 }
 
 void OsdOverlay::ToggleTiny() noexcept {
@@ -2573,6 +2789,94 @@ void OsdOverlay::SetHosts(osd_hosts::View view) noexcept {
         return;
     }
     if (hosts_enabled_) RequestRefresh();
+}
+
+void OsdOverlay::OpenDetails(const topapp::Column column) noexcept {
+    if (collapsed_) return;
+    details_record_ = details::OpeningColumn(column, details_available_);
+    details_opening_column_ = true;
+    // A table left from an earlier opening describes another moment.
+    details_.reset();
+    details_gesture_.Cancel();
+    details_pressed_ = {};
+    details_view_ = details::NameView::Name;
+    details_hover_ = -1;
+    RenderLatest();
+}
+
+void OsdOverlay::OpenDetailsFromCompact(const topapp::Column column) noexcept {
+    if (!collapsed_) {
+        OpenDetails(column);
+        return;
+    }
+    // Expanded with the chevron kept in place, as the chevron would; one
+    // frame is drawn, and it is already Details.
+    ForgetDetails();
+    SwitchShape();
+    OpenDetails(column);
+    details_from_compact_ = true;
+}
+
+void OsdOverlay::LeaveDetails(const bool draw) noexcept {
+    if (!details_record_) return;
+    // An indicator standing over Details' action would be left over a lane.
+    if (DetailsActionRunning()) EndAction();
+    const bool back_to_compact = details_from_compact_;
+    ForgetDetails();
+    if (back_to_compact && !collapsed_) SwitchShape();
+    if (draw) RenderLatest();
+}
+
+void OsdOverlay::ForgetDetails() noexcept {
+    details_record_.reset();
+    details_.reset();
+    details_gesture_.Cancel();
+    details_pressed_ = {};
+    details_from_compact_ = false;
+    details_view_ = details::NameView::Name;
+    details_hover_ = -1;
+    details_opening_column_ = false;
+}
+
+int OsdOverlay::DetailsRowAt(const POINT point) const noexcept {
+    if (!ShowsDetails()) return -1;
+    const Layout layout = CurrentLayout();
+    const float s = layout.scale;
+    const auto geometry = details::MakeGeometry(static_cast<float>(layout.width) / s,
+                                                static_cast<float>(layout.height) / s,
+                                                static_cast<int>(topapp::kDetailsRows));
+    return details::RowIndexAt(geometry, static_cast<float>(point.x) / s,
+                               static_cast<float>(point.y) / s);
+}
+
+// The table's row listed at `index`, as the painter lists them, or null.
+const topapp::DetailsRow* OsdOverlay::ListedDetailsRow(const int index) const noexcept {
+    if (index < 0 || !details_record_ || !details_) return nullptr;
+    try {
+        const auto listed =
+            details::Listed(&*details_, *details_record_, static_cast<int>(topapp::kDetailsRows));
+        if (static_cast<std::size_t>(index) >= listed.size()) return nullptr;
+        return &details_->rows[listed[static_cast<std::size_t>(index)]];
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void OsdOverlay::SetTopAppDetails(const topapp::Details& details) noexcept {
+    if (!details_record_) return;
+    if (details_ && *details_ == details) return;
+    try {
+        details_ = details;
+    } catch (...) {
+        return;
+    }
+    // A paused sweep's table has no columns and says nothing about them.
+    if (!details.paused) {
+        details_available_ = details.available;
+        if (details_opening_column_)
+            details_record_ = details::OpeningColumn(*details_record_, details_available_);
+    }
+    RequestRefresh();
 }
 
 void OsdOverlay::SetTopAppAlerts(const std::uint32_t mask) noexcept {
@@ -2654,7 +2958,7 @@ LRESULT OsdOverlay::OnPowerBroadcast(UINT, const WPARAM event,
 LRESULT OsdOverlay::OnEnterSizeMove(UINT, WPARAM, LPARAM, BOOL&) {
     // The turning O is a separate popup and would be left behind.
     if (overlay_mark_ == OverlayMark::Installing && busy_indicator_.Active() &&
-        action_slot_ < 0) {
+        active_action_ == CellAction::None) {
         busy_indicator_.End();
     }
     BeginMove(m_hWnd);
@@ -3186,6 +3490,10 @@ void OsdOverlay::UpdateHeaderIdle(const std::uint64_t now_ms) noexcept {
     if (present) {
         last_pointer_ms_ = now_ms;
         awake_after_overlay_ = false;  // visited: the ordinary rule resumes
+    } else {
+        // No WM_MOUSELEAVE is tracked: the pointer gone, the footer is the
+        // table's again from this tick's render.
+        details_hover_ = -1;
     }
     header_idle_ = !awake_after_overlay_ &&
                    compact::HeaderIdle(present, Arrangeable(), now_ms, last_pointer_ms_);
@@ -3729,7 +4037,7 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
     // Yellow is play time's, the only yellow on the dashboard.
     const bool in_game_copy = header == HeaderMode::GameClock;
     const bool o_spinning = !in_game_copy && overlay_mark_ == OverlayMark::Installing &&
-                            busy_indicator_.Active() && action_slot_ < 0;
+                            busy_indicator_.Active() && active_action_ == CellAction::None;
     if ((in_game_copy || overlay_mark_ != OverlayMark::None) && !o_spinning) {
         const float mark_left = compact::OverlayMarkLeftDip(show_title) * s;
         const Gdiplus::RectF mark(mark_left, (12.0F - compact::kOverlayMarkHeightDip / 2.0F) * s,
@@ -3757,10 +4065,10 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
     // The clock takes the buttons' place: "23:59:59" at the title font, with
     // the same right margin the buttons leave.
     const float clock_width = 50.0F * s;
-    const float header_buttons = show_clock
-        ? clock_width
-        : static_cast<float>(compact::HeaderButtonWidth(layout.drag_height)) *
-              (ShowsLock() ? 2.0F : 1.0F);
+    const float header_buttons =
+        show_clock ? clock_width
+                   : static_cast<float>(compact::HeaderButtonWidth(layout.drag_height)) *
+                         (ShowsLock() || ShowsDetailsButton() ? 2.0F : 1.0F);
     // Two cells across leaves 48 dip for the status, which fits only the
     // shortest Chinese string. Rather than truncate a warning into an
     // ellipsis, the header keeps the dot and drops the words: the colour
@@ -3876,6 +4184,31 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
         } else {
             Gdiplus::SolidBrush fill(lock_tint);
             graphics.FillRectangle(&fill, body);
+        }
+    }
+
+    // Details' button, in the lock's square of the expanded header: a list,
+    // three rows of a dot and a line, centred on the plate as the other
+    // glyphs are. While Details is open the plate is lit, and the button
+    // closes it.
+    if (!show_clock && ShowsDetailsButton()) {
+        const float list_x = button_x - button_w;
+        Gdiplus::SolidBrush plate(details_record_ ? Gdiplus::Color(64, 203, 215, 231)
+                                                  : Gdiplus::Color(22, 203, 215, 231));
+        graphics.FillRectangle(&plate, list_x + 3.0F * bs, button_y + 3.0F * bs, 19.0F * bs,
+                               19.0F * bs);
+        const Gdiplus::Color ink(235, 224, 235, 248);
+        Gdiplus::SolidBrush dot_ink(ink);
+        Gdiplus::Pen line(ink, 1.4F * bs);
+        line.SetStartCap(Gdiplus::LineCapRound);
+        line.SetEndCap(Gdiplus::LineCapRound);
+        // The plate runs 3..22 units on both axes; the glyph spans 7.35..17.65
+        // across and 9..16 down, both centred on 12.5.
+        for (int row = 0; row < 3; ++row) {
+            const float y = button_y + (9.0F + 3.5F * static_cast<float>(row)) * bs;
+            graphics.FillEllipse(&dot_ink, list_x + 7.35F * bs, y - 0.9F * bs, 1.8F * bs,
+                                 1.8F * bs);
+            graphics.DrawLine(&line, list_x + 11.0F * bs, y, list_x + 17.65F * bs, y);
         }
     }
 
@@ -4314,6 +4647,10 @@ void OsdOverlay::DrawSurface(Gdiplus::Graphics& graphics, const Layout& layout,
                 float_name(*record, spark_bounds, kAlertCellEmDip * s, accent);
             }
         }
+    } else if (details_record_ && header != HeaderMode::GameClock) {
+        // The game's copy cannot be clicked, so it never shows a table it
+        // could not close: it keeps the lanes or cards.
+        DrawDetails(graphics, layout, stale ? nullptr : displayed_sample);
     } else if (cards_) {
         DrawCards(graphics, layout, now_ms, displayed_sample, stale, start, end, deferred);
     } else {
@@ -4842,6 +5179,444 @@ void OsdOverlay::DrawCards(Gdiplus::Graphics& graphics, const Layout& layout,
 
 // Tiny's cell: one bar per placed record, in the reader's order, each with its
 // initial under it, and no values.
+namespace {
+
+// The column's name in Details' title and headings.
+std::wstring DetailsLabel(const topapp::Column column) {
+    switch (column) {
+        case topapp::Column::Gpu:
+            return L"GPU";
+        case topapp::Column::Vram:
+            return L"VRAM";
+        case topapp::Column::Cpu:
+            return L"CPU";
+        case topapp::Column::Ram:
+            return L"RAM";
+        case topapp::Column::Network:
+            return L"NET";
+    }
+    return {};
+}
+
+// A heading also carries the unit where the cells cannot: NET's figures are
+// bare MB/s, the one unit the network is shown in.
+std::wstring DetailsHeading(const topapp::Column column) {
+    return column == topapp::Column::Network ? L"NET MB/s" : DetailsLabel(column);
+}
+
+// The App heading says what the column shows; clicking it switches.
+std::wstring_view NameHeading(const details::NameView view) {
+    switch (view) {
+        case details::NameView::Location:
+            return localization::Select(L"位置", L"Location");
+        case details::NameView::Pid:
+            return L"PID";
+        case details::NameView::Name:
+            break;
+    }
+    return localization::Select(L"應用程式", L"App");
+}
+
+// The word on a column's action.
+std::wstring_view DetailsActionLabel(const details::Action action) {
+    switch (action) {
+        case details::Action::Reclaim:
+            return localization::Select(L"回收", L"Reclaim");
+        case details::Action::Latency:
+            return localization::Select(L"測延遲", L"Latency");
+        case details::Action::None:
+            break;
+    }
+    return {};
+}
+
+// The back control at the title's start: the header buttons' plate with a
+// chevron.
+void DrawDetailsBack(Gdiplus::Graphics& graphics, const Gdiplus::RectF& box, const float s) {
+    Gdiplus::GraphicsPath plate;
+    AddRoundedRectangle(plate, box, 3.0F * s);
+    Gdiplus::SolidBrush fill(Gdiplus::Color(30, 203, 215, 231));
+    graphics.FillPath(&fill, &plate);
+    Gdiplus::Pen pen(Gdiplus::Color(235, 224, 235, 248), 1.5F * s);
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    const float cx = box.X + box.Width / 2.0F;
+    const float cy = box.Y + box.Height / 2.0F;
+    const float arm = 4.0F * s;
+    const Gdiplus::PointF chevron[]{
+        {cx + arm / 2.0F, cy - arm}, {cx - arm / 2.0F, cy}, {cx + arm / 2.0F, cy + arm}};
+    graphics.DrawLines(&pen, chevron, 3);
+}
+
+// The action at the title's end: a word on a plate outlined in the column's
+// accent, so it reads as something the column does rather than a way out.
+void DrawDetailsAction(Gdiplus::Graphics& graphics, const Gdiplus::RectF& box,
+                       const std::wstring_view label, const Gdiplus::Color accent,
+                       Gdiplus::Font& font, const float s) {
+    Gdiplus::GraphicsPath plate;
+    AddRoundedRectangle(plate, box, 3.0F * s);
+    Gdiplus::SolidBrush fill(Gdiplus::Color(46, accent.GetR(), accent.GetG(), accent.GetB()));
+    graphics.FillPath(&fill, &plate);
+    Gdiplus::Pen edge(Gdiplus::Color(200, accent.GetR(), accent.GetG(), accent.GetB()), 1.0F * s);
+    graphics.DrawPath(&edge, &plate);
+    DrawText(graphics, std::wstring(label), box, font, Gdiplus::Color(245, 245, 248, 252),
+             Gdiplus::StringAlignmentCenter);
+}
+
+// Typographic layout, one line, cut with an ellipsis: what a name and the
+// figure beside it are both measured and drawn with, so the two sit a fixed
+// gap apart. The default format pads each string by a sixth of an em and
+// measures CJK fallback differently from how it draws it.
+// GDI+ formats cannot be copied, so this one is a type that builds itself.
+struct PlainFormat : Gdiplus::StringFormat {
+    PlainFormat() : Gdiplus::StringFormat(Gdiplus::StringFormat::GenericTypographic()) {
+        SetFormatFlags(GetFormatFlags() | Gdiplus::StringFormatFlagsNoWrap |
+                       Gdiplus::StringFormatFlagsMeasureTrailingSpaces);
+        SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    }
+};
+
+// The plain layout for a path: too long, it loses its middle and keeps its
+// start and as much of its last folder as fits.
+struct PathFormat : PlainFormat {
+    PathFormat() { SetTrimming(Gdiplus::StringTrimmingEllipsisPath); }
+};
+
+// A string's advance, in the plain layout.
+float TextWidth(Gdiplus::Graphics& graphics, const std::wstring& text, Gdiplus::Font& font) {
+    if (text.empty()) return 0.0F;
+    const PlainFormat format;
+    Gdiplus::RectF measured;
+    graphics.MeasureString(text.c_str(), -1, &font, Gdiplus::PointF(0.0F, 0.0F), &format,
+                           &measured);
+    return measured.Width;
+}
+
+// Left-aligned text in the plain layout, centred on its row.
+void DrawPlain(Gdiplus::Graphics& graphics, const std::wstring& text, const Gdiplus::RectF& bounds,
+               Gdiplus::Font& font, const Gdiplus::Color color) {
+    const PlainFormat format;
+    Gdiplus::SolidBrush brush(color);
+    graphics.DrawString(text.c_str(), -1, &font, bounds, &format, &brush);
+}
+
+// Where DrawPlain's text ends, as GDI+ lays it out. MeasureString does not
+// say: with grid-fitted hinting at small sizes its width differed from the
+// drawn one by several pixels -- wider for Latin, narrower for CJK -- and the
+// figure placed after a name drifted from row to row. The character ranges
+// are measured by the same layout that draws.
+float DrawnRight(Gdiplus::Graphics& graphics, const std::wstring& text,
+                 const Gdiplus::RectF& bounds, Gdiplus::Font& font) {
+    if (text.empty()) return bounds.X;
+    PlainFormat format;
+    const Gdiplus::CharacterRange range(0, static_cast<INT>(text.size()));
+    format.SetMeasurableCharacterRanges(1, &range);
+    Gdiplus::Region region;
+    Gdiplus::RectF box;
+    if (graphics.MeasureCharacterRanges(text.c_str(), -1, &font, bounds, &format, 1, &region) !=
+            Gdiplus::Ok ||
+        region.GetBounds(&box, &graphics) != Gdiplus::Ok) {
+        return bounds.GetRight();
+    }
+    return std::min(box.GetRight(), bounds.GetRight());
+}
+
+// "name (count)" with the count in its own ink. The two are one string laid
+// out once, and two clips colour the parts, so the count sits exactly where
+// GDI+ puts it. Measured and drawn apart, the count crept into the name the
+// longer the name was -- several pixels at 250 % even without grid fitting
+// (2026-11-13). A name too long for the box keeps the count and loses its
+// own end to an ellipsis instead.
+void DrawNameWithCount(Gdiplus::Graphics& graphics, const std::wstring& name,
+                       const std::wstring& count, const Gdiplus::RectF& bounds, Gdiplus::Font& font,
+                       const Gdiplus::Color name_color, const Gdiplus::Color count_color,
+                       const float gap) {
+    const std::wstring whole = name + L" " + count;
+    // The count's width as the layout that draws it lays it out: measured by
+    // MeasureString it came out narrow enough that the count's own box cut it
+    // to "(…" at 250 %.
+    const float count_width =
+        DrawnRight(graphics, count, {0.0F, bounds.Y, 100'000.0F, bounds.Height}, font) + 1.0F;
+    // Whether the whole string fits, from its width laid out with no limit.
+    // Asked of the box itself the answer was wrong both ways: a trimmed
+    // string ends short of the edge by its ellipsis, and the count's range
+    // then measures the ellipsis as if it were the count.
+    const float whole_width =
+        DrawnRight(graphics, whole, {0.0F, bounds.Y, 100'000.0F, bounds.Height}, font);
+    PlainFormat format;
+    const Gdiplus::CharacterRange range(static_cast<INT>(name.size() + 1),
+                                        static_cast<INT>(count.size()));
+    format.SetMeasurableCharacterRanges(1, &range);
+    Gdiplus::Region count_region;
+    const bool whole_fits =
+        whole_width <= bounds.Width - 1.0F &&
+        graphics.MeasureCharacterRanges(whole.c_str(), -1, &font, bounds, &format, 1,
+                                        &count_region) == Gdiplus::Ok;
+    if (whole_fits) {
+        Gdiplus::Region saved;
+        graphics.GetClip(&saved);
+        graphics.ExcludeClip(&count_region);
+        DrawPlain(graphics, whole, bounds, font, name_color);
+        graphics.SetClip(&saved);
+        graphics.IntersectClip(&count_region);
+        DrawPlain(graphics, whole, bounds, font, count_color);
+        graphics.SetClip(&saved);
+        return;
+    }
+    const Gdiplus::RectF name_box(bounds.X, bounds.Y,
+                                  std::max(0.0F, bounds.Width - count_width - gap), bounds.Height);
+    DrawPlain(graphics, name, name_box, font, name_color);
+    DrawPlain(graphics, count,
+              {DrawnRight(graphics, name, name_box, font) + gap, bounds.Y, count_width + gap,
+               bounds.Height},
+              font, count_color);
+}
+
+}  // namespace
+
+// Task Manager's Processes tab at the OSD's size: one row an app, its five
+// figures each shaded by its share of the whole, sorted by the column Details
+// was opened on or the heading clicked since.
+void OsdOverlay::DrawDetails(Gdiplus::Graphics& graphics, const Layout& layout,
+                             const telemetry::Sample* reading) const {
+    if (!details_record_) return;
+    const float s = layout.scale;
+    const topapp::Column sort = *details_record_;
+    const auto geometry = details::MakeGeometry(static_cast<float>(layout.width) / s,
+                                                static_cast<float>(layout.height) / s,
+                                                static_cast<int>(topapp::kDetailsRows));
+    const auto px = [s](const details::Box& box) {
+        return Gdiplus::RectF(box.x * s, box.y * s, box.width * s, box.height * s);
+    };
+    const Gdiplus::Color white(245, 245, 248, 252);
+    const Gdiplus::Color muted(170, 205, 214, 226);
+    const Gdiplus::Color sort_accent = Accent(MetricOf(sort));
+
+    Gdiplus::FontFamily family(L"Segoe UI");
+    const auto face = [&](const float em_dip, const INT style) {
+        return Gdiplus::Font(&family, em_dip * s, style, Gdiplus::UnitPixel);
+    };
+    Gdiplus::Font title_font = face(details::kTitleEmDip, Gdiplus::FontStyleBold);
+    Gdiplus::Font reading_font = face(details::kReadingEmDip, Gdiplus::FontStyleBold);
+    Gdiplus::Font heading_font = face(details::kHeadingEmDip, Gdiplus::FontStyleBold);
+    Gdiplus::Font row_font = face(details::kRowEmDip, Gdiplus::FontStyleRegular);
+    Gdiplus::Font footer_font = face(details::kFooterEmDip, Gdiplus::FontStyleRegular);
+    Gdiplus::Font action_font = face(details::kActionEmDip, Gdiplus::FontStyleBold);
+
+    // The title: back at its start, the column's action at its end when it
+    // has one, the column and its own reading between.
+    DrawDetailsBack(graphics, px(geometry.back), s);
+    if (const auto action = details::ActionOf(sort); action != details::Action::None) {
+        DrawDetailsAction(graphics, px(geometry.action), DetailsActionLabel(action), sort_accent,
+                          action_font, s);
+    }
+    const std::wstring label = DetailsLabel(sort);
+    Gdiplus::RectF title = px(geometry.title);
+    // Without an action its place is the title's: the reading ends at the
+    // margin instead of short of an empty space.
+    if (details::ActionOf(sort) == details::Action::None)
+        title.Width = px(geometry.action).GetRight() - title.X;
+    DrawRuns(graphics,
+             {{label, sort_accent},
+              {std::wstring(localization::Select(L" · 前 10 名", L" · Top 10")), white}},
+             title, title_font, Gdiplus::StringAlignmentNear);
+    std::wstring figure;
+    if (sort == topapp::Column::Ram) {
+        if (ram_history_ != nullptr && !ram_history_->Samples().empty() &&
+            ram_history_->Samples().back().physical_percent) {
+            figure = std::format(L"{:.0f}%", *ram_history_->Samples().back().physical_percent);
+        }
+    } else if (sort == topapp::Column::Network) {
+        // The NET lane's reading, in its form: received then sent.
+        const auto* last = net_history_ != nullptr ? net_history_->Latest() : nullptr;
+        if (last != nullptr && last->received_bytes_per_second && last->sent_bytes_per_second) {
+            figure =
+                std::format(L"{}↓ {}↑ MB/s", details::FormatRate(*last->received_bytes_per_second),
+                            details::FormatRate(*last->sent_bytes_per_second));
+        }
+    } else if (reading != nullptr) {
+        const auto& value = sort == topapp::Column::Gpu    ? reading->gpu_utilization_percent
+                            : sort == topapp::Column::Vram ? reading->vram_utilization_percent
+                                                           : reading->cpu_utilization_percent;
+        if (value) figure = std::format(L"{:.0f}%", *value);
+        if (sort == topapp::Column::Vram && value && reading->vram_used_gib) {
+            figure += std::format(L" · {:.1f} GiB", *reading->vram_used_gib);
+        }
+    }
+    if (!figure.empty()) {
+        DrawText(graphics, figure, title, reading_font, white, Gdiplus::StringAlignmentFar);
+    }
+
+    // The headings, the sorted one in its accent with a down arrow. The App
+    // heading names what its column shows, brighter when it is not the name.
+    DrawText(graphics, std::wstring(NameHeading(details_view_)),
+             {px(geometry.name).X + 4.0F * s, px(geometry.name).Y, px(geometry.name).Width,
+              px(geometry.name).Height},
+             heading_font, details_view_ == details::NameView::Name ? muted : white,
+             Gdiplus::StringAlignmentNear);
+    for (std::size_t c = 0; c < topapp::kColumnCount; ++c) {
+        const auto column = static_cast<topapp::Column>(c);
+        Gdiplus::RectF box = px(geometry.columns[c]);
+        const bool sorted = column == sort;
+        if (sorted) {
+            Gdiplus::SolidBrush tint(
+                Gdiplus::Color(40, sort_accent.GetR(), sort_accent.GetG(), sort_accent.GetB()));
+            graphics.FillRectangle(&tint, box);
+        }
+        Gdiplus::RectF text = box;
+        text.Width -= 4.0F * s;
+        const std::wstring heading = DetailsHeading(column);
+        DrawText(graphics, heading, text, heading_font, sorted ? sort_accent : muted,
+                 Gdiplus::StringAlignmentFar);
+        if (sorted) {
+            const float right =
+                text.GetRight() - TextWidth(graphics, heading, heading_font) - 3.0F * s;
+            const float middle = box.Y + box.Height / 2.0F;
+            const Gdiplus::PointF arrow[]{{right - 5.0F * s, middle - 1.5F * s},
+                                          {right, middle - 1.5F * s},
+                                          {right - 2.5F * s, middle + 1.5F * s}};
+            Gdiplus::SolidBrush ink(sort_accent);
+            graphics.FillPolygon(&ink, arrow, 3);
+        }
+    }
+    const float rule_y = (geometry.name.Bottom() + 0.5F) * s;
+    Gdiplus::Pen rule(Gdiplus::Color(60, 203, 215, 231), 1.0F * s);
+    graphics.DrawLine(&rule, px(geometry.name).X, rule_y,
+                      px(geometry.columns[topapp::kColumnCount - 1]).GetRight(), rule_y);
+
+    // The rows, or why there are none.
+    const auto& table = details_;
+    std::wstring empty;
+    std::vector<std::size_t> rows;
+    const std::uint32_t bit = topapp::Bit(sort);
+    if (!table) {
+        empty = localization::Select(L"量測中…", L"Measuring…");
+    } else if (table->paused) {
+        empty = localization::Select(L"取樣暫停：超過 CPU 預算，稍後再試",
+                                     L"Sampling paused: over its CPU budget, trying again soon");
+    } else if ((table->available & bit) == 0 && sort == topapp::Column::Network) {
+        empty = localization::Select(L"無法啟動網路追蹤：需要系統管理員權限",
+                                     L"No network trace: it needs Administrator");
+    } else if ((table->available & bit) == 0) {
+        empty = localization::Select(L"沒有 GPU 計數器：需要恰好一張 NVIDIA 顯示卡",
+                                     L"No GPU counters: needs exactly one NVIDIA adapter");
+    } else if ((table->measured & bit) == 0) {
+        empty = localization::Select(L"量測中…", L"Measuring…");
+    } else {
+        // As a double-click or the pointer finds them.
+        rows = details::Listed(&*table, sort, geometry.rows);
+        if (rows.empty()) {
+            empty = localization::Format(L"目前沒有 app 用到 {}", L"No app is using {} right now",
+                                         label);
+        }
+    }
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const topapp::DetailsRow& row = table->rows[rows[i]];
+        const Gdiplus::RectF line = px(details::RowAt(geometry, static_cast<int>(i)));
+        if (i % 2 == 1) {
+            Gdiplus::SolidBrush zebra(Gdiplus::Color(10, 203, 215, 231));
+            graphics.FillRectangle(&zebra, line);
+        }
+        // The row the footer is about.
+        if (static_cast<int>(i) == details_hover_) {
+            Gdiplus::SolidBrush lit(Gdiplus::Color(30, 203, 215, 231));
+            graphics.FillRectangle(&lit, line);
+        }
+        for (std::size_t c = 0; c < topapp::kColumnCount; ++c) {
+            const auto figure_column = static_cast<topapp::Column>(c);
+            const Gdiplus::RectF column = px(geometry.columns[c]);
+            const Gdiplus::RectF cell(column.X + 1.0F * s, line.Y + 1.0F * s,
+                                      column.Width - 2.0F * s, line.Height - 2.0F * s);
+            const auto& value = row.values[c];
+            std::wstring text;
+            if (value) {
+                const float heat = details::Heat(*value, table->totals[c]);
+                if (heat > 0.0F) {
+                    const Gdiplus::Color accent = Accent(MetricOf(figure_column));
+                    const auto alpha = static_cast<BYTE>(std::clamp(
+                        8.0F + heat * (figure_column == sort ? 160.0F : 115.0F), 0.0F, 255.0F));
+                    Gdiplus::SolidBrush shade(
+                        Gdiplus::Color(alpha, accent.GetR(), accent.GetG(), accent.GetB()));
+                    graphics.FillRectangle(&shade, cell);
+                }
+                text = details::FormatValue(figure_column, *value);
+            } else {
+                // Not measurable here, or not yet.
+                text = (table->available & topapp::Bit(figure_column)) == 0 ? L"—" : L"…";
+            }
+            Gdiplus::RectF ink = column;
+            ink.Y = line.Y;
+            ink.Height = line.Height;
+            ink.Width -= 4.0F * s;
+            DrawText(graphics, text, ink, row_font, value ? white : muted,
+                     Gdiplus::StringAlignmentFar);
+        }
+        // The name, or the view the heading chose (details::NameFor), cut
+        // with an ellipsis rather than running into the figures; an app of
+        // several processes says how many, as Task Manager does: "Microsoft
+        // Edge (31)", the count in the muted ink.
+        const Gdiplus::RectF name_column = px(geometry.name);
+        const float left = name_column.X + 4.0F * s;
+        const float room = name_column.GetRight() - 4.0F * s - left;
+        const Gdiplus::RectF name_box(left, line.Y, room, line.Height);
+        const details::RowName shown = details::NameFor(row, sort, details_view_);
+        const Gdiplus::Color ink = shown.muted ? muted : white;
+        // Without grid fitting: hinted to whole pixels, small text is laid out
+        // narrower than any measurement says, by more the longer the name.
+        const Gdiplus::TextRenderingHint hint = graphics.GetTextRenderingHint();
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+        if (row.processes > 1) {
+            DrawNameWithCount(graphics, shown.text, std::format(L"({})", row.processes), name_box,
+                              row_font, ink, muted, 3.0F * s);
+        } else {
+            DrawPlain(graphics, shown.text, name_box, row_font, ink);
+        }
+        graphics.SetTextRenderingHint(hint);
+    }
+    if (!empty.empty()) {
+        const Gdiplus::RectF first = px(details::RowAt(geometry, 0));
+        DrawText(graphics, empty, {first.X, first.Y, first.Width, first.Height * 2.0F}, row_font,
+                 muted, Gdiplus::StringAlignmentCenter);
+    }
+
+    // The footer: the hovered row's process and where it works, its path cut
+    // in the middle; otherwise how much was read, and how often, and when the
+    // network trace dropped events, that its column is short by them.
+    const topapp::Representative* hovered = nullptr;
+    if (details_hover_ >= 0 && static_cast<std::size_t>(details_hover_) < rows.size()) {
+        hovered = &table->rows[rows[static_cast<std::size_t>(details_hover_)]]
+                       .representatives[static_cast<std::size_t>(sort)];
+        if (hovered->pid == 0) hovered = nullptr;
+    }
+    if (hovered != nullptr) {
+        const Gdiplus::RectF box = px(geometry.footer);
+        const std::wstring lead = details::HoverLead(*hovered);
+        const Gdiplus::TextRenderingHint hint = graphics.GetTextRenderingHint();
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+        DrawPlain(graphics, lead, box, footer_font, muted);
+        if (!hovered->directory.empty()) {
+            const float start = DrawnRight(graphics, lead, box, footer_font);
+            const PathFormat format;
+            Gdiplus::SolidBrush brush(white);
+            graphics.DrawString(hovered->directory.c_str(), -1, &footer_font,
+                                {start, box.Y, std::max(0.0F, box.GetRight() - start), box.Height},
+                                &format, &brush);
+        }
+        graphics.SetTextRenderingHint(hint);
+    } else if (table && !table->paused) {
+        std::wstring footer = localization::Format(
+            L"{} 個處理程序 · 每秒更新", L"{} processes · every second", table->processes);
+        if (table->network_lost > 0) {
+            footer += localization::Format(L" · 網路漏計 {} 筆", L" · {} network events lost",
+                                           table->network_lost);
+        }
+        DrawText(graphics, footer, px(geometry.footer), footer_font, muted,
+                 Gdiplus::StringAlignmentNear);
+    }
+}
+
 // A record asks for attention the way a compact cell does -- its own accent
 // raised behind the bar and its outline made solid, breathing -- never by
 // changing hue: with no labels, colour is what tells the bars apart. FPS is

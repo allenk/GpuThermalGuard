@@ -92,11 +92,107 @@ void PublishStartupFailure(DWORD error, std::string_view reason) noexcept {
         InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Failed));
     }
 }
+
+// Which executable the target is. This log recorded the helper and target pids
+// and never the image, so a refusal could not be attributed to a title once
+// that process had gone -- which is exactly when a refusal gets read. The pid
+// is checked against the creation time first, because a pid on its own names
+// whatever holds it now rather than what the attach was aimed at.
+void PublishTargetImage(Identity target) noexcept {
+    try {
+        Handle process;
+        process.value = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
+        wchar_t image[32768]{};
+        DWORD length = 32768;
+        if (!process.value || CreationTime(process.value) != target.created ||
+            !QueryFullProcessImageNameW(process.value, 0, image, &length)) {
+            AppendStartupLine("target-image unresolved");
+            return;
+        }
+        AppendStartupLine("target-image path=\"{}\"",
+                          RuntimeNarrowPath(std::filesystem::path(image)));
+    } catch (...) {
+        // A diagnostic line is never worth a failed attach.
+    }
+}
+
+// Which Direct3D 12 runtime the target is on, and therefore which one this
+// discovery loaded beside it. For a title shipping its own Agility SDK Core
+// these are the two facts that separate a method address meaning something in
+// the target from one meaning nothing, and neither was ever written down.
+void PublishTargetRuntime(const ProductMethods& methods) noexcept {
+    try {
+        if (!methods.core_runtime) {
+            AppendStartupLine("target-core none");
+            return;
+        }
+        AppendStartupLine("target-core path=\"{}\" sdk={} system={}",
+                          RuntimeNarrowPath(methods.core_runtime->Path()),
+                          methods.core_runtime->SdkVersion(),
+                          methods.core_runtime->IsSystem() ? 1 : 0);
+    } catch (...) {
+    }
+}
+
+// A refusal recorded while the target is on its way out is the ordinary end of
+// a session rather than a defect, and the two were indistinguishable. The loop
+// finds the counter set about a second before the process actually goes -- the
+// product hook's per-frame path meets a swapchain that is being torn down -- so
+// a single check at that instant reports the target as still running, the line
+// read like a defect, and the user was told to restart a game they had just
+// closed. Waiting that second out is what separates them. The wait is affordable
+// only because the caller publishes the release and the failed state first, so
+// nothing the overlay or the tray depends on is held up by a diagnostic.
+inline constexpr DWORD kExitingTargetWaitMs = 2000;
+
+const char* SectionFailureReason(HANDLE target) noexcept {
+    return WaitForSingleObject(target, kExitingTargetWaitMs) == WAIT_TIMEOUT
+               ? "section reported a failure"
+               : "section reported a failure as the target exited";
+}
+
+// Why a session ended, with the counters that separate the reasons. Reading
+// these after the fact is the only way to tell an install that started refusing
+// from a game that exited, and both arrive at the tray as the same one-line
+// warning.
+//
+// `ready` carries the reason itself. The product hook closes admissions through
+// one function and records a code there, and a fatal code already published
+// wins over any later one, so this is the first thing that went wrong rather
+// than the last. Without it the line says that something refused and leaves
+// which of the refusals to a second run of the title.
+void PublishSessionEnd(const char* why, gtg::research::HookSection& section) noexcept {
+    AppendStartupLine(
+        "stage=session-ended elapsed_ms={} why=\"{}\" ready={} color={} backend={} "
+        "txn_stage={} failures={} errors={} readback={} present_calls={} signal_calls={} "
+        "nested_signal={} outside_signal={} wrong_thread={} queue_ambiguous={} state={}",
+        GetTickCount64() - startup_started, why, static_cast<long>(section.product_ready),
+        static_cast<long>(section.product_color_provenance),
+        static_cast<long>(section.product_backend),
+        static_cast<long>(section.transaction_stage), static_cast<long>(section.failures),
+        static_cast<long>(section.control_errors), static_cast<long>(section.readback_errors),
+        static_cast<long long>(section.hook_calls),
+        static_cast<long long>(section.signal_calls),
+        static_cast<long long>(section.nested_signal_calls),
+        static_cast<long>(section.outside_signal_calls),
+        static_cast<long>(section.wrong_thread), static_cast<long>(section.queue_ambiguous),
+        static_cast<long>(section.header.state));
+}
 }  // namespace
 
 void GtgFeatureStartupStage(const char* stage, ULONGLONG duration) noexcept {
     AppendStartupLine("stage={} elapsed_ms={} duration_ms={}", stage,
                       GetTickCount64() - startup_started, duration);
+}
+
+// The attach-side diagnostics, which used to go to std::cout. The helper is
+// launched with CREATE_NO_WINDOW and no standard handles, so in a deployed
+// build that stream has no reader at all: every entry-shape reading and every
+// refusal breakdown was formatted and then dropped, and both were only ever
+// seen when the helper was run from a console by hand. They travel through this
+// log's one writer instead.
+void GtgFeatureStartupDetail(const char* text) noexcept {
+    AppendStartupLine("elapsed_ms={} {}", GetTickCount64() - startup_started, text);
 }
 
 bool GtgFeatureContinue() noexcept {
@@ -111,14 +207,22 @@ gtg::overlay::integration::ChoiceRead GtgFeatureColorChoice(
 }
 
 int GtgFeatureSession(gtg::research::HookSection& section, HANDLE target) noexcept {
-    if (!GtgFeatureContinue()) return 1;
+    if (!GtgFeatureContinue()) {
+        PublishSessionEnd("refused before the session began", section);
+        return 1;
+    }
     InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Ready));
     GtgFeatureStartupStage("helper-ready", 0);
     bool first_draw{};
     while (GtgFeatureContinue() && WaitForSingleObject(target, 0) == WAIT_TIMEOUT) {
         if (section.failures || section.control_errors) {
+            // Order matters: a failure raised while a target tears itself down
+            // is the worst moment to delay the signal that stops drawing, and
+            // the reason below spends up to two seconds establishing which
+            // kind of ending this is.
             InterlockedExchange(&section.header.release, 1);
             InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Failed));
+            PublishSessionEnd(SectionFailureReason(target), section);
             return 1;
         }
         InterlockedExchange(&section.header.release,
@@ -129,6 +233,12 @@ int GtgFeatureSession(gtg::research::HookSection& section, HANDLE target) noexce
         }
         if (WaitForSingleObject(parent, 33) != WAIT_TIMEOUT) break;
     }
+    // Re-read rather than inferred from which statement broke the loop: the
+    // target going away and the tray going away are the two ordinary ends and
+    // they are told apart by asking, not by where control arrived from.
+    const char* why = "stop requested or the tray went away";
+    if (WaitForSingleObject(target, 0) != WAIT_TIMEOUT) why = "target exited";
+    PublishSessionEnd(why, section);
     InterlockedExchange(&section.header.release, 1);
     InterlockedExchange(&control->state, static_cast<LONG>(HelperState::Closed));
     return 0;
@@ -174,11 +284,15 @@ int gtg::overlay::integration::HelperMain(const wchar_t* argument) noexcept {
         Check(directory_length && directory_length < MAX_PATH &&
                   GetTempFileNameW(directory, L"gtg", 0, temp_file),
               "temporary report");
+        // Named before discovery runs, so a discovery that refuses is still
+        // attributable to a title.
+        PublishTargetImage(initial.target);
         ProductMethods methods;
         const auto discovery_started = GetTickCount64();
         // The target's own identity: a method address is only evidence about
         // the runtime that target has loaded.
         Check(methods.Discover(temp_file, initial.target), "product graphics discovery");
+        PublishTargetRuntime(methods);
         GtgFeatureStartupStage("discovery-complete", GetTickCount64() - discovery_started);
         Check(GtgFeatureContinue(), "canceled discovery");
         const auto dll = OwnPath().parent_path() / L"gtg_overlay.dll";

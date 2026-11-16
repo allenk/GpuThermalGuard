@@ -13,6 +13,7 @@
 // which is gone -- a transitive include is not a dependency you declared.
 #include "../injector/install_diagnostics.hpp"
 #include "../injector/install_policy.hpp"
+#include "slot_admission.hpp"
 #include <splice/live.h>
 #include <memory>
 #include <array>
@@ -26,6 +27,30 @@ namespace {
 using namespace gtg::research;
 using namespace gtg::overlay::integration;
 std::array<std::atomic<void*>, 7> originals{};
+
+// The seven sites keep their numbers everywhere a reader sees them -- the
+// section's fields, the diagnostic report, `originals`, `entry_shape` -- and
+// the two the install treats differently are named. They live in
+// `entry_admission.hpp` because the preflight in the executable decides the
+// same thing about the same sites and must not hold its own copy of either the
+// numbers or the rule.
+using gtg::research::kPresentSite;
+using gtg::research::kSignalSite;
+using gtg::research::kSiteCount;
+using gtg::research::PatchedInline;
+
+// Which report index each site of the inline group is. These used to be the
+// same numbers and are not any more: Signal is report index one and is not in
+// that group at all, so the group's ordinal two is the report's index three. A
+// table, because the alternative is the same arithmetic written out at each
+// use and silently wrong at one of them -- and what it would be wrong about is
+// which site a refusal names.
+constexpr std::size_t kInlineSites[] = {0, 2, 3, 4, 5, 6};
+
+// A refused vtable cell, in the same negative space as the other refusals
+// `product_ready` carries. -300 is unused: -10..-16 is a prologue that would
+// not decode, -100..-106 the one-instruction rule, -2xx the runtime refusals.
+constexpr LONG kSignalCellRefused = -300;
 std::atomic<bool> active{false};
 HookSection* counters{};
 std::atomic<bool> failed{false};
@@ -625,18 +650,56 @@ struct Sites {
                 16)
             return false;
 
+        // The profile is a fact about the site, not a precondition of
+        // reaching the rule. A site whose function is written cannot be judged
+        // without it and refuses; the cell-swapped site does not care whether
+        // its prologue decodes, because nothing writes there, and refusing it
+        // for a decoder's sake would be the code-generation dependency the
+        // cell swap exists to remove.
         splice_prologue_facts facts{};
-        if (splice_prologue_profile(target, &facts) != 0) {
+        const bool profiled = splice_prologue_profile(target, &facts) == 0;
+        if (!profiled && PatchedInline(i)) {
             InterlockedExchange(&section.product_ready, -10 - static_cast<LONG>(i));
             return false;
         }
 
-        // Present and Signal keep the stricter admission they have always had:
-        // the patch window must be one instruction, so no thread can be inside
-        // the bytes being replaced. The coordinated tier would map an interior
-        // program counter rather than refuse it, which is why this is ours to
-        // keep rather than something to drop as redundant.
-        if (i < 2 && !OneInstructionEntry(facts, addresses[i])) {
+        // Record the shape before deciding anything with it, for every site and
+        // not only the two whose admission turns on it. That is the detector:
+        // the number that changed under this product had never been measured on
+        // a successful attach, so there was nothing to compare a later one
+        // against -- and the five sites with no rule over their shape are
+        // exactly the ones nothing would have noticed changing. Left at zero
+        // when the prologue did not decode, which the protocol defines as not
+        // measured.
+        if (profiled) {
+            auto& shape = section.entry_shape[i];
+            InterlockedExchange(&shape.patch_bytes, static_cast<LONG>(facts.patch_bytes));
+            InterlockedExchange(&shape.first_instruction,
+                                static_cast<LONG>(facts.first_instruction));
+            InterlockedExchange(&shape.interior_mask,
+                                static_cast<LONG>(facts.interior_mask));
+            InterlockedExchange(&shape.entry_padding,
+                                static_cast<LONG>(facts.entry_padding));
+        }
+
+        // Signal is installed by swapping its vtable cell, so its prologue is
+        // not written and no rule about the shape of that prologue applies to
+        // it. What it needs instead is for the cell to agree with the method,
+        // and that is the whole of its admission.
+        if (i == kSignalSite) return SignalCellAdmitted(memory);
+
+        // Present keeps the stricter admission it has always had: the patch
+        // window must be one instruction, so no thread can be inside the bytes
+        // being replaced. The coordinated tier would map an interior program
+        // counter rather than refuse it, which is why this is ours to keep
+        // rather than something to drop as redundant.
+        //
+        // It used to cover Signal too, and Signal is the reason it exists: a
+        // runtime update changed that function's register-save encoding from
+        // one five-byte instruction to a three-byte one followed by a
+        // four-byte one, and this rule refused the install. It still would.
+        // Signal left the rule by leaving the tier the rule is about.
+        if (i == kPresentSite && !OneInstructionEntry(facts, addresses[i])) {
             InterlockedExchange(&section.product_patch_copy_size,
                                 static_cast<LONG>(facts.patch_bytes));
             InterlockedExchange(&section.product_patch_boundaries,
@@ -647,14 +710,67 @@ struct Sites {
         return true;
     }
 
-    // The chain. Seven different signatures, so it is seven `.at()` calls and
-    // not a loop -- which is the honest shape: each site names its own type,
-    // its own snapshot and its own replacement, and the compiler checks that
-    // the replacement matches the site.
-    splice::Outcome Install(std::size_t count) {
+    // Gather what the rule needs and take the verdict in slot_admission.hpp.
+    // `method` is the region the caller already measured for the method
+    // address; the cell is measured here.
+    bool SignalCellAdmitted(const MEMORY_BASIC_INFORMATION& method) {
+        VtableCell cell;
+        cell.slot = section.signal_slot_address;
+        cell.method = addresses[kSignalSite];
+        cell.method_image_base = reinterpret_cast<std::uint64_t>(method.AllocationBase);
+        if (cell.slot == 0) {
+            InterlockedExchange(&section.product_ready, kSignalCellRefused);
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(cell.slot), &region, sizeof(region)) !=
+            sizeof(region)) {
+            InterlockedExchange(&section.product_ready, kSignalCellRefused);
+            return false;
+        }
+        cell.cell_region_base = reinterpret_cast<std::uint64_t>(region.BaseAddress);
+        cell.cell_region_size = region.RegionSize;
+        cell.cell_image_base = reinterpret_cast<std::uint64_t>(region.AllocationBase);
+        cell.cell_state = region.State;
+        cell.cell_type = region.Type;
+        cell.cell_protect = region.Protect;
+
+        // Everything that does not need the cell's contents is decided before
+        // the cell is read, because the read is what needs it: a region
+        // `VirtualQuery` described is not necessarily a readable page, and a
+        // slot that is reserved, guarded or eight bytes short of its region's
+        // end would have faulted here, inside the target process, during the
+        // install. This used to be one call *after* the load.
+        if (!VtableCellMemoryAdmitted(cell)) {
+            InterlockedExchange(&section.product_ready, kSignalCellRefused);
+            return false;
+        }
+
+        // Read it as late as the above allows and through the cell itself, so
+        // the value compared is the one a swap would compare-exchange against
+        // moments later. The window between them is what the conditional store
+        // closes; nothing here can close it, and nothing here pretends to.
+        cell.held = *reinterpret_cast<const volatile std::uint64_t*>(cell.slot);
+        if (!VtableCellAdmitted(cell)) {
+            InterlockedExchange(&section.product_ready, kSignalCellRefused);
+            return false;
+        }
+        return true;
+    }
+
+    // The chain. Six different signatures, so it is six `.at()` calls and not
+    // a loop -- which is the honest shape: each site names its own type, its
+    // own snapshot and its own replacement, and the compiler checks that the
+    // replacement matches the site.
+    //
+    // Signal is not here. It is installed afterwards, by swapping its vtable
+    // cell, and the order is deliberate: the failures this group takes are the
+    // common ones -- a prologue that has changed, a site somebody else already
+    // patched -- so taking them first means the likely refusal happens with no
+    // cell written and the module cleanly unloaded. The reverse order leaves a
+    // resident module behind the failure that actually occurs.
+    splice::Outcome InstallInline(std::size_t count) {
         using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
-        using SignalFn =
-            HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
         using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT,
                                                      DXGI_FORMAT, UINT);
         using Resize1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT,
@@ -676,9 +792,6 @@ struct Sites {
             .expect_prologue(section.expected)
             .replace_with(&Present, originals[0]);
         if (count > 1) {
-            group.at(at(1), SignalFn{})
-                .expect_prologue(section.signal_expected)
-                .replace_with(&Signal, originals[1]);
             group.at(at(2), ResizeFn{})
                 .expect_prologue(section.product_expected[0])
                 .replace_with(&Resize, originals[2]);
@@ -697,6 +810,27 @@ struct Sites {
         }
         return group.install(splice::live);
     }
+
+    // One cell, conditionally. `.expect` is not decoration here: it is the
+    // admission rule taken again at the instant of the write, as a
+    // compare-exchange, so a cell another overlay claimed between Prepare and
+    // this call is a refusal rather than a silent eviction -- which would also
+    // publish an original from before they arrived, and calling it would skip
+    // their hook.
+    //
+    // No thread is suspended for this and none needs to be. One aligned
+    // pointer-sized store has no interior state for a thread to observe, which
+    // is the property the prologue rule exists to establish for the tier that
+    // writes code.
+    splice::Outcome SwapSignalCell() {
+        using SignalFn =
+            HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+        splice::Live<> group;
+        group.at_slot(reinterpret_cast<void**>(section.signal_slot_address), SignalFn{})
+            .expect(reinterpret_cast<void*>(addresses[kSignalSite]))
+            .replace_with(&Signal, originals[kSignalSite]);
+        return group.install(splice::slot_swap);
+    }
 };
 
 // What the transaction did, in the sidecar's own fields.
@@ -710,20 +844,30 @@ struct Sites {
 // decoding the old numbers would be silently wrong, and the version is what
 // makes it refuse instead.
 //
-// Per-site evidence survives; per-site transactions do not. All seven sites
-// report the same stage and outcome, because there was one transaction, and
-// the failing site is named by the group's own ordinal.
-void RecordGroupOutcome(HookSection& section, InstallReport& report, std::size_t count,
+// Per-site evidence survives; per-site transactions do not. Every site of one
+// group reports that group's stage and outcome, and the failing one is named
+// by the group's own ordinal.
+//
+// `sites` is the report index of each ordinal, because the two stopped being
+// the same number when Signal left the inline group. A group's ordinal `k` is
+// `sites[k]`; passing the mapping in rather than computing it here is what
+// lets the cell swap use the same function for its one site.
+void RecordGroupOutcome(HookSection& section, InstallReport& report,
+                        const std::size_t* sites, std::size_t count,
                         const splice::Outcome& outcome) noexcept {
     const auto stage = static_cast<DWORD>(outcome.failure().stage);
     const auto state = static_cast<DWORD>(outcome.state());
     const bool installed = outcome.state() == splice::State::installed;
 
-    section.reserved = outcome.threads();
+    // The cell swap enlists nobody, so it reports zero threads and must not
+    // overwrite what the suspension actually cost. The stage is written by
+    // both, in order, so the last group to run is the one described -- which
+    // is the one that failed, if either did.
+    if (outcome.threads() != 0) section.reserved = outcome.threads();
     InterlockedExchange(&section.transaction_stage, static_cast<LONG>(stage));
 
-    for (std::size_t i = 0; i < count; ++i) {
-        auto& site = report.sites[i];
+    for (std::size_t k = 0; k < count; ++k) {
+        auto& site = report.sites[sites[k]];
         site.threads = outcome.threads();
         site.transaction_entered = 1;
         site.transaction_stage = stage;
@@ -738,8 +882,8 @@ void RecordGroupOutcome(HookSection& section, InstallReport& report, std::size_t
 
     // One transaction, so the ordinal is the group's and it localises the
     // refusal without implying that any other site was touched.
-    const auto ordinal = static_cast<DWORD>(outcome.failure().site.ordinal);
-    report.failed_site = ordinal < count ? ordinal : 0;
+    const auto ordinal = static_cast<std::size_t>(outcome.failure().site.ordinal);
+    report.failed_site = static_cast<DWORD>(ordinal < count ? sites[ordinal] : sites[0]);
     RecordInstallError(report.sites[report.failed_site].primary,
                        InstallOperation::Transaction, stage, outcome.failure().os_error,
                        outcome.failure().os_error != 0,
@@ -815,10 +959,34 @@ HookState Install(HookSection& section, InstallReport& report) {
             // non-refusal, exactly as before -- so the outcome's records are
             // dropped here rather than stored, which is what the old path did
             // by never keeping one.
-            const splice::Outcome outcome = sites.Install(count);
-            RecordGroupOutcome(section, report, count, outcome);
-            const AttachResult mapped = AttachResultFor(outcome);
-            result = {mapped, mapped == AttachResult::kActive ? count : 0};
+            const std::size_t inline_count = d12 ? std::size(kInlineSites) : 1U;
+            const splice::Outcome outcome = sites.InstallInline(inline_count);
+            RecordGroupOutcome(section, report, kInlineSites, inline_count, outcome);
+            AttachResult mapped = AttachResultFor(outcome);
+
+            // The cell swap only happens if the code is already patched, which
+            // is what makes the ordering matter: everything above can still
+            // refuse with nothing written anywhere.
+            if (mapped == AttachResult::kActive && d12) {
+                const splice::Outcome cell = sites.SwapSignalCell();
+                RecordGroupOutcome(section, report, &kSignalSite, 1, cell);
+                if (cell.state() != splice::State::installed) {
+                    // Six sites are live and the seventh never will be, so the
+                    // queue never binds and D3D12 never draws. That is neither
+                    // active nor a refusal: a refusal unloads this module, and
+                    // patched code is executing in it. `kPartialResident` is
+                    // the state the protocol already carries for exactly this,
+                    // and the inspection classifier already declines to draw
+                    // on it while the attach side keeps the module.
+                    mapped = AttachResult::kPartialResident;
+                }
+            }
+
+            const std::size_t live = mapped == AttachResult::kActive ? count
+                                     : mapped == AttachResult::kPartialResident
+                                         ? std::size(kInlineSites)
+                                         : 0;
+            result = {mapped, live};
             if (mapped == AttachResult::kActive) {
                 active.store(true, std::memory_order_release);
             }

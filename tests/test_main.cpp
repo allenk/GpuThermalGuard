@@ -9,6 +9,7 @@
 #include "tray/control_baseline.hpp"
 #include "timing/ui_phase_timing.hpp"
 #include "tray/osd_compact.hpp"
+#include "tray/osd_details.hpp"
 #include "tray/osd_placement.hpp"
 #include "tray/osd_tiny.hpp"
 #include "tray/trip_markers.hpp"
@@ -44,11 +45,15 @@
 #include "topapp/app_name.hpp"
 #include "topapp/board.hpp"
 #include "topapp/cpu_ledger.hpp"
+#include "topapp/details.hpp"
 #include "topapp/leader.hpp"
 #include "topapp/marquee.hpp"
+#include "topapp/network_meter.hpp"
 #include "topapp/pdh_instance.hpp"
+#include "topapp/sampler.hpp"
 #include "topapp/sweep_budget.hpp"
 #include "topapp/system_process.hpp"
+#include "topapp/working_directory.hpp"
 #include "peer/admission.hpp"
 #include "peer/crypto.hpp"
 #include "peer/hosts_view.hpp"
@@ -67,6 +72,7 @@
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#include <evntrace.h>
 
 #include <bit>
 #include <cmath>
@@ -4572,6 +4578,712 @@ void TestOsdSnap() {
 
 // --- top-app alert ----------------------------------------------------------
 
+// Details' table: each record's top ten apps merged, then ranked by the column
+// the reader sorts by. Idle apps and unmeasured values are never listed.
+void TestTopAppDetails() {
+    using gtg::topapp::Column;
+    using gtg::topapp::DetailsRow;
+
+    const std::map<std::wstring, double> group{{L"a", 5.0}, {L"b", 0.0}, {L"c", 7.0}, {L"d", 5.0}};
+    Require(gtg::topapp::TopKeys(group, 2) == std::vector<std::wstring>{L"c", L"a"},
+            "the largest first, ties by key, cut at the count");
+    Require(gtg::topapp::TopKeys(group, 10) == std::vector<std::wstring>{L"c", L"a", L"d"},
+            "an app at zero is not ranked");
+
+    std::array<std::map<std::wstring, double>, gtg::topapp::kColumnCount> groups;
+    for (int i = 0; i < 12; ++i)
+        groups[0][std::format(L"g{:02}", i)] = 100.0 - i;
+    groups[2][L"g00"] = 3.0;
+    groups[2][L"cpu-only"] = 1.0;
+    groups[4][L"net-only"] = 2048.0;
+    const auto merged = gtg::topapp::MergeTopKeys(groups, 10);
+    Require(merged.size() == 12, "ten GPU apps, one more from CPU and one from the network");
+    Require(std::find(merged.begin(), merged.end(), L"g10") == merged.end(),
+            "the eleventh GPU app is not kept");
+    Require(std::count(merged.begin(), merged.end(), L"g00") == 1,
+            "an app in two records is listed once");
+    Require(std::is_sorted(merged.begin(), merged.end()), "merged in key order");
+
+    gtg::topapp::Details details;
+    const auto row = [](std::wstring name, std::optional<double> gpu, std::optional<double> cpu) {
+        DetailsRow r;
+        r.name = std::move(name);
+        r.values[0] = gpu;
+        r.values[2] = cpu;
+        return r;
+    };
+    details.rows = {row(L"zeta", 40.0, 1.0), row(L"alpha", 40.0, 0.0), row(L"idle", 0.0, 9.0),
+                    row(L"unknown", std::nullopt, 2.0), row(L"top", 90.0, 0.5)};
+    const auto gpu = gtg::topapp::Ranked(details, Column::Gpu, 10);
+    Require(gpu == std::vector<std::size_t>{4, 1, 0}, "GPU: largest first, ties by name");
+    const auto cpu = gtg::topapp::Ranked(details, Column::Cpu, 2);
+    Require(cpu == std::vector<std::size_t>{2, 3}, "CPU: another order, cut at the count");
+    Require(gtg::topapp::Ranked(details, Column::Ram, 10).empty(),
+            "a column nobody measured lists no one");
+    Require(gtg::topapp::ColumnOf(gtg::topapp::Record::Ram) == Column::Ram &&
+                gtg::topapp::Bit(Column::Cpu) == gtg::topapp::Bit(gtg::topapp::Record::Cpu),
+            "the first four columns are the records, bit for bit");
+
+    // The process an app's row names: the one holding the most, the lower id
+    // of two equal ones whatever order they came in, nothing for nothing held.
+    gtg::topapp::Heaviest heaviest;
+    heaviest.Offer(10, 5.0);
+    heaviest.Offer(7, 5.0);
+    Require(heaviest.pid == 7, "of two equal, the lower id");
+    heaviest.Offer(12, 9.0);
+    heaviest.Offer(3, 0.0);
+    heaviest.Offer(4, 8.9);
+    Require(heaviest.pid == 12 && heaviest.value == 9.0, "the most, whatever came after");
+    gtg::topapp::Heaviest idle;
+    idle.Offer(5, 0.0);
+    idle.Offer(6, -1.0);
+    Require(idle.pid == 0, "a process holding nothing is nobody's representative");
+}
+
+// A process's working directory: made one way, refused when it is not a place,
+// its last folder only where it says something about the app; then read back
+// from this process and from children started where the test chose.
+void TestTopAppWorkingDirectory() {
+    using gtg::topapp::FolderOf;
+    using gtg::topapp::NormalDirectory;
+
+    Require(NormalDirectory(L"C:\\work\\") == L"C:\\work", "no trailing separator");
+    Require(NormalDirectory(L"C:\\") == L"C:\\", "but a drive's root keeps its own");
+    Require(NormalDirectory(L"\\\\host\\share\\dir\\") == L"\\\\host\\share\\dir",
+            "a UNC path is a place too");
+    Require(!NormalDirectory(L"\\\\?\\C:\\work") && !NormalDirectory(L"\\\\.\\pipe\\x"),
+            "a device path is not");
+    Require(!NormalDirectory(L"work\\dir") && !NormalDirectory(L"C:work") && !NormalDirectory(L""),
+            "nor a relative one or nothing");
+    Require(!NormalDirectory(std::wstring(L"C:\\a") + L'\n' + L"b"),
+            "a control character is a torn read");
+    Require(!NormalDirectory(L"C:\\" + std::wstring(gtg::topapp::kMaxDirectoryChars, L'x')),
+            "nor anything longer than a path can be");
+
+    Require(gtg::topapp::IsWithin(L"c:/windows/System32", L"C:\\WINDOWS\\"),
+            "inside, whatever the case and separator");
+    Require(!gtg::topapp::IsWithin(L"C:\\WindowsApps", L"C:\\Windows"),
+            "a longer name is not inside a shorter one");
+
+    const std::wstring_view windows = L"C:\\WINDOWS";
+    Require(FolderOf(L"D:\\work\\image-server", L"C:\\Python313\\python.exe", windows) ==
+                L"image-server",
+            "an interpreter's project");
+    Require(FolderOf(L"C:\\WINDOWS\\system32", L"C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+                     windows)
+                .empty(),
+            "a program the shell started in Windows' folder says nothing");
+    Require(FolderOf(L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\157.0.4341.42",
+                     L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", windows)
+                .empty(),
+            "nor one working inside its own install");
+    Require(FolderOf(L"D:\\tools\\editor", L"D:\\tools\\editor\\editor.exe", windows).empty(),
+            "nor one working where it is");
+    Require(FolderOf(L"C:\\", L"C:\\tools\\a.exe", windows).empty(), "nor a drive's root");
+    Require(FolderOf(L"C:\\WindowsApps2\\project", L"C:\\tools\\a.exe", windows) == L"project",
+            "a folder only named like Windows' is a place");
+    Require(FolderOf(L"\\\\host\\share", L"C:\\tools\\a.exe", windows) == L"share",
+            "a share's last folder");
+    Require(FolderOf(L"", L"C:\\tools\\a.exe", windows).empty(), "nothing read, nothing shown");
+
+    const auto identity_of = [](const HANDLE process) {
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        Require(GetProcessTimes(process, &creation, &exit, &kernel, &user) != FALSE,
+                "a process's creation time");
+        return gtg::topapp::Identity{
+            GetProcessId(process),
+            (static_cast<std::uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime};
+    };
+    wchar_t here[MAX_PATH]{};
+    Require(GetCurrentDirectoryW(MAX_PATH, here) > 0, "this process's directory");
+    const auto self = identity_of(GetCurrentProcess());
+    Require(gtg::topapp::ReadWorkingDirectory(self) == NormalDirectory(here),
+            "this process's own directory, read where it keeps it");
+    Require(!gtg::topapp::ReadWorkingDirectory({self.pid, self.created + 1}),
+            "another process that had this id has no directory here");
+
+    // Children started suspended in a directory of the test's choosing, its
+    // name not ASCII: a 64-bit one is read, a 32-bit one is not.
+    wchar_t temp[MAX_PATH]{};
+    Require(GetTempPathW(MAX_PATH, temp) > 0, "a temporary folder");
+    const std::filesystem::path chosen =
+        std::filesystem::path(temp) / std::format(L"gtg 工作目錄 {}", GetCurrentProcessId());
+    std::filesystem::create_directories(chosen);
+    wchar_t system[MAX_PATH]{};
+    Require(GetSystemDirectoryW(system, MAX_PATH) > 0, "System32");
+    wchar_t windows_folder[MAX_PATH]{};
+    Require(GetWindowsDirectoryW(windows_folder, MAX_PATH) > 0, "Windows' folder");
+    const auto start_in = [&](const std::filesystem::path& program) -> std::optional<std::wstring> {
+        std::wstring command = L"\"" + program.wstring() + L"\" /d /c exit";
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION info{};
+        Require(CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, FALSE,
+                               CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, chosen.c_str(),
+                               &startup, &info) != FALSE,
+                "a child started suspended in the chosen directory");
+        const auto read = gtg::topapp::ReadWorkingDirectory(identity_of(info.hProcess));
+        TerminateProcess(info.hProcess, 0);
+        WaitForSingleObject(info.hProcess, 5'000);
+        CloseHandle(info.hThread);
+        CloseHandle(info.hProcess);
+        return read;
+    };
+    const auto native = start_in(std::filesystem::path(system) / L"cmd.exe");
+    const std::filesystem::path wow64 =
+        std::filesystem::path(windows_folder) / L"SysWOW64" / L"cmd.exe";
+    std::optional<std::wstring> thirty_two;
+    const bool has_wow64 = std::filesystem::exists(wow64);
+    if (has_wow64) thirty_two = start_in(wow64);
+    std::error_code ignored;
+    std::filesystem::remove(chosen, ignored);
+    Require(native == NormalDirectory(chosen.wstring()),
+            "a child's directory is the one it was started in");
+    if (has_wow64) {
+        Require(!thirty_two, "a 32-bit process is not read");
+    } else {
+        std::printf("  (no 32-bit Windows here: not exercised)\n");
+    }
+
+    // The reads are made on the process token: a thread on a copy of it, as
+    // the sampler's is, steps off the copy for them and back on after. On a
+    // thread of its own, so nothing here is left impersonating; Require is
+    // only called once it has ended.
+    const auto has_thread_token = [] {
+        HANDLE token = nullptr;
+        const bool has = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) != FALSE;
+        if (token != nullptr) CloseHandle(token);
+        return has;
+    };
+    bool copied = false;
+    bool ready = false;
+    bool off = false;
+    bool back = false;
+    bool plain_ready = false;
+    std::thread([&] {
+        {
+            gtg::topapp::ProcessTokenScope plain;
+            plain_ready = plain.Ready() && !has_thread_token();
+        }
+        if (!ImpersonateSelf(SecurityImpersonation)) return;
+        copied = has_thread_token();
+        {
+            gtg::topapp::ProcessTokenScope scope;
+            ready = scope.Ready();
+            off = !has_thread_token();
+        }
+        back = has_thread_token();
+        (void)RevertToSelf();
+    }).join();
+    Require(plain_ready, "a thread already on the process token is ready as it is");
+    Require(copied, "the thread runs on a copy of the token");
+    Require(ready && off, "and steps off it for the reads");
+    Require(back, "and is back on it after");
+}
+
+// The network column's events and their grouping, without a trace: the
+// payload's first two fields, only for the eight data events, and bytes per
+// second per app with processes the sweep did not see left out.
+void TestTopAppNetworkColumn() {
+    using gtg::topapp::DecodeNetworkEvent;
+
+    std::array<std::uint8_t, 12> payload{};
+    const std::uint32_t pid = 4242;
+    const std::uint32_t bytes = 1500;
+    std::memcpy(payload.data(), &pid, 4);
+    std::memcpy(payload.data() + 4, &bytes, 4);
+    for (const std::uint16_t id : gtg::topapp::kNetworkDataEvents) {
+        const auto event = DecodeNetworkEvent(id, payload.data(), payload.size());
+        Require(event && event->pid == pid && event->bytes == bytes,
+                "every data event reads PID then size");
+    }
+    Require(!DecodeNetworkEvent(12, payload.data(), payload.size()), "a connect is not traffic");
+    Require(!DecodeNetworkEvent(10, payload.data(), 7), "a short payload is not read");
+    Require(!DecodeNetworkEvent(10, nullptr, 12), "no payload is not read");
+
+    const std::vector<std::pair<std::uint32_t, std::uint64_t>> counted{
+        {10, 3'000'000}, {11, 1'000'000}, {12, 500'000}, {99, 7'000'000}, {13, 0}};
+    const std::map<std::uint32_t, std::wstring> keys{
+        {10, L"edge"}, {11, L"edge"}, {12, L"steam"}, {13, L"idle"}};
+    const auto rates = gtg::topapp::NetworkByApp(counted, keys, 2.0);
+    Require(rates.size() == 2, "two apps; the unseen process and the silent one are not listed");
+    Require(rates.at(L"edge") == 2'000'000.0, "an app's processes add up, per second");
+    Require(rates.at(L"steam") == 250'000.0, "per second over the interval");
+    Require(gtg::topapp::NetworkByApp(counted, keys, 0.0).empty(), "no interval, no rate");
+
+    // The trace session's name: one per program, so the tests running beside a
+    // GTG never reclaim -- stop -- GTG's trace.
+    using gtg::topapp::NetworkSessionName;
+    Require(NetworkSessionName(L"D:\\tools\\GTG\\GpuThermalGuard.exe", 1) ==
+                L"GpuThermalGuard.Network.Session.1",
+            "GTG keeps the name it always had");
+    Require(NetworkSessionName(L"D:\\build\\gtg_tests.exe", 2) == L"gtg_tests.Network.Session.2",
+            "another program has its own");
+    Require(NetworkSessionName(L"", 1) == L"GpuThermalGuard.Network.Session.1",
+            "no path reads as GTG");
+    Require(NetworkSessionName(L"C:\\" + std::wstring(200, L'x') + L".exe", 1).size() <= 80,
+            "a long program name is cut to fit the session's buffer");
+    Require(gtg::topapp::NetworkMeter::SessionName().starts_with(L"gtg_tests.Network.Session."),
+            "the tests' own name");
+}
+
+// Details' geometry: the controls, headings and rows in the expanded window,
+// which lane or card a double-click lands on, and the figures.
+void TestOsdDetails() {
+    namespace details = gtg::tray::details;
+    using gtg::topapp::Column;
+
+    const auto five = details::MakeGeometry(388.0F, 330.0F, 10);
+    Require(five.rows == 10, "ten rows fit the five-record window");
+    Require(five.row_height >= details::kRowMinimumDip && five.row_height < details::kRowHeightDip,
+            "sharing its height below the maximum");
+    Require(details::kRowHeightDip > details::kRowEmDip * 1.5F,
+            "a full row leaves room around its text");
+    const auto eight = details::MakeGeometry(388.0F, 405.0F, 10);
+    Require(eight.rows == 10 && eight.row_height == details::kRowHeightDip,
+            "the eight-record window gives ten rows their full height");
+    const auto& full = five;
+    Require(full.back.x == details::kMarginDip && full.action.Right() == 388.0F - 6.0F,
+            "back and the action at the title's ends");
+    Require(full.name.width >= 120.0F, "five columns leave the name 120 dip or more");
+    Require(full.columns[0].x == full.name.Right(), "the figures start where the name ends");
+    for (std::size_t r = 1; r < gtg::topapp::kColumnCount; ++r)
+        Require(full.columns[r].x == full.columns[r - 1].Right(), "columns are contiguous");
+    Require(full.columns[4].Right() == 388.0F - 6.0F, "the last column ends at the margin");
+    Require(details::RowAt(full, full.rows - 1).Bottom() <= full.footer.y,
+            "the last row ends above the footer");
+    Require(full.footer.Bottom() == 330.0F - 6.0F, "the footer sits on the bottom margin");
+
+    const auto squeezed = details::MakeGeometry(388.0F, 181.0F, 10);
+    Require(squeezed.rows >= 1 && squeezed.rows < 10, "a short window lists fewer rows");
+    Require(squeezed.row_height >= details::kRowMinimumDip, "rows never below the minimum");
+    Require(details::RowAt(squeezed, squeezed.rows - 1).Bottom() <= squeezed.footer.y,
+            "and they still end above the footer");
+
+    const auto centre = [](const details::Box& b) {
+        return std::pair{b.x + b.width / 2.0F, b.y + b.height / 2.0F};
+    };
+    const auto hit = [&](const details::Box& b) {
+        const auto [x, y] = centre(b);
+        return details::HitTest(full, x, y, true);
+    };
+    Require(hit(full.back).target == details::Target::Back, "back");
+    Require(hit(full.action).target == details::Target::Action, "the action, where offered");
+    {
+        const auto [x, y] = centre(full.action);
+        Require(details::HitTest(full, x, y, false).target == details::Target::None,
+                "and nothing where it is not");
+    }
+    const auto busy = details::BusyBox(full);
+    Require(busy.Right() == full.action.Right() && busy.y == details::kTopDip &&
+                busy.height == gtg::tray::compact::kCellHeightDip && busy.x > full.back.Right(),
+            "an action's indicator is a cell over the control, clear of back");
+    Require(details::ActionOf(Column::Ram) == details::Action::Reclaim &&
+                details::ActionOf(Column::Network) == details::Action::Latency &&
+                details::ActionOf(Column::Gpu) == details::Action::None &&
+                details::ActionOf(Column::Vram) == details::Action::None &&
+                details::ActionOf(Column::Cpu) == details::Action::None,
+            "RAM reclaims and NET measures latency, as their cells do; the rest have none");
+    Require(hit(full.columns[2]) == details::Hit{details::Target::Sort, Column::Cpu},
+            "the CPU heading sorts by CPU");
+    Require(hit(full.name).target == details::Target::Name, "the app heading switches its view");
+    Require(hit(details::RowAt(full, 3)).target == details::Target::None, "a row is not a control");
+
+    // The rows the pointer finds: their band, across the width.
+    {
+        const auto [x, y] = centre(details::RowAt(full, 3));
+        Require(details::RowIndexAt(full, x, y) == 3, "the fourth row");
+        Require(details::RowIndexAt(full, x, full.rows_top - 1.0F) == -1, "not the headings");
+        Require(details::RowIndexAt(full, full.name.x - 1.0F, y) == -1, "not the margin");
+        Require(
+            details::RowIndexAt(full, x, details::RowAt(full, full.rows - 1).Bottom() + 1.0F) == -1,
+            "not below the last row");
+    }
+
+    // The App column's three views, from the process holding most of the
+    // sorted column.
+    Require(details::NextView(details::NameView::Name) == details::NameView::Location &&
+                details::NextView(details::NameView::Location) == details::NameView::Pid &&
+                details::NextView(details::NameView::Pid) == details::NameView::Name,
+            "name, location, id, and round again");
+    gtg::topapp::DetailsRow python;
+    python.name = L"Python";
+    python.processes = 2;
+    python.representatives[static_cast<std::size_t>(Column::Vram)] = {
+        3240, L"D:\\work\\image-server", L"image-server"};
+    python.representatives[static_cast<std::size_t>(Column::Cpu)] = {90144, L"D:\\work\\database",
+                                                                     L"database"};
+    python.representatives[static_cast<std::size_t>(Column::Ram)] = {5120, L"C:\\WINDOWS\\system32",
+                                                                     L""};
+    using details::NameView;
+    Require(details::NameFor(python, Column::Vram, NameView::Name) ==
+                details::RowName{L"Python", false},
+            "the name");
+    Require(details::NameFor(python, Column::Vram, NameView::Location) ==
+                details::RowName{L"image-server", false},
+            "where the process holding most of the sorted column works");
+    Require(details::NameFor(python, Column::Cpu, NameView::Location) ==
+                details::RowName{L"database", false},
+            "another column, another process");
+    Require(details::NameFor(python, Column::Ram, NameView::Location) ==
+                details::RowName{L"Python", true},
+            "a directory that says nothing keeps the name, muted");
+    Require(details::NameFor(python, Column::Vram, NameView::Pid) ==
+                details::RowName{L"3240 · Python", false},
+            "the id first");
+    Require(
+        details::NameFor(python, Column::Gpu, NameView::Pid) == details::RowName{L"Python", false},
+        "no process holds the column: the name");
+    Require(details::HoverLead(python.representatives[1]) == L"PID 3240 · " &&
+                details::HoverLead({77, L"", L""}) == L"PID 77" && details::HoverLead({}).empty(),
+            "the footer names the process, then its directory if read");
+    Require(details::ShowableDirectory(L"D:\\Projects") && details::ShowableDirectory(L"c:\\"),
+            "a drive path can be shown");
+    Require(!details::ShowableDirectory(L"\\\\host\\share") &&
+                !details::ShowableDirectory(L"\\\\?\\C:\\x") &&
+                !details::ShowableDirectory(L"C:") && !details::ShowableDirectory(L"1:\\x") &&
+                !details::ShowableDirectory(L"work"),
+            "a network, device, relative or malformed one cannot");
+
+    // What is listed, as the painter, the pointer and a double-click see it.
+    gtg::topapp::Details listed;
+    listed.available = 0x1F;
+    listed.measured = 0x1F;
+    gtg::topapp::DetailsRow loaded;
+    loaded.name = L"loaded";
+    loaded.values[0] = 50.0;
+    gtg::topapp::DetailsRow quiet;
+    quiet.name = L"quiet";
+    quiet.values[0] = 5.0;
+    listed.rows = {quiet, loaded};
+    Require(details::Listed(&listed, Column::Gpu, 10) == std::vector<std::size_t>{1, 0},
+            "largest first");
+    Require(details::Listed(&listed, Column::Gpu, 1) == std::vector<std::size_t>{1},
+            "as many as fit");
+    listed.measured = 0;
+    Require(details::Listed(&listed, Column::Gpu, 10).empty(), "nothing while measuring");
+    listed.measured = 0x1F;
+    listed.paused = true;
+    Require(details::Listed(&listed, Column::Gpu, 10).empty() &&
+                details::Listed(nullptr, Column::Gpu, 10).empty(),
+            "nothing while paused or before a table");
+
+    // Lanes: 299 dip under the header shared by five, 2 dip between them.
+    Require(details::ExpandedSlotAt(false, 5, 388.0F, 330.0F, 100.0F, 40.0F) == 0, "first lane");
+    Require(details::ExpandedSlotAt(false, 5, 388.0F, 330.0F, 100.0F, 31.0F + 59.8F * 2 + 5) == 2,
+            "third lane");
+    Require(details::ExpandedSlotAt(false, 5, 388.0F, 330.0F, 100.0F, 31.0F + 58.5F) == -1,
+            "the gap between two lanes is neither");
+    Require(details::ExpandedSlotAt(false, 5, 388.0F, 330.0F, 100.0F, 20.0F) == -1, "the header");
+    Require(details::ExpandedSlotAt(false, 5, 388.0F, 330.0F, 3.0F, 40.0F) == -1, "the margin");
+    Require(details::ExpandedSlotAt(false, 5, 388.0F, 330.0F, 100.0F, 300.0F) == 4, "last lane");
+    // Cards: the odd last card spans both columns.
+    const auto card = gtg::tray::compact::CardAt(4, 5, 388.0F, 330.0F);
+    Require(details::ExpandedSlotAt(true, 5, 388.0F, 330.0F, card.x + card.width - 10.0F,
+                                    card.y + 10.0F) == 4,
+            "the spanning card, on its right half");
+    const auto second = gtg::tray::compact::CardAt(1, 5, 388.0F, 330.0F);
+    Require(details::ExpandedSlotAt(true, 5, 388.0F, 330.0F, second.x + 5.0F, second.y + 5.0F) == 1,
+            "the second card");
+    Require(
+        details::ExpandedSlotAt(true, 5, 388.0F, 330.0F, second.x - 2.0F, second.y + 5.0F) == -1,
+        "the gap between two cards is neither");
+
+    // Which column a record opens Details on, and whose double-click is its own.
+    using gtg::tray::compact::Metric;
+    Require(details::ColumnFor(Metric::Gpu) == Column::Gpu &&
+                details::ColumnFor(Metric::Vram) == Column::Vram &&
+                details::ColumnFor(Metric::Cpu) == Column::Cpu &&
+                details::ColumnFor(Metric::Ram) == Column::Ram &&
+                details::ColumnFor(Metric::Network) == Column::Network,
+            "a record with a column opens on it");
+    for (const Metric other : {Metric::Temperature, Metric::Power, Metric::Fps, Metric::Hosts}) {
+        Require(details::ColumnFor(other) == Column::Gpu, "a record without one opens on GPU");
+    }
+    // On a machine with no GPU column, GPU opens on CPU; the rest as asked.
+    const std::uint32_t everything = 0x1F;
+    const std::uint32_t no_gpu =
+        everything & ~gtg::topapp::Bit(Column::Gpu) & ~gtg::topapp::Bit(Column::Vram);
+    Require(details::OpeningColumn(Column::Gpu, no_gpu) == Column::Cpu,
+            "GPU opens on CPU where there is no GPU column");
+    Require(details::OpeningColumn(Column::Gpu, everything) == Column::Gpu,
+            "and on GPU where there is");
+    Require(details::OpeningColumn(Column::Gpu, std::nullopt) == Column::Gpu,
+            "and on GPU before anything is known");
+    Require(details::OpeningColumn(Column::Vram, no_gpu) == Column::Vram,
+            "VRAM, asked for by name, is kept");
+    for (const Column asked : {Column::Cpu, Column::Ram, Column::Network}) {
+        Require(details::OpeningColumn(asked, no_gpu) == asked, "the others open as asked");
+    }
+    Require(details::CellHasAction(Metric::Ram) && details::CellHasAction(Metric::Network),
+            "RAM and Network keep their own double-click in the cells");
+    for (const Metric opens : {Metric::Temperature, Metric::Power, Metric::Vram, Metric::Gpu,
+                               Metric::Cpu, Metric::Fps, Metric::Hosts}) {
+        Require(!details::CellHasAction(opens), "every other cell opens Details");
+    }
+
+    // The header button: the square left of the chevron, apart from it.
+    const int header = 44;  // 25 dip at 175 %
+    const int width = 679;  // 388 dip at 175 %
+    const int button = gtg::tray::compact::HeaderButtonWidth(header);
+    Require(details::ButtonHit(width - button - button / 2, header / 2, width, header),
+            "the button's square");
+    Require(!details::ButtonHit(width - button / 2, header / 2, width, header) &&
+                gtg::tray::compact::ToggleHit(width - button / 2, header / 2, width, header),
+            "the chevron's square is the chevron's");
+    Require(!details::ButtonHit(width - 2 * button - 1, header / 2, width, header) &&
+                !details::ButtonHit(width - button - button / 2, header, width, header),
+            "nothing left of it or under the header");
+
+    Require(details::FormatPercent(87.4) == L"87%", "whole percent from ten up");
+    Require(details::FormatPercent(9.96) == L"10%", "rounding up to ten drops the decimal");
+    Require(details::FormatPercent(4.24) == L"4.2%", "one decimal below ten");
+    Require(details::FormatPercent(0.04) == L"<0.1%", "a trace is not zero");
+    Require(details::FormatPercent(0.0) == L"0%", "zero");
+    constexpr double kMiB = 1024.0 * 1024.0;
+    Require(details::FormatBytes(2.5 * 1024.0 * kMiB) == L"2.5 GiB", "GiB");
+    Require(details::FormatBytes(850.0 * kMiB) == L"850 MiB", "MiB");
+    Require(details::FormatBytes(1000.0 * kMiB) == L"1.0 GiB", "never four digits of MiB");
+    Require(details::FormatBytes(60.0 * 1024.0 * kMiB) == L"60 GiB", "whole GiB from ten up");
+    Require(details::FormatBytes(0.5 * kMiB) == L"<1 MiB", "a trace of memory");
+    Require(details::FormatValue(Column::Vram, 850.0 * kMiB) == L"850 MiB", "VRAM in bytes");
+    Require(details::FormatValue(Column::Cpu, 12.0) == L"12%", "CPU in percent");
+    Require(details::FormatValue(Column::Network, 12.4 * kMiB) == L"12.4",
+            "NET in MB/s, the network's one unit");
+    Require(details::FormatRate(1.0) == L"0.1" && details::FormatRate(0.0) == L"0.0",
+            "a live app never reads 0.0; silence does");
+
+    Require(std::abs(details::Heat(50.0, 100.0) - std::sqrt(0.5F)) < 1e-6F,
+            "heat is the root share");
+    Require(details::Heat(200.0, 100.0) == 1.0F, "heat is capped");
+    Require(details::Heat(10.0, 0.0) == 0.0F && details::Heat(0.0, 100.0) == 0.0F,
+            "no heat without a whole or a value");
+}
+
+// The sampler thread with Details open and nothing in alert, on this machine's
+// own processes (read-only): it wakes, publishes a table and no names,
+// measures CPU from its second sweep, and publishes nothing again once Details
+// closes -- the thread is back asleep.
+bool ThisProcessElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    const bool elevated =
+        GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+        elevation.TokenIsElevated != 0;
+    CloseHandle(token);
+    return elevated;
+}
+
+// Stops a trace session by its name, as another program could.
+bool StopTraceSession(const std::wstring& name) {
+    struct StopBuffer {
+        EVENT_TRACE_PROPERTIES properties;
+        wchar_t name[128];
+    } stop{};
+
+    stop.properties.Wnode.BufferSize = sizeof(stop);
+    stop.properties.LoggerNameOffset = offsetof(StopBuffer, name);
+    return ControlTraceW(0, name.c_str(), &stop.properties, EVENT_TRACE_CONTROL_STOP) ==
+           ERROR_SUCCESS;
+}
+
+void TestTopAppSamplerDetails() {
+    using gtg::topapp::Bit;
+    using gtg::topapp::Record;
+    using gtg::topapp::Result;
+
+    gtg::topapp::Sampler sampler;
+    Require(sampler.Start(), "the sampler thread starts");
+    const auto wait_for = [&](const auto& ready, const std::uint64_t timeout_ms) {
+        const std::uint64_t until = GetTickCount64() + timeout_ms;
+        std::optional<Result> found;
+        while (!found && GetTickCount64() < until) {
+            if (auto result = sampler.TryRead(); result && ready(*result)) {
+                found = std::move(result);
+            } else {
+                Sleep(50);
+            }
+        }
+        return found;
+    };
+    const auto has_details = [](const Result& r) {
+        return r.details.has_value();
+    };
+    Require(!wait_for(has_details, 300), "no table before Details opens");
+
+    sampler.SetDetails(true);
+    const auto first =
+        wait_for([](const Result& r) { return r.details && !r.details->paused; }, 5'000);
+    Require(first.has_value(), "opening Details publishes a table");
+    const std::uint32_t always = Bit(Record::Cpu) | Bit(Record::Ram);
+    Require(first->details->processes > 0, "it read this machine's processes");
+    Require((first->details->available & always) == always, "CPU and RAM are always available");
+    for (const auto& name : first->names)
+        Require(!name.has_value(), "nothing in alert names nothing");
+
+    const auto measured = wait_for(
+        [](const Result& r) {
+            return r.details && (r.details->measured & Bit(Record::Cpu)) != 0 &&
+                   (r.details->measured & Bit(Record::Ram)) != 0;
+        },
+        5'000);
+    Require(measured.has_value(), "CPU is measured from the second sweep");
+    const auto& table = *measured->details;
+    Require(!table.rows.empty(), "the table has apps");
+    Require(table.totals[static_cast<std::size_t>(Record::Ram)] > 0.0, "RAM's whole is known");
+    for (const auto& row : table.rows) {
+        Require(!row.name.empty() && row.processes >= 1, "every app is named and counted");
+        Require(row.values[static_cast<std::size_t>(Record::Ram)].has_value() &&
+                    row.values[static_cast<std::size_t>(Record::Cpu)].has_value(),
+                "measured columns carry a value, zero included");
+    }
+
+    // This process made busy enough to be listed: its CPU representative is
+    // itself, with the directory it works in, read through the sampler's own
+    // token handling -- elevated, the thread's privileged copy is stepped out
+    // of for the read.
+    {
+        std::atomic<bool> spinning{true};
+        std::vector<std::thread> spinners;
+        for (int i = 0; i < 4; ++i) {
+            spinners.emplace_back([&] {
+                volatile std::uint64_t sink = 0;
+                while (spinning.load(std::memory_order_relaxed))
+                    sink = sink + 1;
+            });
+        }
+        const DWORD self = GetCurrentProcessId();
+        const auto listed_self = [&](const Result& r) -> const gtg::topapp::Representative* {
+            if (!r.details || (r.details->measured & Bit(Record::Cpu)) == 0) return nullptr;
+            for (const auto& row : r.details->rows) {
+                const auto& who = row.representatives[static_cast<std::size_t>(Record::Cpu)];
+                if (who.pid == self) return &who;
+            }
+            return nullptr;
+        };
+        const auto found =
+            wait_for([&](const Result& r) { return listed_self(r) != nullptr; }, 8'000);
+        spinning.store(false);
+        for (auto& spinner : spinners)
+            spinner.join();
+        Require(found.has_value(), "this process, busy, is listed as its own representative");
+        const gtg::topapp::Representative& who = *listed_self(*found);
+        wchar_t here[MAX_PATH]{};
+        wchar_t image[MAX_PATH]{};
+        wchar_t windows[MAX_PATH]{};
+        Require(GetCurrentDirectoryW(MAX_PATH, here) > 0 &&
+                    GetModuleFileNameW(nullptr, image, MAX_PATH) > 0 &&
+                    GetWindowsDirectoryW(windows, MAX_PATH) > 0,
+                "where this process works and what it is");
+        Require(who.directory == gtg::topapp::NormalDirectory(here),
+                "with the directory it works in");
+        Require(who.folder == gtg::topapp::FolderOf(who.directory, image, windows),
+                "and that directory's folder by the rule");
+    }
+
+    // The network column needs Administrator for its trace. Without it the
+    // column says so rather than showing zeros; with it, this process's own
+    // loopback datagrams are counted under its name.
+    const std::uint32_t network = gtg::topapp::Bit(gtg::topapp::Column::Network);
+    if (!ThisProcessElevated()) {
+        Require((table.available & network) == 0, "no network column without Administrator");
+        std::printf("  (network trace not exercised: not elevated)\n");
+    } else {
+        WSADATA wsa{};
+        Require(WSAStartup(MAKEWORD(2, 2), &wsa) == 0, "the test's own socket");
+        const SOCKET sink = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        const SOCKET source = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int length = sizeof(address);
+        Require(sink != INVALID_SOCKET && source != INVALID_SOCKET &&
+                    bind(sink, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+                    getsockname(sink, reinterpret_cast<sockaddr*>(&address), &length) == 0,
+                "a loopback sink");
+        std::atomic<bool> sending{true};
+        std::thread traffic([&] {
+            std::array<char, 1200> datagram{};
+            while (sending.load()) {
+                (void)sendto(source, datagram.data(), static_cast<int>(datagram.size()), 0,
+                             reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+                Sleep(2);
+            }
+        });
+        const auto counts_own = [](const Result& r) {
+            if (!r.details ||
+                (r.details->measured & gtg::topapp::Bit(gtg::topapp::Column::Network)) == 0)
+                return false;
+            for (const auto& row : r.details->rows) {
+                const auto& rate =
+                    row.values[static_cast<std::size_t>(gtg::topapp::Column::Network)];
+                if (rate && *rate > 0.0 && row.name.find(L"gtg_tests") != std::wstring::npos)
+                    return true;
+            }
+            return false;
+        };
+        const auto counted = wait_for(counts_own, 10'000);
+
+        // The trace's session stopped from outside: the sampler notices, the
+        // column says it is measuring again rather than that no app uses the
+        // network, and the trace is started again and counts again.
+        bool stopped = false;
+        std::optional<Result> lapsed;
+        std::optional<Result> recounted;
+        if (counted) {
+            stopped = StopTraceSession(gtg::topapp::NetworkMeter::SessionName());
+            if (stopped) {
+                lapsed = wait_for(
+                    [&](const Result& r) {
+                        return r.details && (r.details->measured & network) == 0 &&
+                               (r.details->available & network) != 0;
+                    },
+                    5'000);
+                recounted = wait_for(counts_own, 20'000);
+            }
+        }
+
+        // The sender is stopped before any verdict: a failed one throws.
+        sending.store(false);
+        traffic.join();
+        closesocket(source);
+        closesocket(sink);
+        WSACleanup();
+        Require(counted.has_value(), "the trace counts this process's own traffic");
+        Require(stopped, "the trace's session is stopped from outside");
+        Require(lapsed.has_value(), "an ended trace reads as measuring, not as no traffic");
+        Require(recounted.has_value(), "and counts again once started again");
+    }
+
+    sampler.SetDetails(false);
+    Require(wait_for([&](const Result& r) { return !has_details(r); }, 3'000).has_value(),
+            "closing Details publishes nothing again");
+    sampler.Stop();
+
+    // The meter itself, the sampler's gone: an end from outside is reported
+    // with its session gone, and the meter starts again after Stop.
+    if (ThisProcessElevated()) {
+        gtg::topapp::NetworkMeter meter;
+        Require(meter.Start(), "the meter starts");
+        Require(!meter.Ended(), "a running trace has not ended");
+        Require(StopTraceSession(gtg::topapp::NetworkMeter::SessionName()),
+                "its session is stopped from outside");
+        std::optional<gtg::topapp::NetworkMeter::End> end;
+        for (int i = 0; i < 60 && !end; ++i) {
+            Sleep(50);
+            end = meter.Ended();
+        }
+        Require(end.has_value() && !end->session_exists,
+                "the end is seen, and the session is gone");
+        std::printf("  (an ended trace's status: %u)\n", end ? end->status : 0U);
+        meter.Stop();
+        Require(meter.Start() && !meter.Ended(), "and the meter starts again");
+        meter.Stop();
+    }
+}
+
 // The sampler's cost guard: charged with the sweep's own CPU time, doubling the
 // interval over budget, pausing a minute after five overruns and trying again
 // -- never stopping for as long as an alert lasts.
@@ -4917,6 +5629,13 @@ void TestTopAppSystemProcesses() {
     Require(IsVmWorker(L"C:\\Windows\\System32\\vmwp.exe"), "the system's worker");
     Require(IsVmWorker(L"c:\\windows\\SYSTEM32\\VMWP.EXE"), "in any case");
     Require(!IsVmWorker(L"C:\\Tools\\vmwp.exe"), "not a copy elsewhere");
+
+    // WSL's relay joins the VM's group, under the one key the VM has.
+    Require(at(200).key == kWslKey, "WSL's VM is under WSL's key");
+    Require(IsWslRelay(L"C:\\Program Files\\WSL\\wslrelay.exe"), "WSL's relay");
+    Require(IsWslRelay(L"c:/program files/wsl/WSLRELAY.EXE"), "in any case, either slash");
+    Require(!IsWslRelay(L"C:\\Tools\\wslrelay.exe"), "not a copy elsewhere");
+    Require(!IsWslRelay(L"C:\\Program Files\\WSL\\wslhost.exe"), "only the relay");
 
     // The list is read only for processes newer than it, at most every 10
     // sweeps, and a reused pid never inherits the list's name.
@@ -6692,6 +7411,11 @@ int main(int argc, char** argv) {
         {"FpsPlayClock", TestFpsPlayClock},
         {"TopAppAlertRule", TestTopAppAlertRule},
         {"TopAppSweepBudget", TestTopAppSweepBudget},
+        {"TopAppDetails", TestTopAppDetails},
+        {"TopAppNetworkColumn", TestTopAppNetworkColumn},
+        {"TopAppWorkingDirectory", TestTopAppWorkingDirectory},
+        {"TopAppSamplerDetails", TestTopAppSamplerDetails},
+        {"OsdDetails", TestOsdDetails},
         {"TopAppLeader", TestTopAppLeader},
         {"TopAppNames", TestTopAppNames},
         {"TopAppServiceHost", TestTopAppServiceHost},

@@ -153,7 +153,7 @@ bool SaveOsdWindowPosition(const OsdOverlay& overlay,
     };
     logging::Info(
         std::format(L"OSD placement saved; expanded={} compact={} collapsed={} tiny={} reason={}",
-                    text(positions.expanded), text(positions.collapsed), overlay.Collapsed(),
+                    text(positions.expanded), text(positions.collapsed), overlay.CollapsedAtRest(),
                     overlay.Tiny(), reason));
     return true;
 }
@@ -895,6 +895,7 @@ LRESULT MainDialog::OnTimer(UINT, WPARAM id, LPARAM, BOOL&) {
         }
         // After every record's reading for this tick is in.
         UpdateTopApps(now);
+        UpdateTopAppDetails();
         hosts_.Tick(now, [&] { return LocalHostState(now); });
         UpdateHostsRecord(now);
         PersistCompactArrangement();
@@ -952,7 +953,7 @@ LRESULT MainDialog::OnDestroy(UINT, WPARAM, LPARAM, BOOL&) {
         // pressing the chevron once per launch, forever, is the program making
         // the reader restate a preference it already knows.
         std::wstring collapsed_error;
-        if (!settings::SaveOsdCollapsed(osd_overlay_.Collapsed(), collapsed_error)) {
+        if (!settings::SaveOsdCollapsed(osd_overlay_.CollapsedAtRest(), collapsed_error)) {
             logging::Warning(collapsed_error);
         }
         // Tiny is a form of the compact shape and is kept beside it, so the
@@ -1800,6 +1801,36 @@ void MainDialog::UpdateTopApps(const std::uint64_t now_ms) {
         }
     }
     if (osd_ready_) osd_overlay_.SetTopApps(top_app_board_);
+}
+
+void MainDialog::UpdateTopAppDetails() {
+    const auto record =
+        osd_ready_ && osd_overlay_.Visible() ? osd_overlay_.DetailsRecord() : std::nullopt;
+    if (!record) {
+        if (!top_app_details_open_) return;
+        top_app_details_open_ = false;
+        top_app_sampler_.SetDetails(false);
+        // Started for Details alone: off means no thread again. Bounded by
+        // one sweep, as the setting's own switch is.
+        if (!show_top_app_) top_app_sampler_.Stop();
+        return;
+    }
+    timing::SlowUiScope phase(L"main.topapp.details");
+    // The reader asked to see the apps, so the thread runs whatever the
+    // setting says; it only ever decided whether names float unasked.
+    if (!top_app_sampler_.Running() && !top_app_sampler_.Start()) {
+        if (!top_app_details_open_) {
+            logging::Warning(
+                L"top app details unavailable: the sampler thread could not be started");
+        }
+        top_app_details_open_ = true;
+        return;
+    }
+    top_app_details_open_ = true;
+    top_app_sampler_.SetDetails(true);
+    // Try-only, as the names: a busy sampler leaves the table as it was.
+    const auto result = top_app_sampler_.TryRead();
+    if (result && result->details) osd_overlay_.SetTopAppDetails(*result->details);
 }
 
 LRESULT MainDialog::OnFpsToggle(WORD, WORD, HWND, BOOL&) {

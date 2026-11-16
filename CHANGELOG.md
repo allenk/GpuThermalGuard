@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-16
+
+GpuThermalGuard 1.3: the Direct3D 12 overlay attaches again after a Windows update changed the runtime, and a double-click shows which apps are behind a record.
+
+### Fixed
+
+- **The overlay refused every Direct3D 12 game once Windows shipped `D3D12Core.dll` 10.0.26100.9818.** In that runtime, `ID3D12CommandQueue::Signal` begins with a three-byte instruction, and the overlay patches an entry only when the five bytes it writes fall inside the first instruction, so it refused. Direct3D 11 was not affected. `Signal` is now hooked by replacing its pointer in the command queue's vtable instead of patching its code. The store is a compare-and-swap: it happens only while the slot still holds the `Signal` the helper worked out from the game's runtime, and if another program has already replaced it, the game is refused rather than chained. Games that bring their own Direct3D 12 runtime take the same path, against the runtime they loaded.
+- **`Present` is still patched in place, under the rule the patch actually needs:** the five bytes lie inside one aligned eight-byte block, so they are written in a single store, and inside the function's first instruction. The old rule also required the entry to start an eight-byte block, which refused entries the patch can take.
+
+### Added
+
+- **Details: the top ten apps behind a record.** Double-click GPU, VRAM, CPU or RAM on the expanded OSD, a lane or a card, and the same window shows a table under the same header: one row per app with its number of processes, and GPU, VRAM, CPU, RAM and NET columns, each tinted by its share of the whole. It opens sorted by the record you double-clicked; click a column heading to sort by another. Up to ten rows, only apps that use something. On the compact OSD every cell opens it too, except RAM and NET, which keep their own double-click actions. The list button left of the chevron on the expanded header opens it on GPU, or on CPU where there is no GPU column (no NVIDIA GPU, or more than one). `‹` goes back; collapsing or hiding the OSD closes it, and the in-game overlay never shows it.
+- **Per-app network in Details.** The NET column, in MB/s, comes from a Kernel-Network ETW trace that GTG runs only while Details is open, and it needs Administrator rights; without them the column says so. Traffic is counted where Windows attributes it: SMB serving another machine counts as System, traffic WSL sends out through its NAT is not seen at all, traffic between Windows and WSL counts on the Windows side, and WSL's localhost relay is counted as WSL. A trace that ends on its own is started again ten seconds later.
+- **Which process it is.** For each row and column, Details keeps the process that uses the most. Click the App heading to show, instead of names, where that process works -- the last folder of its working directory -- and click again for its process ID; hover a row to see `PID · path` at the bottom. Where the folder says nothing, System32 or the program's own folder, the name is shown dimmed. Double-click a row to open that folder in Explorer: local drives only, never a network path. GTG reads the working directory of 64-bit processes only, only while Details is open, and never reads a command line, which can carry keys.
+- **Actions in Details.** Sorted by RAM, the top right holds **Reclaim**, the same release of host memory as a double-click on the RAM card; sorted by NET, **Latency**, the same verdict as on the NET card.
+
+### Changed
+
+- **[Splice](https://github.com/allenk/splice) 1.3.0** ([notes](https://github.com/allenk/splice/blob/main/CHANGELOG.md#130---2026-11-15)): a vtable slot can be named by its address and swapped only while it holds the expected function, and a set of hooks that names one place twice is refused before anything is written.
+- **The overlay's startup log says more.** `GpuThermalGuard-overlay-startup.log` now names the game's executable, the Direct3D 12 runtime it runs on and the SDK version used to read it, the shape of each entry point measured, and why a session ended. A game that was closed is recorded as closed rather than as a failure.
+
+### Notes
+
+- 1.2.6 updates to 1.3.0 as to any release. Versions 1.2.7 to 1.2.9 were not released here; their changes are part of this one.
+- Not yet tried in games: the new `Signal` hook with the Direct3D 12 debug layer on, and in games built with Control Flow Guard.
+
 ## [1.2.6] - 2026-11-08
 
 GpuThermalGuard 1.2.6 runs on machines without an NVIDIA GPU, and its releases are signed.

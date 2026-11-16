@@ -145,12 +145,18 @@ add_executable(GpuThermalGuard WIN32
     src/topapp/app_name.hpp
     src/topapp/board.hpp
     src/topapp/cpu_ledger.hpp
+    src/topapp/details.hpp
     src/topapp/leader.hpp
     src/topapp/marquee.hpp
     src/topapp/pdh_instance.hpp
+    src/topapp/network_meter.cpp
+    src/topapp/network_meter.hpp
     src/topapp/sampler.cpp
     src/topapp/sampler.hpp
     src/topapp/system_process.hpp
+    # ntdll's NtQueryInformationProcess is resolved at run time.
+    src/topapp/working_directory.cpp
+    src/topapp/working_directory.hpp
     # Hosts: ws2_32, bcrypt and crypt32 are resolved at run time, and only
     # while Hosts is on, so nothing is added to the link line.
     src/peer/admission.hpp
@@ -226,6 +232,12 @@ if(BUILD_TESTING)
         src/peer/crypto.cpp
         src/peer/link.cpp
         src/peer/pairing.cpp
+        # The sampler thread itself, for Details: read-only queries of this
+        # machine's processes, and its network trace, which needs Administrator
+        # and reports itself unavailable without it.
+        src/topapp/network_meter.cpp
+        src/topapp/sampler.cpp
+        src/topapp/working_directory.cpp
     )
     # ws2_32 for the loopback test's own socket; the link itself resolves
     # Winsock at run time.

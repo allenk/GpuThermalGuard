@@ -5,12 +5,25 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
+#include <cstdio>
 #include <memory>
 #include <stdexcept>
 
 namespace gtg::overlay::integration {
 inline constexpr const char* kProductRoles[] = {"ResizeBuffers", "ResizeBuffers1",
                                                 "SetFullscreenState", "Present1", "SetColorSpace1"};
+
+// A refused discovery names the call and what it returned. Four distinct
+// failures used to leave through one bare `return false`, and the caller's one
+// generic label was all that reached the log -- so a driver refusing to create
+// a device read exactly like an absent interface, and the refusal that matters
+// most here is the one an HRESULT identifies.
+[[noreturn]] inline void RefuseDiscovery(const char* reason, HRESULT result) {
+    char text[192]{};
+    std::snprintf(text, sizeof(text), "%s hr=0x%08lX", reason,
+                  static_cast<unsigned long>(result));
+    throw std::runtime_error(text);
+}
 
 // All objects/modules remain alive through the helper's attachment call. For a
 // target with its own runtime that includes the matching Core: the factory and
@@ -50,12 +63,13 @@ struct ProductMethods {
     bool Discover(const wchar_t* report, Identity target) {
         core_runtime = CoreRuntime::Open(target);
         d11 = LoadLibraryExW(L"d3d11.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!d11) return false;
+        RequireRuntime(d11 != nullptr, "discovery Direct3D 11 system module unavailable");
         const auto create11 = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
             GetProcAddress(d11, "D3D11CreateDeviceAndSwapChain"));
+        RequireRuntime(create11 != nullptr, "discovery Direct3D 11 device entry point unavailable");
         window = CreateWindowExW(0, L"STATIC", L"GTG overlay discovery", WS_POPUP, 0, 0, 2, 2,
                                  nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-        if (!window || !create11) return false;
+        RequireRuntime(window != nullptr, "discovery window unavailable");
         DXGI_SWAP_CHAIN_DESC desc{};
         desc.BufferDesc.Width = desc.BufferDesc.Height = 2;
         desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -65,10 +79,13 @@ struct ProductMethods {
         desc.OutputWindow = window;
         desc.Windowed = TRUE;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        if (FAILED(create11(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-                            D3D11_SDK_VERSION, &desc, &chain, &device11, nullptr, &context)) ||
-            FAILED(chain.As(&chain3)))
-            return false;
+        const auto created =
+            create11(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                     &desc, &chain, &device11, nullptr, &context);
+        if (FAILED(created)) RefuseDiscovery("discovery device and swap chain refused", created);
+        const auto upgraded = chain.As(&chain3);
+        if (FAILED(upgraded))
+            RefuseDiscovery("discovery swap chain interface unavailable", upgraded);
         auto** table = *reinterpret_cast<void***>(chain3.Get());
         std::vector<research::MethodAddress> methods{
             {"Present", table[8]},         {kProductRoles[0], table[13]},
@@ -90,14 +107,22 @@ struct ProductMethods {
             // command, here or in the game.
             auto** queue_table = *reinterpret_cast<void***>(queue.Get());
             if (MatchingRuntime()) CheckMethodOwner(queue_table[14]);
-            methods.push_back({"Signal", queue_table[14]});
+            // Slot fourteen is COM ABI and cannot move, which is the whole
+            // reason this site is installed by swapping the cell instead of
+            // patching the function: the method's prologue is code generation
+            // and changed under us once already. The cell's address goes into
+            // the report beside the method's so the attach side can require
+            // the two to agree in the target.
+            methods.push_back({"Signal", queue_table[14], nullptr, queue_table + 14});
         } else if (MatchingRuntime()) {
             // For the system route a missing queue means D3D12 is unavailable,
             // and Signal is left out of the report. A target that runs its own
             // runtime has already proved otherwise, so this is a refusal.
             throw std::runtime_error("matching runtime helper queue unavailable");
         }
-        return research::WriteMethodReport(report, methods);
+        RequireRuntime(research::WriteMethodReport(report, methods),
+                       "discovery method report not written");
+        return true;
     }
 
     // Select the target's runtime side by side, for this helper only: no

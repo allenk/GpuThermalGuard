@@ -63,6 +63,40 @@ static void ClickToggle(HWND overlay, bool outside = false) {
     SendMessageW(input, WM_LBUTTONUP, 0, outside ? MAKELPARAM(1, header + 10) : point);
 }
 
+// The expanded header's list button, the square left of the chevron. The hit
+// test is the regression it guards: the button first shipped drawn but inside
+// the caption band, so every press became a window drag and nothing opened.
+static void ClickDetailsButton(HWND overlay) {
+    HWND input = InputWindow(overlay);
+    RECT rect{};
+    GetClientRect(input, &rect);
+    const int header = MulDiv(25, static_cast<int>(GetDpiForWindow(input)), 96);
+    const int button = gtg::tray::compact::HeaderButtonWidth(header);
+    const LPARAM point = MAKELPARAM(rect.right - button - button / 2, header / 2);
+    POINT screen{rect.right - button - button / 2, header / 2};
+    ClientToScreen(input, &screen);
+    Check(SendMessageW(input, WM_NCHITTEST, 0, MAKELPARAM(screen.x, screen.y)) == HTCLIENT,
+          "the Details button excluded from caption drag");
+    SendMessageW(input, WM_LBUTTONDOWN, MK_LBUTTON, point);
+    SendMessageW(input, WM_LBUTTONUP, 0, point);
+}
+
+// A figure column's heading in the open Details, where the painter draws it.
+static void ClickDetailsHeading(HWND overlay, const gtg::topapp::Column column) {
+    HWND input = InputWindow(overlay);
+    RECT rect{};
+    GetClientRect(input, &rect);
+    const float s = static_cast<float>(GetDpiForWindow(input)) / 96.0F;
+    const auto geometry = gtg::tray::details::MakeGeometry(
+        static_cast<float>(rect.right) / s, static_cast<float>(rect.bottom) / s,
+        static_cast<int>(gtg::topapp::kDetailsRows));
+    const auto& box = geometry.columns[static_cast<std::size_t>(column)];
+    const LPARAM point = MAKELPARAM(static_cast<int>((box.x + box.width / 2.0F) * s),
+                                    static_cast<int>((box.y + box.height / 2.0F) * s));
+    SendMessageW(input, WM_LBUTTONDOWN, MK_LBUTTON, point);
+    SendMessageW(input, WM_LBUTTONUP, 0, point);
+}
+
 int main(int argc, char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     Gdiplus::GdiplusStartupInput startup;
@@ -210,6 +244,50 @@ int main(int argc, char** argv) {
             check_size(false);
             ClickToggle(osd, true);
             check_size(false);
+#if !GTG_OSD_CLICK_THROUGH
+            // The list button opens Details on GPU and closes it, in the same
+            // window.
+            ClickDetailsButton(osd);
+            Check(osd.DetailsRecord() == gtg::topapp::Column::Gpu, "the list button opens Details");
+            check_size(false);
+            ClickDetailsButton(osd);
+            Check(!osd.DetailsRecord().has_value(), "and closes it");
+
+            // A machine with no GPU column: what opens on GPU turns to CPU,
+            // and a GPU heading the reader clicks is kept.
+            {
+                using gtg::topapp::Bit;
+                using gtg::topapp::Column;
+                gtg::topapp::Details with_gpu;
+                with_gpu.available = 0x1F;
+                with_gpu.measured = 0x1F;
+                gtg::topapp::Details without_gpu;
+                without_gpu.available = Bit(Column::Cpu) | Bit(Column::Ram) | Bit(Column::Network);
+                without_gpu.measured = without_gpu.available;
+                gtg::topapp::Details paused;
+                paused.paused = true;
+
+                ClickDetailsButton(osd);
+                osd.SetTopAppDetails(with_gpu);
+                Check(osd.DetailsRecord() == Column::Gpu, "with a GPU column, GPU stays");
+                osd.SetTopAppDetails(paused);
+                Check(osd.DetailsRecord() == Column::Gpu, "a paused sweep changes nothing");
+                osd.SetTopAppDetails(without_gpu);
+                Check(osd.DetailsRecord() == Column::Cpu,
+                      "a table without a GPU column turns it to CPU");
+                ClickDetailsHeading(osd, Column::Gpu);
+                Check(osd.DetailsRecord() == Column::Gpu, "the GPU heading clicked");
+                without_gpu.processes = 2;
+                osd.SetTopAppDetails(without_gpu);
+                Check(osd.DetailsRecord() == Column::Gpu, "is kept through the next table");
+                ClickDetailsButton(osd);
+                ClickDetailsButton(osd);
+                Check(osd.DetailsRecord() == Column::Cpu,
+                      "and the next opening goes to CPU at once");
+                ClickDetailsButton(osd);
+                Check(!osd.DetailsRecord().has_value(), "closed again");
+            }
+#endif
             RECT expanded_bounds{};
             GetWindowRect(osd, &expanded_bounds);
             ClickToggle(osd);

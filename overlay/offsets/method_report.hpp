@@ -13,6 +13,11 @@ struct MethodAddress {
     const char* role;
     void* address;
     void* object = nullptr;
+    // The vtable cell that holds `address`, for a role whose install writes
+    // the table rather than the function: `table + index`, not `table[index]`.
+    // Reported as an RVA in the same image the method is in, so one base
+    // rebases both and the pair cannot be read as spanning two modules.
+    void* const* slot = nullptr;
 };
 
 // A research oracle: called by the helper and, only when requested through an
@@ -55,7 +60,29 @@ inline bool WriteMethodReport(const wchar_t* path, const std::vector<MethodAddre
         out << "\",\"object\":" << reinterpret_cast<std::uintptr_t>(method.object)
             << ",\"base\":" << base << ",\"address\":" << address << ",\"rva\":" << address - base
             << ",\"image_size\":" << nt->OptionalHeader.SizeOfImage
-            << ",\"timestamp\":" << nt->FileHeader.TimeDateStamp << ",\"bytes\":\"";
+            << ",\"timestamp\":" << nt->FileHeader.TimeDateStamp;
+        if (method.slot != nullptr) {
+            // Everything asserted about the slot is asserted here, where the
+            // image is mapped in this process and can be looked at, rather
+            // than left to the reader of a number. The reader checks all of it
+            // again against the target, because this says what was true here.
+            const auto slot = reinterpret_cast<std::uintptr_t>(method.slot);
+            if (slot % sizeof(void*) != 0) return false;
+            if (slot < base || slot - base > nt->OptionalHeader.SizeOfImage - sizeof(void*))
+                return false;
+            MEMORY_BASIC_INFORMATION cell{};
+            if (!VirtualQuery(method.slot, &cell, sizeof(cell)) || cell.State != MEM_COMMIT ||
+                cell.Type != MEM_IMAGE || cell.Protect != PAGE_READONLY ||
+                slot + sizeof(void*) >
+                    reinterpret_cast<std::uintptr_t>(cell.BaseAddress) + cell.RegionSize)
+                return false;
+            // The agreement itself. A slot that does not hold the method is a
+            // wrong offset or somebody else's hook, and neither is something
+            // to publish a number about.
+            if (*method.slot != method.address) return false;
+            out << ",\"slot_rva\":" << slot - base;
+        }
+        out << ",\"bytes\":\"";
         const auto* bytes = static_cast<const unsigned char*>(method.address);
         for (int i = 0; i < 16; ++i)
             out << std::hex << std::setw(2) << std::setfill('0')

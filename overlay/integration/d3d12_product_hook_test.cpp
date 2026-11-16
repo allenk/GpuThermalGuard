@@ -44,6 +44,10 @@ void GtgFeatureStartupStage(const char* stage, ULONGLONG duration) noexcept {
     std::fprintf(stdout, "startup stage=%s duration_ms=%llu\n", stage, duration);
 }
 
+void GtgFeatureStartupDetail(const char* text) noexcept {
+    std::fprintf(stdout, "startup detail=%s\n", text);
+}
+
 bool GtgFeatureContinue() noexcept {
     return true;
 }
@@ -67,19 +71,38 @@ int GtgFeatureSession(gtg::research::HookSection& section, HANDLE child) noexcep
                   report.site_count == (section.signal_address ? 7U : 1U),
               "owned product complete installation ledger");
         // Name the enumerators rather than the numbers they happen to have: a
-        // successful coordinated install carries no stage, because it has no
-        // failure to place, and every site reports the one enlistment.
-        for (DWORD i = 0; i < report.site_count; ++i)
+        // successful install carries no stage, because it has no failure to
+        // place.
+        //
+        // The thread count is where the two routes are told apart, and
+        // asserting it is how this test knows which one each site took. Signal
+        // is installed by swapping its vtable cell, which suspends nobody, so
+        // it reports **zero** enlisted threads; the six inline sites report the
+        // one enlistment they shared. A Signal that came back with a positive
+        // count would mean it had been patched inline after all -- the install
+        // this runtime's `Signal` prologue is refused for -- and a zero on any
+        // other site would mean an enlistment that never happened.
+        for (DWORD i = 0; i < report.site_count; ++i) {
+            // The shared site index, not a copy of the number. This test used
+            // to declare its own, which is how a harness ends up agreeing with
+            // itself about which site it is checking.
+            const bool by_cell =
+                section.signal_address != 0 && i == gtg::research::kSignalSite;
             Check(
                 report.sites[i].state == 3 && report.sites[i].transaction_entered &&
                     report.sites[i].transaction_stage == static_cast<DWORD>(splice::Stage::none) &&
                     report.sites[i].transaction_outcome ==
                         static_cast<DWORD>(splice::State::installed) &&
-                    report.sites[i].threads > 0 &&
-                    report.sites[i].threads == report.sites[0].threads &&
                     report.sites[i].primary.operation == InstallOperation::None &&
                     report.sites[i].cleanup.operation == InstallOperation::None,
-                "owned coordinated successful site evidence");
+                "owned successful site evidence");
+            Check(by_cell ? report.sites[i].threads == 0
+                          : report.sites[i].threads > 0 &&
+                                report.sites[i].threads ==
+                                    report.sites[0].threads,
+                  "the cell swap enlisted nobody and the inline group enlisted "
+                  "once, which is how each site's route is read back");
+        }
         Check(section.product_backend == (d3d11 ? 1 : 2) && section.product_ready == 1 &&
                   (d3d11 || section.queue_identity) && !section.queue_ambiguous,
               "actual native backend/queue qualification before activation");

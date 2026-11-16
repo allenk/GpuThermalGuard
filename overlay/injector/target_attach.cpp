@@ -1,4 +1,5 @@
 // Separate named game profiles; default invocation is read-only preflight.
+#include "entry_admission.hpp"
 #include "hook_protocol.hpp"
 #include "queue_discovery.hpp"
 #include "device_diagnostics.hpp"
@@ -16,6 +17,7 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -33,6 +35,7 @@ gtg::overlay::integration::ChoiceRead GtgFeatureColorChoice(
 bool GtgFeatureContinue() noexcept;
 int GtgFeatureSession(gtg::research::HookSection&, HANDLE) noexcept;
 void GtgFeatureStartupStage(const char*, ULONGLONG) noexcept;
+void GtgFeatureStartupDetail(const char*) noexcept;
 
 namespace {
 gtg::overlay::integration::Identity feature_identity;
@@ -140,8 +143,16 @@ void CheckMitigations(HANDLE process) {
           "mitigation query failed or unsigned/patch trial prohibited; no downgrade attempted");
 }
 
+// What kind of thing an address in an image names, which decides what the
+// mapping under it has to look like. A method is code; a vtable cell is eight
+// bytes of the image's constant data. The parameter exists because the
+// executable-range check was unconditional, and translating a cell through it
+// refused every one of them -- a vtable is not in an executable section, and
+// requiring it to be was asking the wrong question of the right address.
+enum class RemoteKind { Code, ConstantData };
+
 std::uintptr_t RemoteAddress(HANDLE process, const std::vector<MODULEENTRY32W>& modules,
-                             void* local) {
+                             void* local, RemoteKind kind = RemoteKind::Code) {
     HMODULE owner{};
     Check(GetModuleHandleExW(
               GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -155,6 +166,12 @@ std::uintptr_t RemoteAddress(HANDLE process, const std::vector<MODULEENTRY32W>& 
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     const auto rva = reinterpret_cast<std::uintptr_t>(local) - base;
+    // Sixteen bytes for a prologue, a pointer for a cell: the width the caller
+    // is going to read, so the bounds tests below are about the actual access
+    // rather than about a constant that happened to suit one of them.
+    const std::uintptr_t width = kind == RemoteKind::Code ? 16u : sizeof(void*);
+    const DWORD expected_protect =
+        kind == RemoteKind::Code ? PAGE_EXECUTE_READ : PAGE_READONLY;
     for (const auto& module : modules) {
         // One file can be listed under more than one path: a packaged game's
         // runtime is reachable through its package root and through the library
@@ -165,9 +182,9 @@ std::uintptr_t RemoteAddress(HANDLE process, const std::vector<MODULEENTRY32W>& 
         if (_wcsicmp(module.szExePath, path) != 0 &&
             !gtg::overlay::integration::SameRuntimeFile(path, module.szExePath))
             continue;
-        Check(
-            module.modBaseSize == nt->OptionalHeader.SizeOfImage && rva + 16 <= module.modBaseSize,
-            "remote image size/RVA mismatch");
+        Check(module.modBaseSize == nt->OptionalHeader.SizeOfImage &&
+                  rva + width <= module.modBaseSize,
+              "remote image size/RVA mismatch");
         IMAGE_DOS_HEADER rd{};
         IMAGE_NT_HEADERS64 rn{};
         SIZE_T read{};
@@ -184,14 +201,15 @@ std::uintptr_t RemoteAddress(HANDLE process, const std::vector<MODULEENTRY32W>& 
             "remote image identity mismatch");
         const auto remote = reinterpret_cast<std::uintptr_t>(module.modBaseAddr) + rva;
         MEMORY_BASIC_INFORMATION info{};
-        Check(
-            VirtualQueryEx(process, reinterpret_cast<void*>(remote), &info, sizeof(info)) ==
-                    sizeof(info) &&
-                info.State == MEM_COMMIT && info.Type == MEM_IMAGE &&
-                info.Protect == PAGE_EXECUTE_READ &&
-                remote >= reinterpret_cast<std::uintptr_t>(info.BaseAddress) &&
-                remote - reinterpret_cast<std::uintptr_t>(info.BaseAddress) + 16 <= info.RegionSize,
-            "remote executable range");
+        Check(VirtualQueryEx(process, reinterpret_cast<void*>(remote), &info, sizeof(info)) ==
+                      sizeof(info) &&
+                  info.State == MEM_COMMIT && info.Type == MEM_IMAGE &&
+                  info.Protect == expected_protect &&
+                  remote >= reinterpret_cast<std::uintptr_t>(info.BaseAddress) &&
+                  remote - reinterpret_cast<std::uintptr_t>(info.BaseAddress) + width <=
+                      info.RegionSize,
+              kind == RemoteKind::Code ? "remote executable range"
+                                       : "remote constant-data range");
         return remote;
     }
     throw std::runtime_error("matching system module absent in named game");
@@ -356,7 +374,7 @@ int Run(bool attach, bool load_only, bool observe, bool discovery, bool associat
     Check(ReadProcessMemory(process.value, reinterpret_cast<void*>(present), bytes.data(),
                             bytes.size(), &read) &&
               read == bytes.size() && (bytes == expected || (discovery && counter_resident)) &&
-              (present & 7) == 0,
+              gtg::research::EntryStoreFitsOneQuadword(present),
           "Present bytes/alignment mismatch");
     const auto before_bytes = bytes;  // Queue-only trial must preserve the existing counter patch.
     std::wcout << kNamedProfile.image << L" pid=" << pid << L'\n';
@@ -406,7 +424,7 @@ int Run(bool attach, bool load_only, bool observe, bool discovery, bool associat
           "color choice identity/version/publication invalid");
     section->product_color_policy = static_cast<DWORD>(color_policy);
     const auto method = [&](const char* role, std::uint64_t& address, unsigned char(&entry)[16],
-                            bool optional) {
+                            bool optional, std::uint64_t* slot_out = nullptr) {
         const std::string marker = std::string("{\"role\":\"") + role + "\"";
         const auto start = text.find(marker), end = text.find('}', start);
         if (start == std::string::npos && optional) return;
@@ -465,17 +483,52 @@ int Run(bool attach, bool load_only, bool observe, bool discovery, bool associat
                 std::stoul(object.substr(hex + 9 + i * 2, 2), nullptr, 16));
         unsigned char actual[16]{};
         SIZE_T bytes_read{};
-        Check(!(address & 7) &&
+        // The sixteen bytes are compared exactly for every site, this one
+        // included: that is identity, and the detector for another overlay
+        // having patched the method first. What is not required of a site
+        // installed by swapping its cell is anything about its entry address.
+        Check(gtg::research::ProductEntryAdmitted(address, slot_out == nullptr) &&
                   ReadProcessMemory(process.value, reinterpret_cast<void*>(address), actual, 16,
                                     &bytes_read) &&
                   bytes_read == 16 &&
                   std::equal(std::begin(actual), std::end(actual), std::begin(entry)),
               "product remote entry bytes/alignment");
+        if (slot_out == nullptr) return;
+
+        // The vtable cell, for the one role installed by swapping the table
+        // instead of patching the function. `slot_rva` is an offset in the
+        // same image `rva` came from -- the report refuses to emit one that is
+        // not -- so `base + slot_rva` goes through the same translation the
+        // method did, and a pair spanning two modules cannot be expressed.
+        const auto slot_offset = number("\"slot_rva\":");
+        Check(nt->OptionalHeader.SizeOfImage >= sizeof(void*) &&
+                  slot_offset <= nt->OptionalHeader.SizeOfImage - sizeof(void*),
+              "Signal slot RVA within the image");
+        // Translated as constant data, not as code: the identity and alias
+        // handling is the same, and what the mapping has to be is not.
+        const auto slot =
+            RemoteAddress(process.value, modules, reinterpret_cast<void*>(base + slot_offset),
+                          RemoteKind::ConstantData);
+        Check(!(slot & (sizeof(void*) - 1)), "Signal slot alignment in the target");
+
+        // The agreement, and the reason any of the above is worth doing. The
+        // method address was verified by its own sixteen bytes; this requires
+        // the cell to hold exactly that. Two measurements by different routes
+        // have to meet, and a cell holding anything else is a wrong offset or
+        // another overlay's hook -- a refusal either way, with nothing
+        // written and no attempt to chain.
+        std::uintptr_t held{};
+        Check(ReadProcessMemory(process.value, reinterpret_cast<void*>(slot), &held, sizeof(held),
+                                &bytes_read) &&
+                  bytes_read == sizeof(held) && held == address,
+              "Signal slot does not hold the method it was published with");
+        *slot_out = slot;
     };
     for (unsigned i = 0; i < 5; ++i)
         method(gtg::overlay::integration::kProductRoles[i], section->product_methods[i],
                section->product_expected[i], false);
-    method("Signal", section->signal_address, section->signal_expected, true);
+    method("Signal", section->signal_address, section->signal_expected, true,
+           &section->signal_slot_address);
 #endif
     DeviceDiagnosticMapping diagnostic;
     DrawDiagnosticMapping draw_diagnostic;
@@ -658,6 +711,66 @@ int Run(bool attach, bool load_only, bool observe, bool discovery, bool associat
         gtg::overlay::integration::WaitForInspection(ready_clock, ready_ops);
     GtgFeatureStartupStage(inspection_ready ? "inspection-ready" : "inspection-refused-or-timeout",
                            GetTickCount64() - inspection_started);
+
+    // What the two watched entries looked like this time, read after the
+    // install has had its chance to measure them. The first version of this
+    // logged before the inspection wait and printed nothing at all, which is
+    // the failure a detector is most prone to and was caught only by looking
+    // for the line rather than for a green test. Logged whether or not the
+    // attach succeeded, because the value is the series: one reading proves
+    // nothing, and a change between two readings is what refused an install
+    // once already with nothing recording it.
+    static constexpr const char* kSiteNames[gtg::research::kSiteCount] = {
+        "Present", "Signal", "ResizeBuffers", "ResizeBuffers1", "SetFullscreenState",
+        "Present1", "SetColorSpace1"};
+    // The sites that measured nothing are named too. A site whose prologue was
+    // never read and a site that was never reached both leave zeroes here, and
+    // printing neither is how a detector reports success by staying silent --
+    // which this one already did once.
+    std::string unmeasured;
+    for (unsigned i = 0; i < gtg::research::kSiteCount; ++i) {
+        const auto& shape = section->entry_shape[i];
+        if (shape.patch_bytes == 0) {
+            if (!unmeasured.empty()) unmeasured += ",";
+            unmeasured += kSiteNames[i];
+            continue;
+        }
+        GtgFeatureStartupDetail(
+            std::format("entry-shape site={} patch_bytes={} first_instruction={} "
+                        "interior_mask=0x{:x} int3_padding={}",
+                        kSiteNames[i], static_cast<long>(shape.patch_bytes),
+                        static_cast<long>(shape.first_instruction),
+                        static_cast<unsigned long>(shape.interior_mask),
+                        static_cast<long>(shape.entry_padding))
+                .c_str());
+    }
+    if (!unmeasured.empty())
+        GtgFeatureStartupDetail(std::format("entry-shape unmeasured={}", unmeasured).c_str());
+    // The message below names four possibilities and distinguishes none of
+    // them, which cost this change a round of guessing: the install had
+    // actually succeeded and the cell swap had refused, and nothing said so.
+    // One line of the section's own fields on the way out is enough to tell
+    // apart a refused install, a refused cell, an unqualified queue and a
+    // timeout. Failure path only, so there is no recurring output.
+    if (!inspection_ready) {
+        GtgFeatureStartupDetail(
+            std::format("inspection-refused state={} ready={} backend={} stage={} "
+                        "present_calls={} failures={} errors={} queue={} queue_ambiguous={} "
+                        "signal_cell={}",
+                        static_cast<long>(
+                            InterlockedCompareExchange(&section->header.state, 0, 0)),
+                        static_cast<long>(section->product_ready),
+                        static_cast<long>(section->product_backend),
+                        static_cast<long>(section->transaction_stage),
+                        static_cast<long long>(
+                            InterlockedCompareExchange64(&section->hook_calls, 0, 0)),
+                        static_cast<long>(section->failures),
+                        static_cast<long>(section->control_errors),
+                        static_cast<long long>(section->queue_identity),
+                        static_cast<long>(section->queue_ambiguous),
+                        section->signal_slot_address != 0 ? 1 : 0)
+                .c_str());
+    }
     Check(inspection_ready,
           "native inspection not ready, refused, canceled or timed out; drawing remains disabled");
 #else

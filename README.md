@@ -11,7 +11,13 @@ GpuThermalGuard watches GPU telemetry in real time and applies a preconfigured l
 
 ![The GTG dashboard drawn inside a Direct3D 12 game at 4K: temperature, power, VRAM, GPU, CPU, RAM, network and FPS, with the wall clock in the header and 19 minutes of play time on the FPS card](docs/images/overlay-dx12-4k.jpg)
 
-## What's new in 1.2
+## What's new in 1.3
+
+- **The Direct3D 12 overlay attaches again.** A Windows update brought a Direct3D 12 runtime (`D3D12Core.dll` 10.0.26100.9818) whose `Signal` begins with an instruction too short for the overlay's patch, and from then on the overlay refused every Direct3D 12 game on that machine. GTG now hooks `Signal` by swapping its pointer in the command queue's vtable instead ([Built on Splice](#built-on-splice)).
+- **Details.** Double-click a record to see the ten apps behind it, with GPU, VRAM, CPU, RAM and network for each, which process it is and where it works ([Details](#details)).
+- **A clearer overlay log.** The overlay's startup log names the game and the Direct3D 12 runtime it runs on, and tells a game that was closed from a failure.
+
+## What 1.2 added
 
 - **Updates from GitHub.** GTG checks this repository's releases once a day and tells you when a newer one is out. Nothing installs until you agree; then it updates itself at a moment that costs no protection, restarts, and goes back to the previous version if the new one does not come up. A share on your own network can take GitHub's place ([Updates](#updates)).
 - **Hosts.** Pair GTGs on the same network with a one-time code, and each shows the others as a ninth record on its dashboard. The Hosts dialog can also update them, one after another ([Hosts](#hosts)).
@@ -122,7 +128,9 @@ Press the combination you want; it is shown as keycaps and checked as you type. 
 
 ### Built on Splice
 
-The overlay hooks the game's present path with [Splice](https://github.com/allenk/splice), a cross-platform, type-safe C++ hooking library by the same author. Installing a hook into a process whose render thread may be executing the very bytes being replaced is the hardest case there is, and it shaped Splice: atomic five-byte installs through a nearby relay, strict exact-site installation, coordination of the threads caught inside the patch, and since 1.2 a set of hooks installed as one transaction -- one thread enumeration, one suspension, all or nothing. The [Splice 1.2 notes](https://github.com/allenk/splice#new-in-120) give the install times measured in this overlay's startup log, and the limits of those few samples. Splice is a submodule of this repository, so the code that writes into the game is open for anyone to read.
+The overlay hooks the game's present path with [Splice](https://github.com/allenk/splice), a cross-platform, type-safe C++ hooking library by the same author. Installing a hook into a process whose render thread may be executing the very bytes being replaced is the hardest case there is, and it shaped Splice: atomic five-byte installs through a nearby relay, strict exact-site installation, coordination of the threads caught inside the patch, and since 1.2 a set of hooks installed as one transaction -- one thread enumeration, one suspension, all or nothing. The [Splice 1.2 notes](https://github.com/allenk/splice#new-in-120) give the install times measured in this overlay's startup log, and the limits of those few samples.
+
+Splice 1.3 added the other way to hook a method: replace its pointer in the object's vtable rather than patch its code. The overlay uses it for Direct3D 12's `Signal` alone, since a Windows runtime started that function with an instruction too short for a five-byte patch. The swap is a compare-and-swap, made only while the slot still holds the `Signal` the helper worked out from the game's own runtime; if another program has already replaced it, the game is refused rather than chained. `Present` keeps its in-place patch, because a vtable pointer can be taken over by any other overlay that writes the same slot. See the [Splice 1.3 notes](https://github.com/allenk/splice/blob/main/CHANGELOG.md#130---2026-11-15). Splice is a submodule of this repository, so the code that writes into the game is open for anyone to read.
 
 ## The desktop OSD
 
@@ -222,6 +230,17 @@ When GPU, VRAM, CPU or RAM stays high, the name of the program responsible appea
 At ordinary load nothing is shown. The name is the program's own description in the Windows display language, or its file name, shortened -- version numbers and build suffixes such as `-Win64-Shipping` dropped -- to at most 20 letters. The processes of one program are added together, each `svchost` is named after its services, WSL and other virtual machines are named as such, and a process GTG cannot identify is never named. With two NVIDIA adapters, GPU and VRAM stay silent rather than guess. A name too long for its place scrolls on the desktop OSD and turns pages every two seconds in the overlay.
 
 **Top app** in the main window turns it on and off (on by default). The process list is read once a second on a low-priority thread that never touches NVML or the protection loop, and that thread pauses itself for a minute if it uses more CPU than it is allowed. The names shown are written to the diagnostic log.
+
+### Details
+
+A name over a curve says who is on top. **Details** shows the rest: double-click GPU, VRAM, CPU or RAM on the expanded OSD, a lane or a card, and the same window shows the top ten apps under the same header, the way Task Manager would list them -- one row per app with its number of processes, and GPU, VRAM, CPU, RAM and NET columns, each tinted by its share of the whole. It opens sorted by the record you double-clicked; click a column heading to sort by another. Only apps that use something are listed.
+
+- **From the compact OSD** every cell opens it too, except RAM and NET, which keep their own double-click actions. The list button left of the chevron on the expanded header opens it on GPU, or on CPU where there is no GPU column (no NVIDIA GPU, or more than one).
+- **Which process it is.** One app can be several processes; the same `python.exe` may be two unrelated servers. For each row and column Details keeps the process that uses the most. Click the **App** heading to show where that process works -- the last folder of its working directory -- and click again for its process ID. Hovering a row shows `PID · path` at the bottom; double-clicking it opens that folder in Explorer, on local drives only, never a network path. GTG reads the working directory of 64-bit processes only, only while Details is open, and never reads a command line, which can carry keys.
+- **Network per app.** The NET column, in MB/s, comes from a Kernel-Network ETW trace that runs only while Details is open and needs Administrator rights; without them the column says so. It counts traffic where Windows attributes it: SMB serving another machine counts as System, traffic WSL sends out through its NAT is not seen at all, and traffic between Windows and WSL counts on the Windows side.
+- **Actions.** Sorted by RAM, the top right holds **Reclaim** ([releasing host memory](#releasing-host-memory)); sorted by NET, **Latency** ([a verdict on the network path](#a-verdict-on-the-network-path)).
+
+`‹` goes back to the lanes or cards. Collapsing or hiding the OSD closes Details, and the in-game overlay never shows it. The table comes from the same low-priority sampler as the top-app names, which does the extra work only while Details is open, and runs for Details even with **Top app** off.
 
 ### Optional host RAM
 

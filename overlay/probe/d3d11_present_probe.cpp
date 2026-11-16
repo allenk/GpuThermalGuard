@@ -16,7 +16,7 @@
 // inline patches on one slot fight while two wrappers stack -- and a player's
 // machine may already have Steam or Discord in that slot. Wrapping requires
 // intercepting creation, which requires the proxy DLL, which is not this
-// spike. See docs/game-overlay-design-20260927.md section 9.1.
+// probe.
 #include <windows.h>
 
 #include <d3d11.h>

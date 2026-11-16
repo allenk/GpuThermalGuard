@@ -36,7 +36,9 @@ class RectF;
 #include "net/history.hpp"
 #include "sysmem/reclaim.hpp"
 #include "topapp/board.hpp"
+#include "topapp/details.hpp"
 #include "tray/osd_animation.hpp"
+#include "tray/osd_details.hpp"
 #include "tray/osd_hosts.hpp"
 
 namespace gtg::tray {
@@ -216,6 +218,12 @@ public:
     END_MSG_MAP()
 
     [[nodiscard]] bool Collapsed() const noexcept { return collapsed_; }
+
+    // The shape to restore at the next start: the compact one while Details
+    // has only borrowed the expanded shape from a compact cell.
+    [[nodiscard]] bool CollapsedAtRest() const noexcept {
+        return collapsed_ || details_from_compact_;
+    }
     // Set before Initialize, so the window is created at the size the reader
     // last left it rather than being resized in front of them. Persistence
     // itself stays with the caller, beside the position it already saves --
@@ -422,6 +430,23 @@ public:
     // whether or not names are being looked for. Tiny raises their bars at the
     // moments the cells would float a name, so the two forms never disagree.
     void SetTopAppAlerts(std::uint32_t mask) noexcept;
+
+    // Details: the top apps of one column, in the expanded view's own window.
+    // A double-click opens it where a record has no action of its own, as does
+    // the expanded header's list button; its back control, the list button,
+    // collapsing, hiding, or the in-game overlay taking over closes it. Its App
+    // heading switches the name column between name, location and process id;
+    // a hovered row's process is named in the footer, and a double-click shows
+    // that process's working directory in Explorer. While open, the column it
+    // is sorted by; the Tray keeps the sampler's Details on exactly while this
+    // has a value.
+    [[nodiscard]] std::optional<topapp::Column> DetailsRecord() const noexcept {
+        return details_record_;
+    }
+
+    // The sampler's latest table, handed over on the UI tick. Ignored while
+    // Details is closed.
+    void SetTopAppDetails(const topapp::Details& details) noexcept;
     // Paired GTGs: the record is placed while Hosts is on and a host is
     // paired, and draws the view it is given, which says which four hosts and
     // how each reads. The view is built on the UI thread from the link's table.
@@ -439,8 +464,14 @@ private:
     // Everything an action needs before its worker starts: the indicator over
     // the right cell, in that record's accent, with the timing reset. Written
     // once because the two actions differ only in what the worker does and
-    // what the result says -- not in any of this.
+    // what the result says -- not in any of this. A slot below zero is Details'
+    // action control: the indicator stands over it instead of a cell.
     [[nodiscard]] bool BeginAction(int slot, compact::Metric metric) noexcept;
+    // An action running for Details rather than a cell, which leaving Details
+    // ends. The turning O is neither: it is no action at all.
+    [[nodiscard]] bool DetailsActionRunning() const noexcept {
+        return busy_indicator_.Active() && active_action_ != CellAction::None && action_slot_ < 0;
+    }
     void BeginReclaim(int slot) noexcept;
     void BeginNetworkProbe(int slot) noexcept;
     void EndAction() noexcept;
@@ -448,7 +479,44 @@ private:
     [[nodiscard]] bool LockHit(POINT point) const noexcept;
     [[nodiscard]] bool FoldHit(POINT point) const noexcept;
     void ToggleCollapsed() noexcept;
+    // The chevron's change of shape, keeping the chevron where it is, without
+    // drawing: ToggleCollapsed, and Details opened from a cell, both use it.
+    void SwitchShape() noexcept;
     void ToggleTiny() noexcept;
+    void OpenDetails(topapp::Column column) noexcept;
+    // From a compact cell: the window takes the expanded shape for Details,
+    // and leaving Details gives the compact one back.
+    void OpenDetailsFromCompact(topapp::Column column) noexcept;
+    // Returns to the view Details was opened from -- the compact dashboard if
+    // a cell opened it -- drawing it unless the window is about to be hidden.
+    void LeaveDetails(bool draw) noexcept;
+    // Drops Details' state and leaves the shape alone, for ToggleCollapsed.
+    void ForgetDetails() noexcept;
+    // The listed row at a client point, or -1, and that row of the table.
+    [[nodiscard]] int DetailsRowAt(POINT point) const noexcept;
+    [[nodiscard]] const topapp::DetailsRow* ListedDetailsRow(int index) const noexcept;
+
+    // Pointer input reaches the body only outside click-through builds, and
+    // Details lives in the expanded view.
+    [[nodiscard]] bool ShowsDetails() const noexcept {
+#if GTG_OSD_CLICK_THROUGH
+        return false;
+#else
+        return !collapsed_ && details_record_.has_value();
+#endif
+    }
+
+    // The Details button sits in the expanded header, where the compact
+    // header has its lock; it is not offered without pointer input.
+    [[nodiscard]] bool ShowsDetailsButton() const noexcept {
+#if GTG_OSD_CLICK_THROUGH
+        return false;
+#else
+        return !collapsed_;
+#endif
+    }
+
+    [[nodiscard]] bool DetailsButtonHit(POINT point) const noexcept;
     [[nodiscard]] bool Arrangeable() const noexcept {
         return ShowsLock() && !compact_locked_;
     }
@@ -491,6 +559,27 @@ private:
     bool collapsed_{};
     bool tiny_{};
     bool cards_{};
+    // Open while set: the record Details is sorted by.
+    std::optional<topapp::Column> details_record_;
+    // The table to draw; empty until the first one arrives after opening.
+    std::optional<topapp::Details> details_;
+    // A press on Details' back, close or a column heading, and which.
+    compact::Gesture details_gesture_;
+    details::Hit details_pressed_{};
+    // What the App column says, switched by its heading; the name at every
+    // opening.
+    details::NameView details_view_{details::NameView::Name};
+    // The listed row under the pointer, whose process the footer names, or -1.
+    int details_hover_{-1};
+    // Which columns the last table said this machine has, kept across
+    // openings, and whether the column is still the one Details opened on:
+    // only that one is turned from GPU to CPU (details::OpeningColumn).
+    std::optional<std::uint32_t> details_available_;
+    bool details_opening_column_{};
+    // Set while Details is open because a compact cell asked for it: the
+    // expanded shape is borrowed and goes back when Details closes.
+    bool details_from_compact_{};
+    compact::Gesture details_button_gesture_;
     compact::Gesture fold_gesture_;
     std::uint32_t top_app_alerts_{};
     // When the pointer was last over the window, and whether the header has
@@ -620,6 +709,10 @@ private:
     void DrawCards(Gdiplus::Graphics& graphics, const Layout& layout, std::uint64_t now_ms,
                    const telemetry::Sample* reading, bool stale, std::uint64_t start,
                    std::uint64_t end, std::vector<AlertLabel>* deferred) const;
+    // Details, under DrawSurface's header. `reading` is the sample the lanes
+    // would show, for the record's own figure in the title.
+    void DrawDetails(Gdiplus::Graphics& graphics, const Layout& layout,
+                     const telemetry::Sample* reading) const;
     // An app name over a curve: drawn now, or listed in `deferred` for the
     // desktop to draw over pixels it keeps.
     void FloatName(Gdiplus::Graphics& graphics, topapp::Record record, const Gdiplus::RectF& band,

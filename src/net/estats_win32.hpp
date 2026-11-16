@@ -47,11 +47,10 @@ public:
 
     // The attempt: discard the cached path state and re-resolve the next hop.
     //
-    // Measured against a control and found to be below the noise -- see
-    // docs/network-latency-research-20260924.md. It is kept because it is
-    // documented, permitted and undone by the stack re-discovering what it
-    // discarded, and because the owner asked for an attempt. Nothing that
-    // reads this class may report it as an improvement.
+    // Measured against a control and found to be below the noise. It is kept
+    // because it is documented, permitted and undone by the stack
+    // re-discovering what it discarded, and because the owner asked for an
+    // attempt. Nothing that reads this class may report it as an improvement.
     void Attempt() noexcept;
 
     // Reads again and differences against the baseline.

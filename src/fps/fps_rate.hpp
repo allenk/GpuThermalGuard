@@ -25,9 +25,8 @@ enum class Status { Unavailable, Warmup, Ready };
 // The second exists because the first is impossible for Vulkan and OpenGL:
 // they produce no DXGI Present and no Win32k composition token, and the chain
 // from a window to a composition surface was chased to the end and does not
-// close -- see docs/fps-and-windows-composition.md. The owner's ruling is that
-// this record is a reference rather than a guarantee, so a presentation rate
-// is worth more than a permanent dash.
+// close. The owner's ruling is that this record is a reference rather than a
+// guarantee, so a presentation rate is worth more than a permanent dash.
 //
 // The two are never mixed in one window: a reading of the other kind restarts
 // it.

@@ -29,7 +29,13 @@ struct FakeSites {
 
 int main() {
     try {
-        static_assert(sizeof(HookSection) == 712);
+        static_assert(sizeof(HookSection) == 832);
+        // Product v3 appended `signal_slot_address`, so the size moved and
+        // nothing above it did. Both facts are asserted, because a reader that
+        // decodes by offset needs the second one and the first alone would not
+        // have caught a field inserted in the middle.
+        static_assert(offsetof(HookSection, signal_slot_address) == 712);
+        static_assert(offsetof(HookSection, entry_shape) == 720);
         // Guard the read-only PowerShell runtime decoder against layout drift.
         static_assert(offsetof(HookSection, product_version) == 556);
         static_assert(offsetof(HookSection, product_backend) == 560);

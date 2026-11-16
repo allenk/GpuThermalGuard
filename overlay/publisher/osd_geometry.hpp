@@ -1,12 +1,11 @@
-// Spike 4 T-01 -- where the dashboard goes, and how big, in a frame that is not
-// the desktop. The owner's rule (specs/changes/2026-10-02-overlay-spike-4/
-// proposal.md), as arithmetic and nothing else:
+// Where the dashboard goes, and how big, in a frame that is not the desktop.
+// The owner's rule, as arithmetic and nothing else:
 //
 //   1. The reference is the monitor the desktop OSD is on.
 //   2. Size is proportional: the dashboard takes the same share of the frame as
 //      the desktop OSD takes of its monitor.
 //   3. Alignment is kept, not the position: the edge the OSD sits nearest to
-//      (design §4: left / centre / right, top / centre / bottom) stays its edge
+//      (left / centre / right, top / centre / bottom) stays its edge
 //      in the frame, and the margin from it scales with the frame.
 //   4. Never outside the frame: nothing below 0, nothing past the frame's size;
 //      too big, and it shrinks until it fits, keeping its anchor.
@@ -16,8 +15,8 @@
 //
 // Pure: no Windows calls, no state, so every case can be checked against a
 // rectangle worked out by hand. The caller supplies rectangles in desktop
-// coordinates, physical pixels (the OSD window's, and its monitor's bounds --
-// question (b) of the proposal), and the frame's size from OsdReq.v1.
+// coordinates, physical pixels (the OSD window's, and its monitor's bounds),
+// and the frame's size from OsdReq.v1.
 #pragma once
 
 #include <algorithm>

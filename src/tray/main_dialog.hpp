@@ -197,6 +197,9 @@ private:
     // On the 200 ms tick: which records are in alert, which names to float.
     void UpdateTopApps(std::uint64_t now_ms);
     void ClearTopApps();
+    // On the same tick: keeps the sampler's Details on exactly while the
+    // OSD's Details is open, and hands its table over.
+    void UpdateTopAppDetails();
     LRESULT OnResetOsdLayout(WORD, WORD, HWND, BOOL&);
     LRESULT OnDeepMemoryClean(WORD, WORD, HWND, BOOL&);
     LRESULT OnDeepCleanDone(UINT, WPARAM, LPARAM, BOOL&);
@@ -331,6 +334,9 @@ private:
     // The records the top-app rules have in alert on this tick, as Bit()
     // flags: Tiny raises its bars by them, and paired hosts are sent them.
     std::uint32_t top_app_alerts_{};
+    // Details is open on the OSD. With the top-app setting off the sampler
+    // thread runs for Details alone and is stopped when it closes.
+    bool top_app_details_open_{};
     // Paired GTGs. The link thread exists only while Hosts is on.
     HostsController hosts_;
 #ifdef GTG_FEATURE_UPDATE

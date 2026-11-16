@@ -59,6 +59,20 @@ struct ProcessEntry {
            key.compare(key.size() - kTail.size(), kTail.size(), kTail.data(), kTail.size()) == 0;
 }
 
+// WSL's group key, whichever of its processes is asked about.
+inline constexpr std::wstring_view kWslKey = L"vm|wsl";
+
+// WSL's relay forwards the host's localhost connections into the VM, so what
+// it sends and receives is WSL's traffic, and its CPU time and memory are
+// WSL's too: it is grouped as WSL rather than listed as an app of its own.
+// Only the copy WSL installs counts.
+[[nodiscard]] inline bool IsWslRelay(const std::wstring_view image_path) {
+    constexpr std::wstring_view kTail = L"\\program files\\wsl\\wslrelay.exe";
+    const std::wstring key = GroupKey(image_path);
+    return key.size() >= kTail.size() &&
+           key.compare(key.size() - kTail.size(), kTail.size(), kTail.data(), kTail.size()) == 0;
+}
+
 // The name a kernel process is shown with: its own, cleaned and cut like any
 // other. Empty when it has none.
 [[nodiscard]] inline std::wstring KernelProcessName(const std::wstring_view name) {
@@ -91,7 +105,7 @@ struct ProcessEntry {
                                 IsVmWorkerName(parent->second->name);
         const SystemProcess vm{
             wsl ? SystemKind::Wsl : SystemKind::VirtualMachine,
-            wsl ? std::wstring(L"vm|wsl")
+            wsl ? std::wstring(kWslKey)
                 : L"vm|" + std::to_wstring(has_worker ? entry.parent : entry.pid),
             {}};
         out.insert_or_assign(entry.pid, vm);

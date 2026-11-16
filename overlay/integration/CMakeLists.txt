@@ -119,6 +119,27 @@ if(BUILD_TESTING)
     target_link_libraries(gtg_overlay_initial_refusal_test PRIVATE gtg_build_options)
     add_test(NAME gtg_overlay_initial_refusal COMMAND gtg_overlay_initial_refusal_test)
 
+    add_executable(gtg_overlay_slot_admission_test slot_admission_test.cpp)
+    target_link_libraries(gtg_overlay_slot_admission_test PRIVATE gtg_build_options)
+    # It also reads the install's source, to assert the cell is dereferenced
+    # only after the clauses that establish the page is readable. That ordering
+    # lives in the caller, which no case in this binary can reach.
+    target_compile_definitions(gtg_overlay_slot_admission_test
+        PRIVATE GTG_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
+    add_test(NAME gtg_overlay_slot_admission COMMAND gtg_overlay_slot_admission_test)
+
+    # The inline entry rule, beside the cell rule: the two admission decisions
+    # this overlay makes, each with a test in a build that runs. This one was
+    # registered from overlay/injector/CMakeLists.txt, which no preset adds, so
+    # it had never been compiled -- against a signature it no longer matched.
+    add_executable(gtg_overlay_install_policy_test ../injector/install_policy_test.cpp)
+    target_link_libraries(gtg_overlay_install_policy_test PRIVATE gtg_build_options splice::splice)
+    # The rule's test also reads the preflight's source, to assert the two
+    # sides reach the shared clause by name instead of open-coding it again.
+    target_compile_definitions(gtg_overlay_install_policy_test
+        PRIVATE GTG_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
+    add_test(NAME gtg_overlay_install_policy COMMAND gtg_overlay_install_policy_test)
+
     add_executable(gtg_overlay_d3d12_product_hook_test d3d12_product_hook_test.cpp
         ../injector/target_attach.cpp)
     target_compile_definitions(gtg_overlay_d3d12_product_hook_test PRIVATE GTG_FEATURE_ATTACH
